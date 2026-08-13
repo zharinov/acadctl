@@ -14,14 +14,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the AutoCAD plugin connection status.
-    Status,
+    /// List open AutoCAD documents.
+    Ls {
+        /// Show the full path of named drawings.
+        #[arg(long)]
+        long: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Status => commands::status::run().await,
+        Command::Ls { long } => commands::ls::run(long).await,
     }
 }
 
@@ -30,14 +34,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_status_command() {
-        let cli = Cli::try_parse_from(["acadctl", "status"]).unwrap();
+    fn parses_ls_command() {
+        let cli = Cli::try_parse_from(["acadctl", "ls"]).unwrap();
 
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(cli.command, Command::Ls { long: false }));
+
+        let cli = Cli::try_parse_from(["acadctl", "ls", "--long"]).unwrap();
+
+        assert!(matches!(cli.command, Command::Ls { long: true }));
     }
 
     #[test]
-    fn does_not_advertise_unimplemented_commands() {
+    fn does_not_keep_superseded_or_unimplemented_commands() {
+        assert!(Cli::try_parse_from(["acadctl", "status"]).is_err());
         assert!(Cli::try_parse_from(["acadctl", "exec"]).is_err());
     }
 }

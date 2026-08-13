@@ -1,7 +1,7 @@
 use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use acadctl_rpc::{Acadctl, AcadctlServer, Document, StatusRequest, StatusResponse};
+use acadctl_rpc::{Acadctl, AcadctlServer, Document, ListRequest, ListResponse};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
@@ -19,15 +19,12 @@ struct Service;
 
 #[tonic::async_trait]
 impl Acadctl for Service {
-    async fn status(
-        &self,
-        _request: Request<StatusRequest>,
-    ) -> Result<Response<StatusResponse>, Status> {
+    async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let documents = DOCUMENTS
             .lock()
             .map_err(|_| Status::internal("document state is unavailable"))?
             .clone();
-        Ok(Response::new(StatusResponse { documents }))
+        Ok(Response::new(ListResponse { documents }))
     }
 }
 
@@ -72,8 +69,10 @@ pub fn set_documents(documents: Vec<crate::ffi::DocumentState>) {
         *active = documents
             .into_iter()
             .map(|document| Document {
+                id: document.id,
                 path: document.path,
                 modified: document.modified,
+                read_only: document.read_only,
             })
             .collect();
     }
@@ -125,12 +124,16 @@ mod tests {
     fn reports_documents_and_stops_promptly() {
         set_documents(vec![
             crate::ffi::DocumentState {
+                id: "k7m2qx".into(),
                 path: "/tmp/house.dwg".into(),
                 modified: false,
+                read_only: false,
             },
             crate::ffi::DocumentState {
+                id: "p8z4cw".into(),
                 path: "/tmp/site.dwg".into(),
                 modified: true,
+                read_only: true,
             },
         ]);
         start().unwrap();
@@ -141,12 +144,16 @@ mod tests {
 
         let client = runtime.block_on(async {
             let mut client = acadctl_rpc::connect(std::process::id()).await.unwrap();
-            let status = client.status(StatusRequest {}).await.unwrap().into_inner();
-            assert_eq!(status.documents.len(), 2);
-            assert_eq!(status.documents[0].path, "/tmp/house.dwg");
-            assert!(!status.documents[0].modified);
-            assert_eq!(status.documents[1].path, "/tmp/site.dwg");
-            assert!(status.documents[1].modified);
+            let listed = client.list(ListRequest {}).await.unwrap().into_inner();
+            assert_eq!(listed.documents.len(), 2);
+            assert_eq!(listed.documents[0].id, "k7m2qx");
+            assert_eq!(listed.documents[0].path, "/tmp/house.dwg");
+            assert!(!listed.documents[0].modified);
+            assert!(!listed.documents[0].read_only);
+            assert_eq!(listed.documents[1].id, "p8z4cw");
+            assert_eq!(listed.documents[1].path, "/tmp/site.dwg");
+            assert!(listed.documents[1].modified);
+            assert!(listed.documents[1].read_only);
             client
         });
 

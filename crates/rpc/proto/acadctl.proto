@@ -3,16 +3,18 @@ syntax = "proto3";
 package acadctl;
 
 service Acadctl {
-  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc List(ListRequest) returns (ListResponse);
 }
 
-message StatusRequest {}
+message ListRequest {}
 
-message StatusResponse {
+message ListResponse {
   repeated Document documents = 1;
 }
 
 message Document {
-  string path = 1;
-  bool modified = 2;
+  string id = 1;
+  string path = 2;
+  bool modified = 3;
+  bool read_only = 4;
 }

@@ -1,28 +1,35 @@
 use std::ffi::OsStr;
 use std::time::Duration;
 
-use acadctl_rpc::{Document, StatusRequest};
+use acadctl_rpc::{Document, ListRequest};
 use sysinfo::System;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tonic::Code;
 
-const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Instance {
     pub process_id: u32,
-    pub plugin: PluginState,
+    pub documents: Result<Vec<Document>, QueryError>,
 }
 
-pub struct StatusReport {
+pub struct ListReport {
     pub instances: Vec<Instance>,
 }
 
-pub enum PluginState {
-    Available(Vec<Document>),
-    Unavailable,
+pub enum QueryError {
+    CannotConnect,
+    TimedOut,
+    OutdatedPlugin,
+    RequestFailed(String),
 }
 
-pub async fn status() -> StatusReport {
+pub enum ListError {
+    QueryTaskFailed,
+}
+
+pub async fn list() -> Result<ListReport, ListError> {
     let process_ids = autocad_process_ids();
     let mut pending = JoinSet::new();
     for process_id in process_ids {
@@ -31,29 +38,41 @@ pub async fn status() -> StatusReport {
 
     let mut instances = Vec::new();
     while let Some(result) = pending.join_next().await {
-        if let Ok(instance) = result {
-            instances.push(instance);
-        }
+        instances.push(result.map_err(|_| ListError::QueryTaskFailed)?);
     }
     instances.sort_unstable_by_key(|instance| instance.process_id);
 
-    StatusReport { instances }
+    Ok(ListReport { instances })
 }
 
 async fn query(process_id: u32) -> Instance {
-    let documents = timeout(STATUS_TIMEOUT, async move {
-        let mut client = acadctl_rpc::connect(process_id).await.ok()?;
-        let status = client.status(StatusRequest {}).await.ok()?.into_inner();
-        Some(status.documents)
-    })
-    .await
-    .ok()
-    .flatten();
+    let documents = match timeout(LIST_TIMEOUT, query_documents(process_id)).await {
+        Ok(result) => result,
+        Err(_) => Err(QueryError::TimedOut),
+    };
 
     Instance {
         process_id,
-        plugin: documents.map_or(PluginState::Unavailable, PluginState::Available),
+        documents,
     }
+}
+
+async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
+    let mut client = acadctl_rpc::connect(process_id)
+        .await
+        .map_err(|_| QueryError::CannotConnect)?;
+    let listed = client
+        .list(ListRequest {})
+        .await
+        .map_err(|status| {
+            if status.code() == Code::Unimplemented {
+                QueryError::OutdatedPlugin
+            } else {
+                QueryError::RequestFailed(status.message().to_owned())
+            }
+        })?
+        .into_inner();
+    Ok(listed.documents)
 }
 
 fn autocad_process_ids() -> Vec<u32> {

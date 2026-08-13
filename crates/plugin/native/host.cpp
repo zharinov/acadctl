@@ -4,7 +4,9 @@
 #include "AcString.h"
 #include "acadctl-plugin/src/lib.rs.h"
 #include <algorithm>
+#include <cctype>
 #include <memory>
+#include <string>
 #include <syslog.h>
 #include <utility>
 #include <vector>
@@ -12,6 +14,27 @@
 int acdbGetDbmod(AcDbDatabase *database);
 
 namespace {
+
+struct TrackedDocument {
+    AcApDocument *document;
+    std::string id;
+};
+
+std::string documentPath(AcApDocument *document) {
+    const AcString value(document->isNamedDrawing()
+        ? document->fileName()
+        : document->docTitle());
+    std::string path(value.utf8Ptr());
+    if (!document->isNamedDrawing() && path.size() >= 4) {
+        std::string suffix = path.substr(path.size() - 4);
+        std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+            [](unsigned char character) { return std::tolower(character); });
+        if (suffix == ".dwg") {
+            path.resize(path.size() - 4);
+        }
+    }
+    return path;
+}
 
 class DocumentRegistry {
 public:
@@ -82,7 +105,7 @@ private:
         DocumentRegistry &registry_;
     };
 
-    std::vector<AcApDocument *> documents_;
+    std::vector<TrackedDocument> documents_;
     DocumentReactor documentReactor_;
     EditorReactor editorReactor_;
 };
@@ -113,12 +136,14 @@ void DocumentRegistry::stop() {
 
 void DocumentRegistry::publish() {
     rust::Vec<acadctl::DocumentState> states;
-    for (AcApDocument *document : documents_) {
+    for (const TrackedDocument &tracked : documents_) {
+        AcApDocument *document = tracked.document;
         if (AcDbDatabase *database = document->database()) {
-            const AcString path(document->fileName());
             states.push_back(acadctl::DocumentState{
-                rust::String(path.utf8Ptr()),
+                rust::String(tracked.id),
+                rust::String(documentPath(document)),
                 acdbGetDbmod(database) != 0,
+                document->isReadOnly(),
             });
         }
     }
@@ -126,15 +151,31 @@ void DocumentRegistry::publish() {
 }
 
 void DocumentRegistry::track(AcApDocument *document) {
-    if (std::find(documents_.begin(), documents_.end(), document) != documents_.end()) {
+    const auto alreadyTracked = std::find_if(
+        documents_.begin(), documents_.end(),
+        [document](const TrackedDocument &tracked) {
+            return tracked.document == document;
+        });
+    if (alreadyTracked != documents_.end()) {
         return;
     }
-    documents_.push_back(document);
+
+    std::string id;
+    do {
+        id = static_cast<std::string>(acadctl::new_document_id());
+    } while (std::any_of(
+        documents_.begin(), documents_.end(),
+        [&id](const TrackedDocument &tracked) { return tracked.id == id; }));
+    documents_.push_back(TrackedDocument{document, std::move(id)});
 }
 
 void DocumentRegistry::untrack(AcApDocument *document) {
     documents_.erase(
-        std::remove(documents_.begin(), documents_.end(), document),
+        std::remove_if(
+            documents_.begin(), documents_.end(),
+            [document](const TrackedDocument &tracked) {
+                return tracked.document == document;
+            }),
         documents_.end());
 }
 

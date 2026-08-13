@@ -10,3 +10,4 @@ acadctl-rpc = { path = "../rpc" }
 clap.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
+tonic.workspace = true

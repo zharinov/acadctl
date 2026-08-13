@@ -11,6 +11,7 @@ crate-type = ["staticlib"]
 [dependencies]
 acadctl-rpc = { path = "../rpc" }
 cxx.workspace = true
+nanoid.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 

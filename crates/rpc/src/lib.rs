@@ -8,7 +8,7 @@ use tower::service_fn;
 
 pub use protocol::acadctl_client::AcadctlClient;
 pub use protocol::acadctl_server::{Acadctl, AcadctlServer};
-pub use protocol::{Document, StatusRequest, StatusResponse};
+pub use protocol::{Document, ListRequest, ListResponse};
 pub use transport::{Incoming, incoming};
 
 mod protocol {
