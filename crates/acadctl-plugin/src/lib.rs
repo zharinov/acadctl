@@ -25,12 +25,13 @@ mod dev_watcher {
     static WATCHER: Mutex<Option<PollWatcher>> = Mutex::new(None);
 
     pub fn start(path: String) {
-        let target = PathBuf::from(path);
-        let watched_target = target.clone();
+        let watched_path = PathBuf::from(path);
+        let event_path = watched_path.clone();
         let handler = move |result: notify::Result<Event>| {
             let Ok(event) = result else { return };
 
-            if event.paths.iter().any(|path| path == &target) {
+            let reload_requested = event.paths.iter().any(|path| path == &event_path);
+            if reload_requested {
                 super::ffi::schedule_dev_reload();
             }
         };
@@ -42,7 +43,7 @@ mod dev_watcher {
         };
 
         if watcher
-            .watch(&watched_target, RecursiveMode::NonRecursive)
+            .watch(&watched_path, RecursiveMode::NonRecursive)
             .is_err()
         {
             return;

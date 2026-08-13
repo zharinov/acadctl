@@ -10,22 +10,29 @@
 namespace {
 
 constexpr const ACHAR *kCommandGroup = ACRX_T("ACADCTL_COMMANDS");
-using HelloMessage = const char *(*)();
-
-void *payload = nullptr;
-HelloMessage helloMessage = nullptr;
-std::mutex payloadMutex;
 
 // Rust uses thread-local storage, which dyld otherwise keeps mapped after dlclose.
 constexpr int kRtldUnloadable = static_cast<int>(0x80000000);
 
+using HelloMessageFn = const char *(*)();
+
+void *payload = nullptr;
+HelloMessageFn helloMessage = nullptr;
+std::mutex payloadMutex;
+
+void unloadPayloadLocked() {
+    if (payload == nullptr) {
+        return;
+    }
+
+    dlclose(payload);
+    payload = nullptr;
+    helloMessage = nullptr;
+}
+
 bool loadPayload() {
     const std::lock_guard lock(payloadMutex);
-    if (payload != nullptr) {
-        dlclose(payload);
-        payload = nullptr;
-        helloMessage = nullptr;
-    }
+    unloadPayloadLocked();
 
     int mode = RTLD_NOW | RTLD_LOCAL;
 #ifdef ACADCTL_DEV_RELOAD
@@ -36,7 +43,7 @@ bool loadPayload() {
         return false;
     }
 
-    auto nextHelloMessage = reinterpret_cast<HelloMessage>(
+    auto nextHelloMessage = reinterpret_cast<HelloMessageFn>(
         dlsym(nextPayload, "acadctl_hello_message"));
     if (nextHelloMessage == nullptr) {
         dlclose(nextPayload);
@@ -68,7 +75,7 @@ void schedule_dev_reload() {
 }
 
 extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
-                                              void *applicationId) {
+                                             void *applicationId) {
     switch (message) {
         case AcRx::kInitAppMsg:
             acrxDynamicLinker->unlockApplication(applicationId);
@@ -89,11 +96,7 @@ extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
             acedRegCmds->removeGroup(kCommandGroup);
             {
                 const std::lock_guard lock(payloadMutex);
-                if (payload != nullptr) {
-                    dlclose(payload);
-                    payload = nullptr;
-                    helloMessage = nullptr;
-                }
+                unloadPayloadLocked();
             }
             break;
         default:
