@@ -2,15 +2,17 @@ use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use acadctl_rpc::{Acadctl, AcadctlServer, Document, ListRequest, ListResponse};
+use acadctl_rpc::{Acadctl, AcadctlServer, ListRequest, ListResponse};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
+
+use crate::documents::DocumentRegistry;
 
 const MAX_CONCURRENT_STREAMS: u32 = 32;
 const RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
-static DOCUMENTS: Mutex<Vec<Document>> = Mutex::new(Vec::new());
+static DOCUMENTS: Mutex<DocumentRegistry> = Mutex::new(DocumentRegistry::new());
 
 struct Server {
     stop: oneshot::Sender<()>,
@@ -36,7 +38,7 @@ impl Acadctl for Service {
         let documents = DOCUMENTS
             .lock()
             .map_err(|_| Status::internal("document state is unavailable"))?
-            .clone();
+            .list();
         Ok(Response::new(ListResponse { documents }))
     }
 }
@@ -79,17 +81,9 @@ pub fn stop() {
     }
 }
 
-pub fn set_documents(documents: Vec<crate::ffi::DocumentState>) {
+pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentState>) {
     if let Ok(mut active) = DOCUMENTS.lock() {
-        *active = documents
-            .into_iter()
-            .map(|document| Document {
-                id: document.id,
-                path: document.path,
-                modified: document.modified,
-                read_only: document.read_only,
-            })
-            .collect();
+        active.replace(documents);
     }
 }
 
@@ -167,16 +161,18 @@ mod tests {
 
     #[test]
     fn reports_documents_and_stops_promptly() {
-        set_documents(vec![
-            crate::ffi::DocumentState {
-                id: "k7m2qx".into(),
-                path: "/tmp/house.dwg".into(),
+        replace_documents(vec![
+            crate::ffi::NativeDocumentState {
+                token: 1,
+                name: "/tmp/house.dwg".into(),
+                named: true,
                 modified: false,
                 read_only: false,
             },
-            crate::ffi::DocumentState {
-                id: "p8z4cw".into(),
-                path: "/tmp/site.dwg".into(),
+            crate::ffi::NativeDocumentState {
+                token: 2,
+                name: "/tmp/site.dwg".into(),
+                named: true,
                 modified: true,
                 read_only: true,
             },
@@ -191,11 +187,12 @@ mod tests {
             let mut client = acadctl_rpc::connect(std::process::id()).await.unwrap();
             let listed = client.list(ListRequest {}).await.unwrap().into_inner();
             assert_eq!(listed.documents.len(), 2);
-            assert_eq!(listed.documents[0].id, "k7m2qx");
+            assert_eq!(listed.documents[0].id.len(), 6);
             assert_eq!(listed.documents[0].path, "/tmp/house.dwg");
             assert!(!listed.documents[0].modified);
             assert!(!listed.documents[0].read_only);
-            assert_eq!(listed.documents[1].id, "p8z4cw");
+            assert_eq!(listed.documents[1].id.len(), 6);
+            assert_ne!(listed.documents[0].id, listed.documents[1].id);
             assert_eq!(listed.documents[1].path, "/tmp/site.dwg");
             assert!(listed.documents[1].modified);
             assert!(listed.documents[1].read_only);
