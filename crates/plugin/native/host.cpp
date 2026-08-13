@@ -2,14 +2,16 @@
 #include "acdocman.h"
 #include "aced.h"
 #include "AcString.h"
+#include "dbmain.h"
 #include "acadctl-plugin/src/lib.rs.h"
 #include <algorithm>
 #include <cctype>
+#include <list>
 #include <memory>
 #include <string>
 #include <syslog.h>
+#include <unordered_map>
 #include <utility>
-#include <vector>
 
 int acdbGetDbmod(AcDbDatabase *database);
 
@@ -17,7 +19,12 @@ namespace {
 
 struct TrackedDocument {
     AcApDocument *document;
+    AcDbDatabase *database;
     std::string id;
+    std::string path;
+    bool modified;
+    bool readOnly;
+    bool dirty;
 };
 
 std::string documentPath(AcApDocument *document) {
@@ -47,9 +54,53 @@ public:
 private:
     void publish();
 
+    void flush();
+
+    void flush(const AcDbDatabase *database);
+
+    void flush(AcApDocument *document);
+
+    void markDirty(const AcDbDatabase *database);
+
+    void markDirty(AcApDocument *document);
+
+    bool refresh(TrackedDocument &tracked);
+
     void track(AcApDocument *document);
 
     void untrack(AcApDocument *document);
+
+    class DatabaseReactor final : public AcDbDatabaseReactor {
+    public:
+        explicit DatabaseReactor(DocumentRegistry &registry) : registry_(registry) {}
+
+        void objectAppended(const AcDbDatabase *database, const AcDbObject *) override {
+            registry_.markDirty(database);
+        }
+
+        void objectUnAppended(const AcDbDatabase *database, const AcDbObject *) override {
+            registry_.markDirty(database);
+        }
+
+        void objectReAppended(const AcDbDatabase *database, const AcDbObject *) override {
+            registry_.markDirty(database);
+        }
+
+        void objectModified(const AcDbDatabase *database, const AcDbObject *) override {
+            registry_.markDirty(database);
+        }
+
+        void objectErased(const AcDbDatabase *database, const AcDbObject *, bool) override {
+            registry_.markDirty(database);
+        }
+
+        void headerSysVarChanged(const AcDbDatabase *database, const ACHAR *, bool) override {
+            registry_.markDirty(database);
+        }
+
+    private:
+        DocumentRegistry &registry_;
+    };
 
     class DocumentReactor final : public AcApDocManagerReactor {
     public:
@@ -65,8 +116,12 @@ private:
             registry_.publish();
         }
 
-        void documentTitleUpdated(AcApDocument *) override {
-            registry_.publish();
+        void documentTitleUpdated(AcApDocument *document) override {
+            registry_.flush(document);
+        }
+
+        void documentActivated(AcApDocument *document) override {
+            registry_.flush(document);
         }
 
     private:
@@ -78,40 +133,54 @@ private:
         explicit EditorReactor(DocumentRegistry &registry) : registry_(registry) {}
 
         void commandEnded(const ACHAR *) override {
-            registry_.publish();
+            registry_.flush();
         }
 
         void commandCancelled(const ACHAR *) override {
-            registry_.publish();
+            registry_.flush();
         }
 
         void commandFailed(const ACHAR *) override {
-            registry_.publish();
+            registry_.flush();
         }
 
         void lispEnded() override {
-            registry_.publish();
+            registry_.flush();
         }
 
         void lispCancelled() override {
-            registry_.publish();
+            registry_.flush();
         }
 
-        void saveComplete(AcDbDatabase *, const ACHAR *) override {
-            registry_.publish();
+        void saveComplete(AcDbDatabase *database, const ACHAR *) override {
+            registry_.flush(database);
+        }
+
+        void abortSave(AcDbDatabase *database) override {
+            registry_.flush(database);
+        }
+
+        void curDocOpenUpgraded(AcDbDatabase *database, const CAdUiPathname &) override {
+            registry_.flush(database);
+        }
+
+        void curDocOpenDowngraded(AcDbDatabase *database, const CAdUiPathname &) override {
+            registry_.flush(database);
         }
 
     private:
         DocumentRegistry &registry_;
     };
 
-    std::vector<TrackedDocument> documents_;
+    std::list<TrackedDocument> documents_;
+    std::unordered_map<const AcDbDatabase *, TrackedDocument *> documentsByDatabase_;
+    DatabaseReactor databaseReactor_;
     DocumentReactor documentReactor_;
     EditorReactor editorReactor_;
 };
 
 DocumentRegistry::DocumentRegistry()
-    : documentReactor_(*this), editorReactor_(*this) {}
+    : databaseReactor_(*this), documentReactor_(*this), editorReactor_(*this) {}
 
 void DocumentRegistry::start() {
     acDocManager->addReactor(&documentReactor_);
@@ -131,23 +200,97 @@ void DocumentRegistry::stop() {
     acedEditor->removeReactor(&editorReactor_);
     acDocManager->removeReactor(&documentReactor_);
 
+    for (const TrackedDocument &tracked : documents_) {
+        if (tracked.database) {
+            tracked.database->removeReactor(&databaseReactor_);
+        }
+    }
+    documentsByDatabase_.clear();
     documents_.clear();
 }
 
 void DocumentRegistry::publish() {
     rust::Vec<acadctl::DocumentState> states;
     for (const TrackedDocument &tracked : documents_) {
-        AcApDocument *document = tracked.document;
-        if (AcDbDatabase *database = document->database()) {
+        if (tracked.database) {
             states.push_back(acadctl::DocumentState{
                 rust::String(tracked.id),
-                rust::String(documentPath(document)),
-                acdbGetDbmod(database) != 0,
-                document->isReadOnly(),
+                rust::String(tracked.path),
+                tracked.modified,
+                tracked.readOnly,
             });
         }
     }
     acadctl::update_documents(std::move(states));
+}
+
+void DocumentRegistry::flush() {
+    bool changed = false;
+    for (TrackedDocument &tracked : documents_) {
+        if (tracked.dirty) {
+            changed = refresh(tracked) || changed;
+        }
+    }
+    if (changed) {
+        publish();
+    }
+}
+
+void DocumentRegistry::flush(const AcDbDatabase *database) {
+    markDirty(database);
+    flush();
+}
+
+void DocumentRegistry::flush(AcApDocument *document) {
+    markDirty(document);
+    flush();
+}
+
+void DocumentRegistry::markDirty(const AcDbDatabase *database) {
+    const auto tracked = documentsByDatabase_.find(database);
+    if (tracked != documentsByDatabase_.end()) {
+        tracked->second->dirty = true;
+    }
+}
+
+void DocumentRegistry::markDirty(AcApDocument *document) {
+    const auto tracked = std::find_if(
+        documents_.begin(), documents_.end(),
+        [document](const TrackedDocument &candidate) {
+            return candidate.document == document;
+        });
+    if (tracked != documents_.end()) {
+        tracked->dirty = true;
+    }
+}
+
+bool DocumentRegistry::refresh(TrackedDocument &tracked) {
+    AcDbDatabase *database = tracked.document->database();
+    const bool databaseChanged = tracked.database != database;
+    if (tracked.database != database) {
+        if (tracked.database) {
+            tracked.database->removeReactor(&databaseReactor_);
+            documentsByDatabase_.erase(tracked.database);
+        }
+        tracked.database = database;
+        if (tracked.database) {
+            tracked.database->addReactor(&databaseReactor_);
+            documentsByDatabase_[tracked.database] = &tracked;
+        }
+    }
+
+    std::string path = documentPath(tracked.document);
+    const bool modified = tracked.database && acdbGetDbmod(tracked.database) != 0;
+    const bool readOnly = tracked.document->isReadOnly();
+    const bool changed = databaseChanged
+        || tracked.path != path
+        || tracked.modified != modified
+        || tracked.readOnly != readOnly;
+    tracked.path = std::move(path);
+    tracked.modified = modified;
+    tracked.readOnly = readOnly;
+    tracked.dirty = false;
+    return changed;
 }
 
 void DocumentRegistry::track(AcApDocument *document) {
@@ -166,17 +309,31 @@ void DocumentRegistry::track(AcApDocument *document) {
     } while (std::any_of(
         documents_.begin(), documents_.end(),
         [&id](const TrackedDocument &tracked) { return tracked.id == id; }));
-    documents_.push_back(TrackedDocument{document, std::move(id)});
+    documents_.push_back(TrackedDocument{
+        document,
+        nullptr,
+        std::move(id),
+        {},
+        false,
+        false,
+        true,
+    });
+    refresh(documents_.back());
 }
 
 void DocumentRegistry::untrack(AcApDocument *document) {
-    documents_.erase(
-        std::remove_if(
-            documents_.begin(), documents_.end(),
-            [document](const TrackedDocument &tracked) {
-                return tracked.document == document;
-            }),
-        documents_.end());
+    const auto tracked = std::find_if(
+        documents_.begin(), documents_.end(),
+        [document](const TrackedDocument &candidate) {
+            return candidate.document == document;
+        });
+    if (tracked != documents_.end() && tracked->database) {
+        tracked->database->removeReactor(&databaseReactor_);
+        documentsByDatabase_.erase(tracked->database);
+    }
+    if (tracked != documents_.end()) {
+        documents_.erase(tracked);
+    }
 }
 
 std::unique_ptr<DocumentRegistry> documentRegistry;
