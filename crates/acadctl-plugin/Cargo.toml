@@ -1,0 +1,19 @@
+[package]
+name = "acadctl-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+dev-reload = ["dep:notify"]
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+cxx.workspace = true
+notify = { version = "8.2.0", optional = true }
+
+[build-dependencies]
+cxx-build.workspace = true
