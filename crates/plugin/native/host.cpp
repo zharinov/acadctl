@@ -2,8 +2,6 @@
 #include "acdocman.h"
 #include "aced.h"
 #include "AcString.h"
-#include "dbmain.h"
-
 #include "acadctl-plugin/src/lib.rs.h"
 #include <algorithm>
 #include <memory>
@@ -29,38 +27,6 @@ private:
     void track(AcApDocument *document);
 
     void untrack(AcApDocument *document);
-
-    class DatabaseReactor final : public AcDbDatabaseReactor {
-    public:
-        explicit DatabaseReactor(DocumentRegistry &registry) : registry_(registry) {}
-
-        void objectAppended(const AcDbDatabase *, const AcDbObject *) override {
-            registry_.publish();
-        }
-
-        void objectUnAppended(const AcDbDatabase *, const AcDbObject *) override {
-            registry_.publish();
-        }
-
-        void objectReAppended(const AcDbDatabase *, const AcDbObject *) override {
-            registry_.publish();
-        }
-
-        void objectModified(const AcDbDatabase *, const AcDbObject *) override {
-            registry_.publish();
-        }
-
-        void objectErased(const AcDbDatabase *, const AcDbObject *, bool) override {
-            registry_.publish();
-        }
-
-        void headerSysVarChanged(const AcDbDatabase *, const ACHAR *, bool) override {
-            registry_.publish();
-        }
-
-    private:
-        DocumentRegistry &registry_;
-    };
 
     class DocumentReactor final : public AcApDocManagerReactor {
     public:
@@ -117,13 +83,12 @@ private:
     };
 
     std::vector<AcApDocument *> documents_;
-    DatabaseReactor databaseReactor_;
     DocumentReactor documentReactor_;
     EditorReactor editorReactor_;
 };
 
 DocumentRegistry::DocumentRegistry()
-    : databaseReactor_(*this), documentReactor_(*this), editorReactor_(*this) {}
+    : documentReactor_(*this), editorReactor_(*this) {}
 
 void DocumentRegistry::start() {
     acDocManager->addReactor(&documentReactor_);
@@ -143,11 +108,6 @@ void DocumentRegistry::stop() {
     acedEditor->removeReactor(&editorReactor_);
     acDocManager->removeReactor(&documentReactor_);
 
-    for (AcApDocument *document : documents_) {
-        if (AcDbDatabase *database = document->database()) {
-            database->removeReactor(&databaseReactor_);
-        }
-    }
     documents_.clear();
 }
 
@@ -170,15 +130,9 @@ void DocumentRegistry::track(AcApDocument *document) {
         return;
     }
     documents_.push_back(document);
-    if (AcDbDatabase *database = document->database()) {
-        database->addReactor(&databaseReactor_);
-    }
 }
 
 void DocumentRegistry::untrack(AcApDocument *document) {
-    if (AcDbDatabase *database = document->database()) {
-        database->removeReactor(&databaseReactor_);
-    }
     documents_.erase(
         std::remove(documents_.begin(), documents_.end(), document),
         documents_.end());
