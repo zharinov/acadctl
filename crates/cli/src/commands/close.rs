@@ -9,15 +9,8 @@ pub async fn run(id: String, discard: bool) -> ExitCode {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
-    if let Err(status) = client
-        .close(CloseRequest {
-            id: id.clone(),
-            discard,
-        })
-        .await
-    {
+    if let Err(status) = client.close(CloseRequest { id, discard }).await {
         return fail(request_error_message("close the document", status));
     }
-    println!("closed  {id}");
     ExitCode::SUCCESS
 }

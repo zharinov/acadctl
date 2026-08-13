@@ -16,7 +16,7 @@ use crate::instances::QueryError;
 type Client = acadctl_rpc::AcadctlClient<Channel>;
 
 fn fail(message: String) -> ExitCode {
-    eprintln!("Error: {message}");
+    eprintln!("acadctl: {message}");
     ExitCode::FAILURE
 }
 

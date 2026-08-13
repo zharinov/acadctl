@@ -5,7 +5,7 @@ use acadctl_rpc::OpenRequest;
 
 use crate::instances::{ListReport, autocad_process_ids};
 
-use super::{document_line, fail, query_error_message, request_error_message};
+use super::{fail, query_error_message, request_error_message};
 
 pub async fn run(path: PathBuf, process_id: Option<u32>) -> ExitCode {
     let path = match drawing_path(&path) {
@@ -41,7 +41,7 @@ pub async fn run(path: PathBuf, process_id: Option<u32>) -> ExitCode {
     let Some(document) = opened.document else {
         return fail("AutoCAD did not identify the opened document.".into());
     };
-    println!("{}", document_line(&document, true));
+    println!("{}", document.id);
     ExitCode::SUCCESS
 }
 

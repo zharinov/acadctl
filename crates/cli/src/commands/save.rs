@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::SaveRequest;
 
-use super::{document_line, fail, request_error_message};
+use super::{fail, request_error_message};
 
 pub async fn run(id: String) -> ExitCode {
     let mut client = match super::target::connect(&id).await {
@@ -13,9 +13,8 @@ pub async fn run(id: String) -> ExitCode {
         Ok(response) => response.into_inner(),
         Err(status) => return fail(request_error_message("save the document", status)),
     };
-    let Some(document) = saved.document else {
+    if saved.document.is_none() {
         return fail("AutoCAD did not identify the saved document.".into());
-    };
-    println!("{}", document_line(&document, true));
+    }
     ExitCode::SUCCESS
 }
