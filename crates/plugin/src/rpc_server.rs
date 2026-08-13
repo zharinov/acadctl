@@ -1,11 +1,13 @@
 use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use acadctl_rpc::{Acadctl, AcadctlServer, Document, ListRequest, ListResponse};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 const MAX_CONCURRENT_STREAMS: u32 = 32;
+const RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
 static DOCUMENTS: Mutex<Vec<Document>> = Mutex::new(Vec::new());
@@ -13,6 +15,17 @@ static DOCUMENTS: Mutex<Vec<Document>> = Mutex::new(Vec::new());
 struct Server {
     stop: oneshot::Sender<()>,
     thread: JoinHandle<()>,
+}
+
+impl Server {
+    fn is_running(&self) -> bool {
+        !self.thread.is_finished()
+    }
+
+    fn shutdown(self) {
+        let _ = self.stop.send(());
+        let _ = self.thread.join();
+    }
 }
 
 struct Service;
@@ -32,15 +45,18 @@ pub fn start() -> Result<(), String> {
     let mut active = SERVER
         .lock()
         .map_err(|_| "server state is unavailable".to_owned())?;
-    if active.is_some() {
+    if active.as_ref().is_some_and(Server::is_running) {
         return Ok(());
+    }
+    if let Some(server) = active.take() {
+        server.shutdown();
     }
 
     let (stop, stop_receiver) = oneshot::channel();
-    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-    let thread = thread::spawn(move || run(stop_receiver, ready_sender));
+    let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || run(stop_receiver, startup_sender));
 
-    match ready_receiver.recv() {
+    match startup_receiver.recv() {
         Ok(Ok(())) => {
             *active = Some(Server { stop, thread });
             Ok(())
@@ -59,8 +75,7 @@ pub fn start() -> Result<(), String> {
 pub fn stop() {
     let server = SERVER.lock().ok().and_then(|mut active| active.take());
     if let Some(server) = server {
-        let _ = server.stop.send(());
-        let _ = server.thread.join();
+        server.shutdown();
     }
 }
 
@@ -78,50 +93,93 @@ pub fn set_documents(documents: Vec<crate::ffi::DocumentState>) {
     }
 }
 
-fn run(stop: oneshot::Receiver<()>, ready: mpsc::SyncSender<Result<(), String>>) {
+fn run(stop: oneshot::Receiver<()>, startup: mpsc::SyncSender<Result<(), String>>) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = ready.send(Err(format!("could not create the async runtime: {error}")));
+            let error = format!("could not create the async runtime: {error}");
+            let _ = startup.send(Err(error));
             return;
         }
     };
 
-    runtime.block_on(async move {
-        let incoming = match acadctl_rpc::incoming(std::process::id()) {
+    runtime.block_on(serve(
+        std::process::id(),
+        stop,
+        startup,
+        acadctl_rpc::incoming,
+    ))
+}
+
+async fn serve(
+    process_id: u32,
+    mut stop: oneshot::Receiver<()>,
+    startup: mpsc::SyncSender<Result<(), String>>,
+    mut bind: impl FnMut(u32) -> std::io::Result<acadctl_rpc::Incoming>,
+) {
+    let mut startup = Some(startup);
+    loop {
+        let connections = match bind(process_id) {
             Ok(incoming) => incoming,
             Err(error) => {
-                let _ = ready.send(Err(format!("could not create the RPC endpoint: {error}")));
-                return;
+                let error = format!("could not create the RPC endpoint: {error}");
+                if let Some(startup) = startup.take() {
+                    let _ = startup.send(Err(error));
+                    return;
+                }
+                if stopped_during_restart_backoff(&mut stop).await {
+                    return;
+                }
+                continue;
             }
         };
-        if ready.send(Ok(())).is_err() {
+        if startup
+            .take()
+            .is_some_and(|startup| startup.send(Ok(())).is_err())
+        {
             return;
         }
 
         let serving = tonic::transport::Server::builder()
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
             .add_service(AcadctlServer::new(Service))
-            .serve_with_incoming(incoming);
+            .serve_with_incoming(connections);
         tokio::pin!(serving);
         tokio::select! {
             _ = &mut serving => {}
-            _ = stop => {}
+            _ = &mut stop => return,
         }
-    });
+        if stopped_during_restart_backoff(&mut stop).await {
+            return;
+        }
+    }
+}
+
+async fn stopped_during_restart_backoff(stop: &mut oneshot::Receiver<()>) -> bool {
+    tokio::select! {
+        _ = stop => true,
+        _ = tokio::time::sleep(RESTART_BACKOFF) => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+
+    use futures_util::StreamExt;
 
     use super::*;
 
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn reports_documents_and_stops_promptly() {
+        let _guard = TEST_LOCK.lock().unwrap();
         set_documents(vec![
             crate::ffi::DocumentState {
                 id: "k7m2qx".into(),
@@ -161,5 +219,91 @@ mod tests {
         stop();
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(client);
+    }
+
+    #[test]
+    fn start_replaces_a_finished_server_thread() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        stop();
+
+        let (stop_sender, _stop_receiver) = oneshot::channel();
+        let thread = thread::spawn(|| {});
+        while !thread.is_finished() {
+            thread::yield_now();
+        }
+        *SERVER.lock().unwrap() = Some(Server {
+            stop: stop_sender,
+            thread,
+        });
+
+        start().unwrap();
+        assert!(
+            SERVER
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(Server::is_running)
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            acadctl_rpc::connect(std::process::id()).await.unwrap();
+        });
+        stop();
+    }
+
+    #[test]
+    fn restarts_after_the_incoming_stream_fails() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        stop();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let factory_attempts = Arc::clone(&attempts);
+        let (stop_sender, stop_receiver) = oneshot::channel();
+        let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(serve(
+                std::process::id(),
+                stop_receiver,
+                startup_sender,
+                move |process_id| {
+                    let incoming = acadctl_rpc::incoming(process_id)?;
+                    if factory_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let failure = futures_util::stream::once(async {
+                            Err(std::io::Error::other("forced accept failure"))
+                        });
+                        Ok(Box::pin(failure.chain(incoming.take(0))))
+                    } else {
+                        Ok(incoming)
+                    }
+                },
+            ))
+        });
+
+        startup_receiver.recv().unwrap().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while attempts.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "RPC server was not restarted");
+            thread::yield_now();
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut client = acadctl_rpc::connect(std::process::id()).await.unwrap();
+            client.list(ListRequest {}).await.unwrap();
+        });
+
+        let _ = stop_sender.send(());
+        thread.join().unwrap();
     }
 }

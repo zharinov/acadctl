@@ -20,6 +20,7 @@ dependencies = [
  "acadctl-rpc",
  "cxx",
  "cxx-build",
+ "futures-util",
  "nanoid",
  "tokio",
  "tonic",
