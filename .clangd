@@ -1,0 +1,11 @@
+If:
+  PathMatch: crates/plugin/native/.*
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -arch
+    - arm64
+    - -mmacosx-version-min=14.0
+    - -isystem
+    - /Library/Developer/Autodesk/ObjectARX 2027/inc
+    - -I../../../target/rust-objectarx/cxxbridge
