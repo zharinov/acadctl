@@ -1,35 +1,34 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 sdk_root=${OBJECTARX_SDK_ROOT:-/Library/Developer/Autodesk/ObjectARX 2027}
 autocad_root=${AUTOCAD_ROOT:-/Applications/Autodesk/AutoCAD 2027/AutoCAD 2027.app}
 deployment_target=${MACOSX_DEPLOYMENT_TARGET:-14.0}
 rust_target="$repo_root/target/rust-objectarx"
-configuration=${1:-}
+configuration=${1:-dev}
 
 case "$configuration" in
     dev)
         cargo_profile=debug
-        cargo_args="--features acadctl-plugin/dev-reload"
+        cargo_args=
         ;;
     release)
         cargo_profile=release
         cargo_args=--release
         ;;
     *)
-        echo "usage: $0 dev|release" >&2
+        echo "usage: $0 [dev|release]" >&2
         exit 2
         ;;
 esac
 
 build_bundle="$repo_root/target/objectarx/build/$configuration/acadctl.bundle"
-build_executable="$build_bundle/Contents/MacOS/acadctl-plugin"
-build_payload="$build_bundle/Contents/MacOS/libacadctl_core.dylib"
-bundle="$repo_root/target/objectarx/$configuration/acadctl.bundle"
-executable="$bundle/Contents/MacOS/acadctl-plugin"
-payload="$bundle/Contents/MacOS/libacadctl_core.dylib"
-reload_signal="$repo_root/target/objectarx/$configuration/reload"
+build_cli="$repo_root/target/objectarx/build/$configuration/acadctl"
+build_plugin="$build_bundle/Contents/acadctl-plugin.bundle"
+build_executable="$build_plugin/Contents/MacOS/acadctl-plugin"
+bundle="$repo_root/dist/acadctl.bundle"
+cli="$repo_root/dist/acadctl"
 
 test -f "$sdk_root/inc/rxregsvc.h" || {
     echo "ObjectARX SDK not found at $sdk_root" >&2
@@ -46,57 +45,46 @@ MACOSX_DEPLOYMENT_TARGET="$deployment_target" \
     CARGO_TARGET_DIR="$rust_target" \
     cargo build --workspace $cargo_args
 
-mkdir -p "$build_bundle/Contents/MacOS"
-mkdir -p "$bundle/Contents/MacOS"
-rm -f "$build_bundle/Contents/_CodeSignature/CodeResources"
-cp "$repo_root/native/objectarx/Info.plist" "$build_bundle/Contents/Info.plist"
-
-set --
-if test "$configuration" = dev; then
-    set -- \
-        -DACADCTL_DEV_RELOAD \
-        "-DACADCTL_RELOAD_SIGNAL_PATH=\"$reload_signal\"" \
-        -framework CoreFoundation \
-        -framework CoreServices
-fi
-set -- "$@" "-DACADCTL_PAYLOAD_PATH=\"$payload\""
+rm -rf "$build_bundle"
+mkdir -p "$build_plugin/Contents/MacOS"
+cp "$repo_root/crates/plugin/native/Info.plist" "$build_plugin/Contents/Info.plist"
+cp "$repo_root/crates/plugin/native/PackageContents.xml" "$build_bundle/PackageContents.xml"
+cp "$repo_root/crates/plugin/native/acadctl-loader.lsp" "$build_bundle/Contents/acadctl-loader.lsp"
 
 clang++ \
     -std=c++17 \
     -arch arm64 \
     -mmacosx-version-min="$deployment_target" \
     -bundle \
-    "$@" \
-    -I"$sdk_root/inc" \
-    -I"$repo_root/native/objectarx" \
+    -isystem "$sdk_root/inc" \
     -I"$rust_target/cxxbridge" \
     -L"$autocad_root/Contents/Frameworks" \
     -F"$autocad_root/Contents/Frameworks" \
-    "$repo_root/native/objectarx/host.cpp" \
+    "$repo_root/crates/plugin/native/host.cpp" \
     "$rust_target/$cargo_profile/libacadctl_plugin.a" \
     -lacfirst \
     -lacdb \
     -laccore \
     -lAcPal \
+    -framework Foundation \
+    -lobjc \
     -o "$build_executable"
 
-cp "$rust_target/$cargo_profile/libacadctl_core.dylib" "$build_payload"
+cp "$rust_target/$cargo_profile/acadctl" "$build_cli"
 
-plutil -lint "$build_bundle/Contents/Info.plist" >/dev/null
+plutil -lint "$build_plugin/Contents/Info.plist" >/dev/null
+xmllint --noout "$build_bundle/PackageContents.xml"
 file "$build_executable" | grep -q 'Mach-O 64-bit bundle arm64'
 nm -gU "$build_executable" | grep -q ' _acrxEntryPoint$'
-nm -gU "$build_payload" | grep -q ' _acadctl_hello_message$'
-codesign --force --sign - "$build_bundle"
-codesign --verify --strict "$build_bundle"
+codesign --force --sign - "$build_plugin"
+codesign --verify --strict "$build_plugin"
+test -x "$build_cli"
 
-mkdir -p "$bundle/Contents/_CodeSignature"
-mv -f "$build_bundle/Contents/Info.plist" "$bundle/Contents/Info.plist"
-mv -f "$build_executable" "$executable"
-mv -f "$build_bundle/Contents/_CodeSignature/CodeResources" \
-    "$bundle/Contents/_CodeSignature/CodeResources"
-mv -f "$build_payload" "$payload"
-if test "$configuration" = dev; then
-    printf '%s-%s\n' "$(date +%s)" "$$" > "$reload_signal"
-fi
+mkdir -p "$(dirname "$bundle")"
+rm -rf "$bundle"
+mv "$build_bundle" "$bundle"
+mv -f "$build_cli" "$cli"
+codesign --verify --strict "$bundle/Contents/acadctl-plugin.bundle"
 
 echo "$bundle"
+echo "$cli"

@@ -1,19 +1,18 @@
 [package]
 name = "acadctl-plugin"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-
-[features]
-dev-reload = ["dep:notify"]
 
 [lib]
 crate-type = ["staticlib"]
 
 [dependencies]
+acadctl-rpc = { path = "../rpc" }
 cxx.workspace = true
-notify = { version = "8.2.0", optional = true }
+tokio.workspace = true
+tonic.workspace = true
 
 [build-dependencies]
 cxx-build.workspace = true

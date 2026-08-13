@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package acadctl;
+
+service Acadctl {
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  repeated Document documents = 1;
+}
+
+message Document {
+  string path = 1;
+  bool modified = 2;
+}

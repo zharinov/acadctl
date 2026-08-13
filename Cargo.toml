@@ -1,7 +1,8 @@
 [workspace]
 members = [
-    "crates/acadctl-core",
-    "crates/acadctl-plugin",
+    "crates/cli",
+    "crates/rpc",
+    "crates/plugin",
 ]
 resolver = "3"
 
@@ -9,7 +10,20 @@ resolver = "3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
+version = "0.7.2"
 
 [workspace.dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
 cxx = "1.0.199"
 cxx-build = "1.0.199"
+futures-util = "0.3.31"
+hyper-util = { version = "0.1.17", features = ["tokio"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSPathUtilities", "NSString"] }
+prost = "0.14.1"
+protoc-bin-vendored = "3.2.0"
+sysinfo = "0.39.6"
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+tower = { version = "0.5.2", features = ["util"] }
