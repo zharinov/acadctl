@@ -2,17 +2,22 @@ use std::sync::{Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use acadctl_rpc::{Acadctl, AcadctlServer, ListRequest, ListResponse};
+use acadctl_rpc::{
+    Acadctl, AcadctlServer, CloseRequest, CloseResponse, ListRequest, ListResponse, OpenRequest,
+    OpenResponse, SaveRequest, SaveResponse,
+};
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
-use crate::documents::DocumentRegistry;
+use crate::documents::{DocumentRegistry, DocumentTarget};
+use crate::native_actions::Error as NativeActionError;
 
 const MAX_CONCURRENT_STREAMS: u32 = 32;
 const RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
 static DOCUMENTS: Mutex<DocumentRegistry> = Mutex::new(DocumentRegistry::new());
+static LIFECYCLE_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Server {
     stop: oneshot::Sender<()>,
@@ -41,6 +46,160 @@ impl Acadctl for Service {
             .list();
         Ok(Response::new(ListResponse { documents }))
     }
+
+    async fn open(&self, request: Request<OpenRequest>) -> Result<Response<OpenResponse>, Status> {
+        let path = request.into_inner().path;
+        validate_open_path(&path)?;
+        let _operation = LIFECYCLE_OPERATION.lock().await;
+
+        if let Some(target) = find_by_path(&path)? {
+            return Ok(Response::new(OpenResponse {
+                document: Some(target.document),
+            }));
+        }
+
+        crate::native_actions::open(path.clone())
+            .await
+            .map_err(native_error)?;
+
+        let target = find_by_path(&path)?.ok_or_else(|| {
+            Status::internal("AutoCAD opened the drawing but did not publish its document state")
+        })?;
+        Ok(Response::new(OpenResponse {
+            document: Some(target.document),
+        }))
+    }
+
+    async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
+        let id = request.into_inner().id;
+        validate_document_id(&id)?;
+        let _operation = LIFECYCLE_OPERATION.lock().await;
+        let target = find_by_id(&id)?.ok_or_else(|| document_not_found(&id))?;
+        validate_save_target(&target, &id)?;
+
+        if target.document.modified {
+            crate::native_actions::save(target.native_token)
+                .await
+                .map_err(native_error)?;
+        }
+
+        let saved = find_by_id(&id)?.ok_or_else(|| document_not_found(&id))?;
+        if saved.document.modified {
+            return Err(Status::internal(
+                "AutoCAD completed the save but still reports unsaved changes",
+            ));
+        }
+        Ok(Response::new(SaveResponse {
+            document: Some(saved.document),
+        }))
+    }
+
+    async fn close(
+        &self,
+        request: Request<CloseRequest>,
+    ) -> Result<Response<CloseResponse>, Status> {
+        let request = request.into_inner();
+        validate_document_id(&request.id)?;
+        let _operation = LIFECYCLE_OPERATION.lock().await;
+        let target = find_by_id(&request.id)?.ok_or_else(|| document_not_found(&request.id))?;
+        if target.document.modified && !request.discard {
+            return Err(unsaved_changes(&request.id));
+        }
+
+        crate::native_actions::close(target.native_token, request.discard)
+            .await
+            .map_err(|error| match error {
+                NativeActionError::Dirty => unsaved_changes(&request.id),
+                error => native_error(error),
+            })?;
+
+        if find_by_id(&request.id)?.is_some() {
+            return Err(Status::internal(
+                "AutoCAD completed the close but the document is still open",
+            ));
+        }
+        Ok(Response::new(CloseResponse {}))
+    }
+}
+
+fn validate_open_path(path: &str) -> Result<(), Status> {
+    let path = std::path::Path::new(path);
+
+    if !path.is_absolute() {
+        return Err(Status::invalid_argument(
+            "The drawing path must be absolute",
+        ));
+    }
+
+    if !is_dwg(path) {
+        return Err(Status::invalid_argument("Only DWG drawings can be opened"));
+    }
+
+    Ok(())
+}
+
+fn validate_document_id(id: &str) -> Result<(), Status> {
+    if id.is_empty() {
+        Err(Status::invalid_argument("The document ID is required"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_save_target(target: &DocumentTarget, id: &str) -> Result<(), Status> {
+    if !target.named {
+        return Err(Status::failed_precondition(format!(
+            "Document '{id}' has no file name. Save As is not supported yet."
+        )));
+    }
+
+    if target.document.read_only {
+        return Err(Status::failed_precondition(format!(
+            "Document '{id}' is read-only."
+        )));
+    }
+
+    if !is_dwg(std::path::Path::new(&target.document.path)) {
+        return Err(Status::failed_precondition(
+            "Only DWG drawings can be saved",
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_dwg(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dwg"))
+}
+
+fn find_by_id(id: &str) -> Result<Option<DocumentTarget>, Status> {
+    DOCUMENTS
+        .lock()
+        .map_err(|_| Status::internal("document state is unavailable"))
+        .map(|documents| documents.find_by_id(id))
+}
+
+fn find_by_path(path: &str) -> Result<Option<DocumentTarget>, Status> {
+    DOCUMENTS
+        .lock()
+        .map_err(|_| Status::internal("document state is unavailable"))
+        .map(|documents| documents.find_by_path(path))
+}
+
+fn document_not_found(id: &str) -> Status {
+    Status::not_found(format!("Document '{id}' is not open."))
+}
+
+fn unsaved_changes(id: &str) -> Status {
+    Status::failed_precondition(format!(
+        "Document '{id}' has unsaved changes. Run `acadctl save {id}` first or use `acadctl close {id} --discard`."
+    ))
+}
+
+fn native_error(error: NativeActionError) -> Status {
+    Status::failed_precondition(error.to_string())
 }
 
 pub fn start() -> Result<(), String> {
@@ -75,6 +234,7 @@ pub fn start() -> Result<(), String> {
 }
 
 pub fn stop() {
+    crate::native_actions::cancel_all();
     let server = SERVER.lock().ok().and_then(|mut active| active.take());
     if let Some(server) = server {
         server.shutdown();
@@ -196,6 +356,39 @@ mod tests {
             assert_eq!(listed.documents[1].path, "/tmp/site.dwg");
             assert!(listed.documents[1].modified);
             assert!(listed.documents[1].read_only);
+
+            let opened = client
+                .open(OpenRequest {
+                    path: "/tmp/house.dwg".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .document
+                .unwrap();
+            assert_eq!(opened.id, listed.documents[0].id);
+
+            let saved = client
+                .save(SaveRequest {
+                    id: opened.id.clone(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .document
+                .unwrap();
+            assert_eq!(saved.id, opened.id);
+            assert!(!saved.modified);
+
+            let close_error = client
+                .close(CloseRequest {
+                    id: listed.documents[1].id.clone(),
+                    discard: false,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(close_error.code(), tonic::Code::FailedPrecondition);
+            assert!(close_error.message().contains("has unsaved changes"));
             client
         });
 

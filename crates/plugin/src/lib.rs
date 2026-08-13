@@ -10,6 +10,43 @@ mod ffi {
         read_only: bool,
     }
 
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeActionKind {
+        None,
+        Open,
+        Save,
+        Close,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeActionResultKind {
+        Success,
+        DocumentGone,
+        Unnamed,
+        ReadOnly,
+        Dirty,
+        OpenFailed,
+        LockFailed,
+        SaveFailed,
+        CloseFailed,
+    }
+
+    struct NativeAction {
+        request_id: u64,
+        kind: NativeActionKind,
+        document_token: usize,
+        path: String,
+        discard: bool,
+    }
+
+    struct NativeActionResult {
+        kind: NativeActionResultKind,
+        native_status: i32,
+        native_detail: String,
+    }
+
     extern "Rust" {
         fn start_rpc_server() -> String;
 
@@ -19,11 +56,16 @@ mod ffi {
 
         fn replace_documents(documents: Vec<NativeDocumentState>);
 
+        fn take_native_action() -> NativeAction;
+
+        fn complete_native_action(request_id: u64, result: NativeActionResult);
+
         fn stop_rpc_server();
     }
 }
 
 mod documents;
+mod native_actions;
 mod rpc_server;
 
 static DOCUMENTS_DIRTY: AtomicBool = AtomicBool::new(false);
@@ -42,6 +84,14 @@ fn take_documents_dirty() -> bool {
 
 fn replace_documents(documents: Vec<ffi::NativeDocumentState>) {
     rpc_server::replace_documents(documents);
+}
+
+fn take_native_action() -> ffi::NativeAction {
+    native_actions::take()
+}
+
+fn complete_native_action(request_id: u64, result: ffi::NativeActionResult) {
+    native_actions::complete(request_id, result);
 }
 
 fn stop_rpc_server() {

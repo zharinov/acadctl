@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::process::ExitCode;
 
-use acadctl_rpc::Document;
+use crate::instances::{ListError, ListReport};
 
-use crate::instances::{ListError, ListReport, QueryError};
+use super::{document_line, fail, query_error_message};
 
 pub async fn run(long: bool) -> ExitCode {
     let report = match crate::instances::list().await {
@@ -40,11 +39,6 @@ fn render(report: &ListReport, long: bool) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
-fn fail(message: String) -> ExitCode {
-    eprintln!("Error: {message}");
-    ExitCode::FAILURE
-}
-
 fn list_error_message(error: ListError) -> String {
     match error {
         ListError::QueryTaskFailed => {
@@ -53,45 +47,12 @@ fn list_error_message(error: ListError) -> String {
     }
 }
 
-fn query_error_message(error: &QueryError) -> String {
-    match error {
-        QueryError::CannotConnect => {
-            "Could not connect to the acadctl plugin. Install it and restart AutoCAD.".into()
-        }
-        QueryError::TimedOut => {
-            "AutoCAD did not respond within 5 seconds. Try again when it is idle.".into()
-        }
-        QueryError::OutdatedPlugin => {
-            "The acadctl plugin is outdated. Install the current version and restart AutoCAD."
-                .into()
-        }
-        QueryError::RequestFailed(message) if message.is_empty() => {
-            "The acadctl plugin could not list documents.".into()
-        }
-        QueryError::RequestFailed(message) => {
-            format!("Could not list AutoCAD documents: {message}")
-        }
-    }
-}
-
-fn document_line(document: &Document, long: bool) -> String {
-    let modified = if document.modified { "*" } else { "-" };
-    let mode = if document.read_only { "r" } else { "w" };
-    let name = if long {
-        document.path.as_str()
-    } else {
-        Path::new(&document.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&document.path)
-    };
-    format!("{}  {modified}  {mode}  {name}", document.id)
-}
-
 #[cfg(test)]
 mod tests {
+    use acadctl_rpc::Document;
+
     use super::*;
-    use crate::instances::Instance;
+    use crate::instances::{Instance, QueryError};
 
     #[test]
     fn renders_only_actionable_document_state() {

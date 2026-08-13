@@ -1,11 +1,12 @@
 use std::ffi::OsStr;
 use std::time::Duration;
 
-use acadctl_rpc::{Document, ListRequest};
+use acadctl_rpc::{AcadctlClient, Document, ListRequest};
 use sysinfo::System;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tonic::Code;
+use tonic::transport::Channel;
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -58,9 +59,7 @@ async fn query(process_id: u32) -> Instance {
 }
 
 async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
-    let mut client = acadctl_rpc::connect(process_id)
-        .await
-        .map_err(|_| QueryError::CannotConnect)?;
+    let mut client = connect(process_id).await?;
     let listed = client
         .list(ListRequest {})
         .await
@@ -75,7 +74,13 @@ async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
     Ok(listed.documents)
 }
 
-fn autocad_process_ids() -> Vec<u32> {
+pub async fn connect(process_id: u32) -> Result<AcadctlClient<Channel>, QueryError> {
+    acadctl_rpc::connect(process_id)
+        .await
+        .map_err(|_| QueryError::CannotConnect)
+}
+
+pub fn autocad_process_ids() -> Vec<u32> {
     let system = System::new_all();
     let mut pids = system
         .processes()

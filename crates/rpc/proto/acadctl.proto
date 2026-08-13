@@ -4,6 +4,9 @@ package acadctl;
 
 service Acadctl {
   rpc List(ListRequest) returns (ListResponse);
+  rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Save(SaveRequest) returns (SaveResponse);
+  rpc Close(CloseRequest) returns (CloseResponse);
 }
 
 message ListRequest {}
@@ -11,6 +14,29 @@ message ListRequest {}
 message ListResponse {
   repeated Document documents = 1;
 }
+
+message OpenRequest {
+  string path = 1;
+}
+
+message OpenResponse {
+  Document document = 1;
+}
+
+message SaveRequest {
+  string id = 1;
+}
+
+message SaveResponse {
+  Document document = 1;
+}
+
+message CloseRequest {
+  string id = 1;
+  bool discard = 2;
+}
+
+message CloseResponse {}
 
 message Document {
   string id = 1;

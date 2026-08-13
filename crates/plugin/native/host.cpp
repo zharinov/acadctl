@@ -1,9 +1,10 @@
-#include "rxregsvc.h"
+#include "AcString.h"
+#include "acadctl-plugin/src/lib.rs.h"
 #include "acdocman.h"
 #include "aced.h"
-#include "AcString.h"
+#include "acestext.h"
 #include "dbmain.h"
-#include "acadctl-plugin/src/lib.rs.h"
+#include "rxregsvc.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -12,277 +13,436 @@
 #include <vector>
 
 int acdbGetDbmod(AcDbDatabase *database);
+int acdbSetDbmod(AcDbDatabase *database, int value);
 
 namespace {
 
 struct DocumentSubscription {
-    AcApDocument *document;
-    AcDbDatabase *database;
+  AcApDocument *document;
+  AcDbDatabase *database;
 };
 
 class ObjectArxBridge {
 public:
-    ObjectArxBridge();
+  ObjectArxBridge();
 
-    void start();
+  void start();
 
-    void stop();
+  void stop();
+
+  void processPendingActions();
 
 private:
-    void publishDocuments();
+  AcApDocument *document(std::size_t token);
 
-    void syncDocuments();
+  acadctl::NativeActionResult open(const rust::String &path);
 
-    void syncDirtyDocuments();
+  acadctl::NativeActionResult save(AcApDocument *document);
 
-    void refreshSubscription(DocumentSubscription &subscription);
+  acadctl::NativeActionResult close(AcApDocument *document, bool discard);
 
-    void subscribe(AcApDocument *document);
+  void publishDocuments();
 
-    void unsubscribe(AcApDocument *document);
+  void syncDocuments();
 
-    class DatabaseReactor final : public AcDbDatabaseReactor {
-    public:
-        void objectAppended(const AcDbDatabase *, const AcDbObject *) override {
-            acadctl::mark_documents_dirty();
-        }
+  void syncDirtyDocuments();
 
-        void objectUnAppended(const AcDbDatabase *, const AcDbObject *) override {
-            acadctl::mark_documents_dirty();
-        }
+  void refreshSubscription(DocumentSubscription &subscription);
 
-        void objectReAppended(const AcDbDatabase *, const AcDbObject *) override {
-            acadctl::mark_documents_dirty();
-        }
+  void subscribe(AcApDocument *document);
 
-        void objectModified(const AcDbDatabase *, const AcDbObject *) override {
-            acadctl::mark_documents_dirty();
-        }
+  void unsubscribe(AcApDocument *document);
 
-        void objectErased(const AcDbDatabase *, const AcDbObject *, bool) override {
-            acadctl::mark_documents_dirty();
-        }
+  class DatabaseReactor final : public AcDbDatabaseReactor {
+  public:
+    void objectAppended(const AcDbDatabase *, const AcDbObject *) override {
+      acadctl::mark_documents_dirty();
+    }
 
-        void headerSysVarChanged(const AcDbDatabase *, const ACHAR *, bool) override {
-            acadctl::mark_documents_dirty();
-        }
-    };
+    void objectUnAppended(const AcDbDatabase *, const AcDbObject *) override {
+      acadctl::mark_documents_dirty();
+    }
 
-    class DocumentReactor final : public AcApDocManagerReactor {
-    public:
-        explicit DocumentReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
+    void objectReAppended(const AcDbDatabase *, const AcDbObject *) override {
+      acadctl::mark_documents_dirty();
+    }
 
-        void documentCreated(AcApDocument *document) override {
-            bridge_.subscribe(document);
-            bridge_.syncDocuments();
-        }
+    void objectModified(const AcDbDatabase *, const AcDbObject *) override {
+      acadctl::mark_documents_dirty();
+    }
 
-        void documentToBeDestroyed(AcApDocument *document) override {
-            bridge_.unsubscribe(document);
-            bridge_.syncDocuments();
-        }
+    void objectErased(const AcDbDatabase *, const AcDbObject *, bool) override {
+      acadctl::mark_documents_dirty();
+    }
 
-        void documentTitleUpdated(AcApDocument *) override {
-            bridge_.syncDocuments();
-        }
+    void headerSysVarChanged(const AcDbDatabase *, const ACHAR *,
+                             bool) override {
+      acadctl::mark_documents_dirty();
+    }
+  };
 
-        void documentActivated(AcApDocument *) override {
-            bridge_.syncDocuments();
-        }
+  class DocumentReactor final : public AcApDocManagerReactor {
+  public:
+    explicit DocumentReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
 
-    private:
-        ObjectArxBridge &bridge_;
-    };
+    void documentCreated(AcApDocument *document) override {
+      bridge_.subscribe(document);
+      bridge_.syncDocuments();
+    }
 
-    class EditorReactor final : public AcEditorReactor {
-    public:
-        explicit EditorReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
+    void documentToBeDestroyed(AcApDocument *document) override {
+      bridge_.unsubscribe(document);
+      bridge_.syncDocuments();
+    }
 
-        void commandEnded(const ACHAR *) override {
-            bridge_.syncDirtyDocuments();
-        }
+    void documentTitleUpdated(AcApDocument *) override {
+      bridge_.syncDocuments();
+    }
 
-        void commandCancelled(const ACHAR *) override {
-            bridge_.syncDirtyDocuments();
-        }
+    void documentActivated(AcApDocument *) override { bridge_.syncDocuments(); }
 
-        void commandFailed(const ACHAR *) override {
-            bridge_.syncDirtyDocuments();
-        }
+  private:
+    ObjectArxBridge &bridge_;
+  };
 
-        void lispEnded() override {
-            bridge_.syncDirtyDocuments();
-        }
+  class EditorReactor final : public AcEditorReactor {
+  public:
+    explicit EditorReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
 
-        void lispCancelled() override {
-            bridge_.syncDirtyDocuments();
-        }
+    void commandEnded(const ACHAR *) override { bridge_.syncDirtyDocuments(); }
 
-        void saveComplete(AcDbDatabase *, const ACHAR *) override {
-            bridge_.syncDocuments();
-        }
+    void commandCancelled(const ACHAR *) override {
+      bridge_.syncDirtyDocuments();
+    }
 
-        void abortSave(AcDbDatabase *) override {
-            bridge_.syncDocuments();
-        }
+    void commandFailed(const ACHAR *) override { bridge_.syncDirtyDocuments(); }
 
-        void curDocOpenUpgraded(AcDbDatabase *, const CAdUiPathname &) override {
-            bridge_.syncDocuments();
-        }
+    void lispEnded() override { bridge_.syncDirtyDocuments(); }
 
-        void curDocOpenDowngraded(AcDbDatabase *, const CAdUiPathname &) override {
-            bridge_.syncDocuments();
-        }
+    void lispCancelled() override { bridge_.syncDirtyDocuments(); }
 
-    private:
-        ObjectArxBridge &bridge_;
-    };
+    void saveComplete(AcDbDatabase *, const ACHAR *) override {
+      bridge_.syncDocuments();
+    }
 
-    std::vector<DocumentSubscription> subscriptions_;
-    DatabaseReactor databaseReactor_;
-    DocumentReactor documentReactor_;
-    EditorReactor editorReactor_;
+    void abortSave(AcDbDatabase *) override { bridge_.syncDocuments(); }
+
+    void curDocOpenUpgraded(AcDbDatabase *, const CAdUiPathname &) override {
+      bridge_.syncDocuments();
+    }
+
+    void curDocOpenDowngraded(AcDbDatabase *, const CAdUiPathname &) override {
+      bridge_.syncDocuments();
+    }
+
+  private:
+    ObjectArxBridge &bridge_;
+  };
+
+  std::vector<DocumentSubscription> subscriptions_;
+  DatabaseReactor databaseReactor_;
+  DocumentReactor documentReactor_;
+  EditorReactor editorReactor_;
 };
+
+acadctl::NativeActionResult result(acadctl::NativeActionResultKind kind) {
+  return {kind, 0, rust::String()};
+}
+
+acadctl::NativeActionResult nativeFailure(
+    acadctl::NativeActionResultKind kind, Acad::ErrorStatus status) {
+  const AcString detail(acadErrorStatusText(status));
+  return {kind, static_cast<std::int32_t>(status), rust::String(detail.utf8Ptr())};
+}
 
 ObjectArxBridge::ObjectArxBridge()
     : documentReactor_(*this), editorReactor_(*this) {}
 
 void ObjectArxBridge::start() {
-    acDocManager->addReactor(&documentReactor_);
-    acedEditor->addReactor(&editorReactor_);
+  acDocManager->addReactor(&documentReactor_);
+  acedEditor->addReactor(&editorReactor_);
 
-    auto iterator = acDocManager->getDocumentIterator();
-    while (!iterator->done()) {
-        if (AcApDocument *document = iterator->document()) {
-            subscribe(document);
-        }
-        iterator->step();
+  auto iterator = acDocManager->getDocumentIterator();
+  while (!iterator->done()) {
+    if (AcApDocument *document = iterator->document()) {
+      subscribe(document);
     }
-    syncDocuments();
+    iterator->step();
+  }
+  syncDocuments();
 }
 
 void ObjectArxBridge::stop() {
-    acedEditor->removeReactor(&editorReactor_);
-    acDocManager->removeReactor(&documentReactor_);
+  acedEditor->removeReactor(&editorReactor_);
+  acDocManager->removeReactor(&documentReactor_);
 
-    for (const DocumentSubscription &subscription : subscriptions_) {
-        if (subscription.database) {
-            subscription.database->removeReactor(&databaseReactor_);
-        }
+  for (const DocumentSubscription &subscription : subscriptions_) {
+    if (subscription.database) {
+      subscription.database->removeReactor(&databaseReactor_);
     }
-    subscriptions_.clear();
+  }
+  subscriptions_.clear();
+}
+
+void ObjectArxBridge::processPendingActions() {
+  while (true) {
+    acadctl::NativeAction action = acadctl::take_native_action();
+    if (action.kind == acadctl::NativeActionKind::None) {
+      return;
+    }
+
+    acadctl::NativeActionResult actionResult =
+        result(acadctl::NativeActionResultKind::Success);
+    switch (action.kind) {
+    case acadctl::NativeActionKind::Open:
+      actionResult = open(action.path);
+      break;
+    case acadctl::NativeActionKind::Save:
+      if (AcApDocument *target = document(action.document_token)) {
+        actionResult = save(target);
+      } else {
+        actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+      }
+      break;
+    case acadctl::NativeActionKind::Close:
+      if (AcApDocument *target = document(action.document_token)) {
+        actionResult = close(target, action.discard);
+      } else {
+        actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+      }
+      break;
+    case acadctl::NativeActionKind::None:
+      return;
+    }
+
+    syncDocuments();
+    acadctl::complete_native_action(action.request_id, std::move(actionResult));
+  }
+}
+
+AcApDocument *ObjectArxBridge::document(std::size_t token) {
+  const auto subscription = std::find_if(
+      subscriptions_.begin(), subscriptions_.end(),
+      [token](const DocumentSubscription &candidate) {
+        return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(
+                   candidate.document)) == token;
+      });
+  return subscription == subscriptions_.end() ? nullptr
+                                              : subscription->document;
+}
+
+acadctl::NativeActionResult ObjectArxBridge::open(const rust::String &path) {
+  const AcString drawingPath(path.data(), AcString::Utf8,
+                             static_cast<Adesk::UInt32>(path.size()));
+  AcApDocManager::DocOpenParams parameters{};
+  parameters.mpwszFileName = drawingPath.kACharPtr();
+  parameters.mnInitialViewType = AcApDocManager::DocOpenParams::kDefaultView;
+  parameters.mnFlags = AcApDocManager::DocOpenParams::kFileNameArgIsUnicode;
+
+  const Acad::ErrorStatus status =
+      acDocManager->appContextOpenDocument(&parameters);
+  return status == Acad::eOk
+             ? result(acadctl::NativeActionResultKind::Success)
+             : nativeFailure(acadctl::NativeActionResultKind::OpenFailed,
+                             status);
+}
+
+acadctl::NativeActionResult ObjectArxBridge::save(AcApDocument *document) {
+  if (!document->isNamedDrawing()) {
+    return result(acadctl::NativeActionResultKind::Unnamed);
+  }
+
+  if (document->isReadOnly()) {
+    return result(acadctl::NativeActionResultKind::ReadOnly);
+  }
+
+  const Acad::ErrorStatus lockStatus = acDocManager->lockDocument(
+      document, AcAp::kXWrite, nullptr, nullptr, false);
+  if (lockStatus != Acad::eOk) {
+    return nativeFailure(acadctl::NativeActionResultKind::LockFailed,
+                         lockStatus);
+  }
+
+  AcApDocument *active = acDocManager->mdiActiveDocument();
+  bool changedCurrent = active != document;
+  Acad::ErrorStatus status = Acad::eOk;
+  if (changedCurrent) {
+    status = acDocManager->setCurDocument(document, AcAp::kNone, false);
+  }
+
+  if (status == Acad::eOk) {
+    AcDb::AcDbDwgVersion version;
+    AcDb::MaintenanceReleaseVersion maintenance;
+    status = AcApDocument::getDwgVersionFromSaveFormat(
+        document->formatForSave(), version, maintenance);
+    if (status == Acad::eOk) {
+      status =
+          document->database()->saveAs(document->fileName(), true, version);
+    }
+  }
+
+  if (changedCurrent && active) {
+    const Acad::ErrorStatus restoreStatus =
+        acDocManager->setCurDocument(active, AcAp::kNone, false);
+    if (status == Acad::eOk) {
+      status = restoreStatus;
+    }
+  }
+  const Acad::ErrorStatus unlockStatus = acDocManager->unlockDocument(document);
+  if (status == Acad::eOk) {
+    status = unlockStatus;
+  }
+
+  return status == Acad::eOk
+             ? result(acadctl::NativeActionResultKind::Success)
+             : nativeFailure(acadctl::NativeActionResultKind::SaveFailed,
+                             status);
+}
+
+acadctl::NativeActionResult ObjectArxBridge::close(AcApDocument *document,
+                                                   bool discard) {
+  AcDbDatabase *database = document->database();
+  const int dbmod = acdbGetDbmod(database);
+
+  if (dbmod != 0 && !discard) {
+    return result(acadctl::NativeActionResultKind::Dirty);
+  }
+
+  if (discard) {
+    acdbSetDbmod(database, 0);
+  }
+
+  const Acad::ErrorStatus status =
+      acDocManager->appContextCloseDocument(document);
+  if (status != Acad::eOk && discard) {
+    acdbSetDbmod(database, dbmod);
+  }
+  return status == Acad::eOk
+             ? result(acadctl::NativeActionResultKind::Success)
+             : nativeFailure(acadctl::NativeActionResultKind::CloseFailed,
+                             status);
 }
 
 void ObjectArxBridge::publishDocuments() {
-    rust::Vec<acadctl::NativeDocumentState> states;
-    for (DocumentSubscription &subscription : subscriptions_) {
-        refreshSubscription(subscription);
-        if (!subscription.database) {
-            continue;
-        }
-
-        AcApDocument *document = subscription.document;
-        const bool named = document->isNamedDrawing();
-        const AcString name(named ? document->fileName() : document->docTitle());
-        states.push_back(acadctl::NativeDocumentState{
-            static_cast<std::size_t>(
-                reinterpret_cast<std::uintptr_t>(document)),
-            rust::String(name.utf8Ptr()),
-            named,
-            acdbGetDbmod(subscription.database) != 0,
-            document->isReadOnly(),
-        });
+  rust::Vec<acadctl::NativeDocumentState> states;
+  for (DocumentSubscription &subscription : subscriptions_) {
+    refreshSubscription(subscription);
+    if (!subscription.database) {
+      continue;
     }
-    acadctl::replace_documents(std::move(states));
+
+    AcApDocument *document = subscription.document;
+    const bool named = document->isNamedDrawing();
+    const AcString name(named ? document->fileName() : document->docTitle());
+    states.push_back(acadctl::NativeDocumentState{
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
+        rust::String(name.utf8Ptr()),
+        named,
+        acdbGetDbmod(subscription.database) != 0,
+        document->isReadOnly(),
+    });
+  }
+  acadctl::replace_documents(std::move(states));
 }
 
 void ObjectArxBridge::syncDocuments() {
-    acadctl::take_documents_dirty();
-    publishDocuments();
+  acadctl::take_documents_dirty();
+  publishDocuments();
 }
 
 void ObjectArxBridge::syncDirtyDocuments() {
-    if (!acadctl::take_documents_dirty()) {
-        return;
-    }
+  if (!acadctl::take_documents_dirty()) {
+    return;
+  }
 
-    publishDocuments();
+  publishDocuments();
 }
 
 void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
-    AcDbDatabase *database = subscription.document->database();
-    if (subscription.database == database) {
-        return;
-    }
+  AcDbDatabase *database = subscription.document->database();
+  if (subscription.database == database) {
+    return;
+  }
 
-    if (subscription.database) {
-        subscription.database->removeReactor(&databaseReactor_);
-    }
-    subscription.database = database;
-    if (subscription.database) {
-        subscription.database->addReactor(&databaseReactor_);
-    }
+  if (subscription.database) {
+    subscription.database->removeReactor(&databaseReactor_);
+  }
+  subscription.database = database;
+  if (subscription.database) {
+    subscription.database->addReactor(&databaseReactor_);
+  }
 }
 
 void ObjectArxBridge::subscribe(AcApDocument *document) {
-    const auto alreadySubscribed = std::find_if(
-        subscriptions_.begin(), subscriptions_.end(),
-        [document](const DocumentSubscription &subscription) {
-            return subscription.document == document;
-        });
-    if (alreadySubscribed != subscriptions_.end()) {
-        return;
-    }
+  const auto alreadySubscribed =
+      std::find_if(subscriptions_.begin(), subscriptions_.end(),
+                   [document](const DocumentSubscription &subscription) {
+                     return subscription.document == document;
+                   });
+  if (alreadySubscribed != subscriptions_.end()) {
+    return;
+  }
 
-    subscriptions_.push_back(DocumentSubscription{document, nullptr});
-    refreshSubscription(subscriptions_.back());
+  subscriptions_.push_back(DocumentSubscription{document, nullptr});
+  refreshSubscription(subscriptions_.back());
 }
 
 void ObjectArxBridge::unsubscribe(AcApDocument *document) {
-    const auto subscription = std::find_if(
-        subscriptions_.begin(), subscriptions_.end(),
-        [document](const DocumentSubscription &candidate) {
-            return candidate.document == document;
-        });
-    if (subscription == subscriptions_.end()) {
-        return;
-    }
+  const auto subscription =
+      std::find_if(subscriptions_.begin(), subscriptions_.end(),
+                   [document](const DocumentSubscription &candidate) {
+                     return candidate.document == document;
+                   });
+  if (subscription == subscriptions_.end()) {
+    return;
+  }
 
-    if (subscription->database) {
-        subscription->database->removeReactor(&databaseReactor_);
-    }
-    subscriptions_.erase(subscription);
+  if (subscription->database) {
+    subscription->database->removeReactor(&databaseReactor_);
+  }
+  subscriptions_.erase(subscription);
 }
 
 std::unique_ptr<ObjectArxBridge> objectArxBridge;
 
+void processPendingActions(void *) {
+  if (objectArxBridge) {
+    objectArxBridge->processPendingActions();
+  }
+}
+
+} // namespace
+
+extern "C" int acadctl_wake_native_actions() {
+  return static_cast<int>(acDocManager->beginExecuteInApplicationContext(
+      processPendingActions, nullptr));
 }
 
 extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
-                                             void *applicationId) {
-    switch (message) {
-        case AcRx::kInitAppMsg: {
-            acrxDynamicLinker->unlockApplication(applicationId);
-            acrxDynamicLinker->registerAppMDIAware(applicationId);
-            objectArxBridge = std::make_unique<ObjectArxBridge>();
-            objectArxBridge->start();
-            rust::String error = acadctl::start_rpc_server();
-            if (!error.empty()) {
-                syslog(LOG_ERR, "acadctl plugin failed to start: %s", error.c_str());
-                objectArxBridge->stop();
-                objectArxBridge.reset();
-                return AcRx::kRetError;
-            }
-            break;
-        }
-        case AcRx::kUnloadAppMsg:
-            objectArxBridge->stop();
-            objectArxBridge.reset();
-            acadctl::stop_rpc_server();
-            break;
-        default:
-            break;
+                                           void *applicationId) {
+  switch (message) {
+  case AcRx::kInitAppMsg: {
+    acrxDynamicLinker->unlockApplication(applicationId);
+    acrxDynamicLinker->registerAppMDIAware(applicationId);
+    objectArxBridge = std::make_unique<ObjectArxBridge>();
+    objectArxBridge->start();
+    rust::String error = acadctl::start_rpc_server();
+    if (!error.empty()) {
+      syslog(LOG_ERR, "acadctl plugin failed to start: %s", error.c_str());
+      objectArxBridge->stop();
+      objectArxBridge.reset();
+      return AcRx::kRetError;
     }
+    break;
+  }
+  case AcRx::kUnloadAppMsg:
+    acadctl::stop_rpc_server();
+    objectArxBridge->stop();
+    objectArxBridge.reset();
+    break;
+  default:
+    break;
+  }
 
-    return AcRx::kRetOK;
+  return AcRx::kRetOK;
 }

@@ -16,7 +16,15 @@ pub struct DocumentRegistry {
 
 struct TrackedDocument {
     native_token: usize,
+    named: bool,
     document: Document,
+}
+
+#[derive(Clone)]
+pub struct DocumentTarget {
+    pub native_token: usize,
+    pub named: bool,
+    pub document: Document,
 }
 
 impl DocumentRegistry {
@@ -44,6 +52,7 @@ impl DocumentRegistry {
                 .unwrap_or_else(|| new_document_id(&mut reserved_ids));
             self.documents.push(TrackedDocument {
                 native_token: native.token,
+                named: native.named,
                 document: Document {
                     id,
                     path: document_path(native.name, native.named),
@@ -60,6 +69,38 @@ impl DocumentRegistry {
             .map(|tracked| tracked.document.clone())
             .collect()
     }
+
+    pub fn find_by_id(&self, id: &str) -> Option<DocumentTarget> {
+        self.documents
+            .iter()
+            .find(|tracked| tracked.document.id == id)
+            .map(document_target)
+    }
+
+    pub fn find_by_path(&self, path: &str) -> Option<DocumentTarget> {
+        self.documents
+            .iter()
+            .find(|tracked| tracked.named && paths_equal(&tracked.document.path, path))
+            .map(document_target)
+    }
+}
+
+fn document_target(tracked: &TrackedDocument) -> DocumentTarget {
+    DocumentTarget {
+        native_token: tracked.native_token,
+        named: tracked.named,
+        document: tracked.document.clone(),
+    }
+}
+
+#[cfg(windows)]
+fn paths_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn paths_equal(left: &str, right: &str) -> bool {
+    left == right
 }
 
 fn take_document_id(documents: &mut Vec<TrackedDocument>, native_token: usize) -> Option<String> {
@@ -144,6 +185,29 @@ mod tests {
             "/tmp/house.DWG"
         );
         assert_eq!(document_path("図面".into(), false), "図面");
+    }
+
+    #[test]
+    fn finds_documents_by_id_and_named_path() {
+        let mut documents = DocumentRegistry::new();
+        documents.replace(vec![
+            named_document(1, "/tmp/house.dwg"),
+            unnamed_document(2, "Drawing1.dwg"),
+        ]);
+        let listed = documents.list();
+
+        let by_id = documents.find_by_id(&listed[0].id).unwrap();
+        assert_eq!(by_id.native_token, 1);
+        assert!(by_id.named);
+        assert_eq!(by_id.document.path, "/tmp/house.dwg");
+        assert_eq!(
+            documents
+                .find_by_path("/tmp/house.dwg")
+                .unwrap()
+                .native_token,
+            1
+        );
+        assert!(documents.find_by_path("Drawing1").is_none());
     }
 
     #[test]
