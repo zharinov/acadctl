@@ -10,17 +10,20 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Instance {
     pub process_id: u32,
-    pub documents: Vec<Document>,
+    pub plugin: PluginState,
 }
 
 pub struct StatusReport {
-    pub process_count: usize,
     pub instances: Vec<Instance>,
+}
+
+pub enum PluginState {
+    Available(Vec<Document>),
+    Unavailable,
 }
 
 pub async fn status() -> StatusReport {
     let process_ids = autocad_process_ids();
-    let process_count = process_ids.len();
     let mut pending = JoinSet::new();
     for process_id in process_ids {
         pending.spawn(query(process_id));
@@ -28,30 +31,29 @@ pub async fn status() -> StatusReport {
 
     let mut instances = Vec::new();
     while let Some(result) = pending.join_next().await {
-        if let Ok(Some(instance)) = result {
+        if let Ok(instance) = result {
             instances.push(instance);
         }
     }
     instances.sort_unstable_by_key(|instance| instance.process_id);
 
-    StatusReport {
-        process_count,
-        instances,
-    }
+    StatusReport { instances }
 }
 
-async fn query(process_id: u32) -> Option<Instance> {
-    timeout(STATUS_TIMEOUT, async move {
+async fn query(process_id: u32) -> Instance {
+    let documents = timeout(STATUS_TIMEOUT, async move {
         let mut client = acadctl_rpc::connect(process_id).await.ok()?;
         let status = client.status(StatusRequest {}).await.ok()?.into_inner();
-        Some(Instance {
-            process_id,
-            documents: status.documents,
-        })
+        Some(status.documents)
     })
     .await
     .ok()
-    .flatten()
+    .flatten();
+
+    Instance {
+        process_id,
+        plugin: documents.map_or(PluginState::Unavailable, PluginState::Available),
+    }
 }
 
 fn autocad_process_ids() -> Vec<u32> {
