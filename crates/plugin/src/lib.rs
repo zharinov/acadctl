@@ -65,6 +65,7 @@ mod ffi {
     #[derive(Debug)]
     #[repr(u8)]
     enum NativeValueEventKind {
+        Invalid,
         BeginList,
         EndList,
         Dot,
@@ -130,6 +131,10 @@ mod ffi {
         integer: i64,
         number: u64,
         native_type: u32,
+        real: f64,
+        x: f64,
+        y: f64,
+        z: f64,
         has_payload: bool,
     }
 
@@ -173,9 +178,6 @@ mod ffi {
             writer: &mut NativeValueWriter,
             event: NativeValueEvent,
             text: &str,
-            x: &str,
-            y: &str,
-            z: &str,
         ) -> NativeValueWriteResult;
 
         fn finish_value_writer(writer: Box<NativeValueWriter>) -> NativeValueWriteResult;
@@ -270,20 +272,18 @@ fn write_value_event(
     writer: &mut NativeValueWriter,
     event: ffi::NativeValueEvent,
     text: &str,
-    x: &str,
-    y: &str,
-    z: &str,
 ) -> ffi::NativeValueWriteResult {
     let value = match event.kind {
+        ffi::NativeValueEventKind::Invalid => ValueEvent::Invalid,
         ffi::NativeValueEventKind::BeginList => ValueEvent::BeginList,
         ffi::NativeValueEventKind::EndList => ValueEvent::EndList,
         ffi::NativeValueEventKind::Dot => ValueEvent::Dot,
         ffi::NativeValueEventKind::Nil => ValueEvent::Nil,
         ffi::NativeValueEventKind::True => ValueEvent::True,
         ffi::NativeValueEventKind::Integer => ValueEvent::Integer(event.integer),
-        ffi::NativeValueEventKind::Real => ValueEvent::Real(text),
-        ffi::NativeValueEventKind::Point2 => ValueEvent::Point2(x, y),
-        ffi::NativeValueEventKind::Point3 => ValueEvent::Point3(x, y, z),
+        ffi::NativeValueEventKind::Real => ValueEvent::Real(event.real),
+        ffi::NativeValueEventKind::Point2 => ValueEvent::Point2(event.x, event.y),
+        ffi::NativeValueEventKind::Point3 => ValueEvent::Point3(event.x, event.y, event.z),
         ffi::NativeValueEventKind::BeginString => ValueEvent::BeginString,
         ffi::NativeValueEventKind::StringChunk => ValueEvent::StringChunk(text),
         ffi::NativeValueEventKind::EndString => ValueEvent::EndString,

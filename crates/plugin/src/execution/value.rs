@@ -1,14 +1,8 @@
-#![allow(
-    dead_code,
-    reason = "the value printer stays private until the native output bridge is connected"
-)]
-
 use super::output::{EmitResult, OUTPUT_CHUNK_BYTES, OutputSink};
 
 pub const MAX_VALUE_DEPTH: usize = 64 * 1024;
 pub const MAX_VALUE_TEXT_BYTES: usize = OUTPUT_CHUNK_BYTES;
 
-const MAX_REAL_TEXT_BYTES: usize = 64;
 const MAX_ENTITY_HANDLE_BYTES: usize = 32;
 const MAX_CLASS_NAME_BYTES: usize = 128;
 const MAX_FUNCTION_NAME_BYTES: usize = 256;
@@ -174,21 +168,21 @@ impl ValuePrinter {
         self.scalar(&value.to_string())
     }
 
-    pub fn real_text(&mut self, text: &str) -> Result<(), PrintError> {
-        if !valid_real_text(text) {
-            return Err(PrintError::InvalidSequence);
-        }
-        self.scalar(text)
+    pub fn real(&mut self, value: f64) -> Result<(), PrintError> {
+        let text = format_autolisp_real(value).ok_or(PrintError::InvalidSequence)?;
+        self.scalar(&text)
     }
 
-    pub fn point(&mut self, coordinates: &[&str]) -> Result<(), PrintError> {
-        if !matches!(coordinates.len(), 2 | 3)
-            || coordinates
-                .iter()
-                .any(|coordinate| !valid_real_text(coordinate))
-        {
+    pub fn point(&mut self, coordinates: &[f64]) -> Result<(), PrintError> {
+        if !matches!(coordinates.len(), 2 | 3) {
             return Err(PrintError::InvalidSequence);
         }
+        let coordinates = coordinates
+            .iter()
+            .copied()
+            .map(format_autolisp_real)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(PrintError::InvalidSequence)?;
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
@@ -555,47 +549,70 @@ impl OpaqueKind {
     }
 }
 
-fn valid_real_text(text: &str) -> bool {
-    text.len() <= MAX_REAL_TEXT_BYTES
-        && canonical_real_syntax(text)
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E'))
-        && text.parse::<f64>().is_ok_and(f64::is_finite)
+fn format_autolisp_real(value: f64) -> Option<String> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value == 0.0 {
+        return Some("0.0".to_owned());
+    }
+
+    let scientific = format!("{value:.5e}");
+    let (mantissa, exponent) = scientific.split_once('e')?;
+    let exponent = exponent.parse::<i32>().ok()?;
+    let negative = mantissa.starts_with('-');
+    let digits: String = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(char::from)
+        .collect();
+
+    if (-4..6).contains(&exponent) {
+        let decimal = exponent + 1;
+        let mut result = String::with_capacity(16);
+        if negative {
+            result.push('-');
+        }
+        if decimal <= 0 {
+            result.push_str("0.");
+            result.extend(std::iter::repeat_n('0', (-decimal) as usize));
+            result.push_str(&digits);
+        } else {
+            let decimal = decimal as usize;
+            if decimal >= digits.len() {
+                result.push_str(&digits);
+                result.extend(std::iter::repeat_n('0', decimal - digits.len()));
+                result.push_str(".0");
+                return Some(result);
+            }
+            result.push_str(&digits[..decimal]);
+            result.push('.');
+            result.push_str(&digits[decimal..]);
+        }
+        trim_fraction(&mut result);
+        Some(result)
+    } else {
+        let mut result = mantissa.to_owned();
+        trim_fraction(&mut result);
+        result.push('e');
+        if exponent >= 0 {
+            result.push('+');
+        } else {
+            result.push('-');
+        }
+        let magnitude = exponent.unsigned_abs();
+        if magnitude < 10 {
+            result.push('0');
+        }
+        result.push_str(&magnitude.to_string());
+        Some(result)
+    }
 }
 
-fn canonical_real_syntax(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
-    let integer_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
+fn trim_fraction(value: &mut String) {
+    while value.ends_with('0') && !value.ends_with(".0") {
+        value.pop();
     }
-    if index == integer_start || bytes.get(index) != Some(&b'.') {
-        return false;
-    }
-    index += 1;
-    let fraction_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
-    }
-    if index == fraction_start {
-        return false;
-    }
-    if matches!(bytes.get(index), Some(b'e' | b'E')) {
-        index += 1;
-        if matches!(bytes.get(index), Some(b'+' | b'-')) {
-            index += 1;
-        }
-        let exponent_start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
-        if index == exponent_start {
-            return false;
-        }
-    }
-    index == bytes.len()
 }
 
 fn valid_label(text: &str, max_bytes: usize) -> bool {
@@ -756,24 +773,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_only_autolisp_normalized_real_text() {
+    async fn formats_autolisp_reals_from_native_binary_values() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
         printer.begin_list().unwrap();
-        for number in ["1.0", "0.0", "1.23457", "1.0e-12", "1.0e+20"] {
-            printer.real_text(number).unwrap();
+        for number in [1.0, -0.0, 1.234567890123, 1.0e-12, 1.0e20] {
+            printer.real(number).unwrap();
         }
-        assert_eq!(printer.real_text("NaN"), Err(PrintError::InvalidSequence));
-        assert_eq!(printer.real_text("inf"), Err(PrintError::InvalidSequence));
-        assert_eq!(printer.real_text(".5"), Err(PrintError::InvalidSequence));
-        assert_eq!(printer.real_text("1."), Err(PrintError::InvalidSequence));
-        assert_eq!(printer.real_text("1.0e"), Err(PrintError::InvalidSequence));
+        assert_eq!(printer.real(f64::NAN), Err(PrintError::InvalidSequence));
+        assert_eq!(
+            printer.real(f64::INFINITY),
+            Err(PrintError::InvalidSequence)
+        );
         printer.end_list().unwrap();
         printer.finish().unwrap();
         terminal.finish();
 
         assert_eq!(collect(stream).await, "(1.0 0.0 1.23457 1.0e-12 1.0e+20)\n");
+    }
+
+    #[test]
+    fn matches_live_autolisp_real_thresholds_and_rounding() {
+        for (value, expected) in [
+            (1.0e-6, "1.0e-06"),
+            (1.0e-5, "1.0e-05"),
+            (1.0e-4, "0.0001"),
+            (1.0e-3, "0.001"),
+            (1.0e4, "10000.0"),
+            (1.0e5, "100000.0"),
+            (1.0e6, "1.0e+06"),
+            (9.999994, "9.99999"),
+            (9.999995, "10.0"),
+            (999_999.4, "999999.0"),
+            (999_999.5, "1.0e+06"),
+            (0.000_099_999_94, "9.99999e-05"),
+            (0.000_099_999_95, "0.0001"),
+            (999_996.5, "999996.0"),
+            (999_997.5, "999998.0"),
+            (999_998.5, "999998.0"),
+            (100_000.5, "100000.0"),
+        ] {
+            assert_eq!(format_autolisp_real(value).as_deref(), Some(expected));
+            let negative = format!("-{expected}");
+            assert_eq!(
+                format_autolisp_real(-value).as_deref(),
+                Some(negative.as_str())
+            );
+        }
+        assert_eq!(
+            format_autolisp_real(f64::MAX).as_deref(),
+            Some("1.79769e+308")
+        );
+        assert_eq!(
+            format_autolisp_real(f64::MIN_POSITIVE).as_deref(),
+            Some("2.22507e-308")
+        );
     }
 
     #[test]

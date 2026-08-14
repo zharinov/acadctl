@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "the typed native writer stays private until acadctl:println is registered"
-)]
-
 use super::output::EmitResult;
 use super::value::{PrintError, PrintMode, ValuePrinter};
 use super::{FormOutputLease, ValueBridgeFailure};
@@ -27,9 +22,9 @@ pub enum ValueEvent<'a> {
     Nil,
     True,
     Integer(i64),
-    Real(&'a str),
-    Point2(&'a str, &'a str),
-    Point3(&'a str, &'a str, &'a str),
+    Real(f64),
+    Point2(f64, f64),
+    Point3(f64, f64, f64),
     BeginString,
     StringChunk(&'a str),
     EndString,
@@ -123,7 +118,7 @@ impl NativeValueWriter {
             ValueEvent::Nil => printer.nil(),
             ValueEvent::True => printer.true_value(),
             ValueEvent::Integer(value) => printer.integer(value),
-            ValueEvent::Real(text) => printer.real_text(text),
+            ValueEvent::Real(value) => printer.real(value),
             ValueEvent::Point2(x, y) => printer.point(&[x, y]),
             ValueEvent::Point3(x, y, z) => printer.point(&[x, y, z]),
             ValueEvent::BeginString => printer.begin_string(),

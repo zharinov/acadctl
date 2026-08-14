@@ -7,11 +7,13 @@
 #include "aced.h"
 #include "acestext.h"
 #include "acutads.h"
+#include "dbhandle.h"
 #include "dbmain.h"
 #include "rxregsvc.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <syslog.h>
 #include <vector>
@@ -25,6 +27,7 @@ namespace {
 struct DocumentSubscription {
   AcApDocument *document;
   AcDbDatabase *database;
+  bool lispFunctionsDefined;
 };
 
 class ObjectArxBridge {
@@ -37,8 +40,12 @@ public:
 
   void processPendingActions();
 
+  void setLispFunctionsDefined(AcApDocument *document, bool defined);
+
 private:
   AcApDocument *document(std::size_t token);
+
+  bool lispFunctionsDefined(AcApDocument *document) const;
 
   acadctl::NativeActionResult open(const rust::String &path);
 
@@ -189,6 +196,216 @@ struct ResbufDeleter {
 };
 
 using ResbufPtr = std::unique_ptr<resbuf, ResbufDeleter>;
+
+constexpr int kPrintlnFunctionCode = 1;
+constexpr std::size_t kWideValueChunkUnits = 4096;
+
+acadctl::NativeValueEvent
+valueEvent(acadctl::NativeValueEventKind kind) {
+  return {kind};
+}
+
+bool writeValueEvent(acadctl::NativeValueWriter &writer,
+                     acadctl::NativeValueEvent event,
+                     rust::Str text = rust::Str()) {
+  return acadctl::write_value_event(writer, event, text) ==
+         acadctl::NativeValueWriteResult::Continue;
+}
+
+bool writeValueKind(acadctl::NativeValueWriter &writer,
+                    acadctl::NativeValueEventKind kind) {
+  return writeValueEvent(writer, valueEvent(kind));
+}
+
+std::size_t boundedWideChunkLength(const ACHAR *text) {
+  std::size_t length = 0;
+  while (length < kWideValueChunkUnits && text[length] != 0) {
+    ++length;
+  }
+  if constexpr (sizeof(ACHAR) == 2) {
+    if (length == kWideValueChunkUnits && text[length] != 0) {
+      const auto last = static_cast<std::uint32_t>(text[length - 1]);
+      const auto next = static_cast<std::uint32_t>(text[length]);
+      if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 &&
+          next <= 0xdfff) {
+        --length;
+      }
+    }
+  }
+  return length;
+}
+
+bool writeString(acadctl::NativeValueWriter &writer, const ACHAR *text) {
+  if (!text) {
+    return writeValueKind(writer, acadctl::NativeValueEventKind::Invalid);
+  }
+  if (!writeValueKind(writer, acadctl::NativeValueEventKind::BeginString)) {
+    return false;
+  }
+
+  for (const ACHAR *cursor = text; *cursor != 0;) {
+    const std::size_t length = boundedWideChunkLength(cursor);
+    const AcString chunk(cursor, static_cast<Adesk::UInt32>(length));
+    const char *utf8 = chunk.utf8Ptr();
+    if (!utf8) {
+      return writeValueKind(writer, acadctl::NativeValueEventKind::Invalid);
+    }
+    if (!writeValueEvent(writer,
+                         valueEvent(acadctl::NativeValueEventKind::StringChunk),
+                         rust::Str(utf8, std::strlen(utf8)))) {
+      return false;
+    }
+    cursor += length;
+  }
+  return writeValueKind(writer, acadctl::NativeValueEventKind::EndString);
+}
+
+bool writeEntity(acadctl::NativeValueWriter &writer, const ads_name name) {
+  acadctl::NativeValueEvent event =
+      valueEvent(acadctl::NativeValueEventKind::Entity);
+  AcDbObjectId objectId;
+  if (acdbGetObjectId(objectId, name) != Acad::eOk || objectId.isNull()) {
+    return writeValueEvent(writer, event);
+  }
+
+  ACHAR handleText[AcDbHandle::kStrSiz]{};
+  if (!objectId.handle().getIntoAsciiBuffer(handleText)) {
+    return writeValueEvent(writer, event);
+  }
+  const AcString utf8Handle(handleText);
+  event.has_payload = true;
+  return writeValueEvent(writer, event, rust::Str(utf8Handle.utf8Ptr()));
+}
+
+bool writeResbufNode(acadctl::NativeValueWriter &writer,
+                     const resbuf &node) {
+  switch (node.restype) {
+  case RTLB:
+    return writeValueKind(writer, acadctl::NativeValueEventKind::BeginList);
+  case RTLE:
+    return writeValueKind(writer, acadctl::NativeValueEventKind::EndList);
+  case RTDOTE:
+    return writeValueKind(writer, acadctl::NativeValueEventKind::Dot);
+  case RTNIL:
+    return writeValueKind(writer, acadctl::NativeValueEventKind::Nil);
+  case RTT:
+    return writeValueKind(writer, acadctl::NativeValueEventKind::True);
+  case RTVOID:
+    return writeValueKind(writer, acadctl::NativeValueEventKind::Void);
+  case RTSHORT: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Integer);
+    event.integer = node.resval.rint;
+    return writeValueEvent(writer, event);
+  }
+  case RTLONG: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Integer);
+    event.integer = node.resval.rlong;
+    return writeValueEvent(writer, event);
+  }
+  case RTINT64: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Integer);
+    event.integer = node.resval.mnInt64;
+    return writeValueEvent(writer, event);
+  }
+  case RTREAL:
+  case RTANG:
+  case RTORINT: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Real);
+    event.real = node.resval.rreal;
+    return writeValueEvent(writer, event);
+  }
+  case RTPOINT: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Point2);
+    event.x = node.resval.rpoint[0];
+    event.y = node.resval.rpoint[1];
+    return writeValueEvent(writer, event);
+  }
+  case RT3DPOINT: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Point3);
+    event.x = node.resval.rpoint[0];
+    event.y = node.resval.rpoint[1];
+    event.z = node.resval.rpoint[2];
+    return writeValueEvent(writer, event);
+  }
+  case RTSTR:
+    return writeString(writer, node.resval.rstring);
+  case RTENAME:
+    return writeEntity(writer, node.resval.rlname);
+  case RTPICKS:
+    return writeValueKind(writer,
+                          acadctl::NativeValueEventKind::SelectionSet);
+  default: {
+    acadctl::NativeValueEvent event =
+        valueEvent(acadctl::NativeValueEventKind::Unsupported);
+    event.native_type = static_cast<std::uint32_t>(
+        static_cast<std::int32_t>(node.restype));
+    event.has_payload = true;
+    return writeValueEvent(writer, event);
+  }
+  }
+}
+
+void writeResbufSequence(acadctl::NativeValueWriter &writer,
+                         const resbuf *head) {
+  const resbuf *slow = head;
+  const resbuf *fast = head;
+  for (const resbuf *node = head; node; node = node->rbnext) {
+    if (!writeResbufNode(writer, *node)) {
+      return;
+    }
+
+    slow = slow ? slow->rbnext : nullptr;
+    fast = fast && fast->rbnext ? fast->rbnext->rbnext : nullptr;
+    if (slow && slow == fast) {
+      writeValueKind(writer, acadctl::NativeValueEventKind::Invalid);
+      return;
+    }
+  }
+}
+
+int acadctlPrintln() noexcept {
+  try {
+    AcApDocument *document = acDocManager->curDocument();
+    AcDbDatabase *database = document ? document->database() : nullptr;
+    rust::Box<acadctl::NativeValueWriter> writer = acadctl::begin_println(
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(database)));
+    if (acadctl::value_writer_active(*writer)) {
+      writeResbufSequence(*writer, acedGetArgs());
+    }
+    const int returnStatus = acedRetNil();
+    if (returnStatus != RTNORM) {
+      writeValueKind(*writer, acadctl::NativeValueEventKind::Invalid);
+    }
+    acadctl::finish_value_writer(std::move(writer));
+    return returnStatus == RTNORM ? RSRSLT : RSERR;
+  } catch (...) {
+    syslog(LOG_ERR, "acadctl:println bridge failed unexpectedly");
+    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+  }
+}
+
+int defineLispFunctions() {
+  int status = acedDefun(ACRX_T("acadctl:println"), kPrintlnFunctionCode);
+  if (status != RTNORM) {
+    return status;
+  }
+  status = acedRegFunc(&acadctlPrintln, kPrintlnFunctionCode);
+  if (status != RTNORM) {
+    acedUndef(ACRX_T("acadctl:println"), kPrintlnFunctionCode);
+  }
+  return status;
+}
+
+int undefineLispFunctions() {
+  return acedUndef(ACRX_T("acadctl:println"), kPrintlnFunctionCode);
+}
 
 int putStringSymbol(const ACHAR *name, const AcString &text) {
   resbuf value{};
@@ -694,6 +911,27 @@ void ObjectArxBridge::processPendingActions() {
   scheduleNextNativeAction();
 }
 
+void ObjectArxBridge::setLispFunctionsDefined(AcApDocument *document,
+                                              bool defined) {
+  if (!document) {
+    return;
+  }
+  if (defined) {
+    subscribe(document);
+  }
+  const auto subscription =
+      std::find_if(subscriptions_.begin(), subscriptions_.end(),
+                   [document](const DocumentSubscription &candidate) {
+                     return candidate.document == document;
+                   });
+  if (subscription != subscriptions_.end()) {
+    if (defined) {
+      refreshSubscription(*subscription);
+    }
+    subscription->lispFunctionsDefined = defined;
+  }
+}
+
 AcApDocument *ObjectArxBridge::document(std::size_t token) {
   const auto subscription = std::find_if(
       subscriptions_.begin(), subscriptions_.end(),
@@ -703,6 +941,16 @@ AcApDocument *ObjectArxBridge::document(std::size_t token) {
       });
   return subscription == subscriptions_.end() ? nullptr
                                               : subscription->document;
+}
+
+bool ObjectArxBridge::lispFunctionsDefined(AcApDocument *document) const {
+  const auto subscription =
+      std::find_if(subscriptions_.begin(), subscriptions_.end(),
+                   [document](const DocumentSubscription &candidate) {
+                     return candidate.document == document;
+                   });
+  return subscription != subscriptions_.end() &&
+         subscription->lispFunctionsDefined;
 }
 
 acadctl::NativeActionResult ObjectArxBridge::open(const rust::String &path) {
@@ -801,6 +1049,11 @@ acadctl::NativeActionResult
 ObjectArxBridge::runExecution(AcApDocument *document,
                               std::size_t databaseToken,
                               std::uint64_t executionId) {
+  if (!lispFunctionsDefined(document)) {
+    return bridgeFailure(
+        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
+        "acadctl:println is unavailable in the target drawing");
+  }
   if (!document->isQuiescent()) {
     return result(acadctl::NativeActionResultKind::NotQuiescent);
   }
@@ -950,6 +1203,7 @@ void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
     subscription.database->removeReactor(&databaseReactor_);
   }
   subscription.database = database;
+  subscription.lispFunctionsDefined = false;
   if (subscription.database) {
     subscription.database->addReactor(&databaseReactor_);
   }
@@ -965,7 +1219,7 @@ void ObjectArxBridge::subscribe(AcApDocument *document) {
     return;
   }
 
-  subscriptions_.push_back(DocumentSubscription{document, nullptr});
+  subscriptions_.push_back(DocumentSubscription{document, nullptr, false});
   refreshSubscription(subscriptions_.back());
 }
 
@@ -1013,6 +1267,30 @@ extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
       objectArxBridge->stop();
       objectArxBridge.reset();
       return AcRx::kRetError;
+    }
+    break;
+  }
+  case AcRx::kLoadDwgMsg: {
+    const int status = defineLispFunctions();
+    if (objectArxBridge) {
+      objectArxBridge->setLispFunctionsDefined(acDocManager->curDocument(),
+                                               status == RTNORM);
+    }
+    if (status != RTNORM) {
+      syslog(LOG_ERR, "acadctl plugin could not define acadctl:println: %d",
+             status);
+    }
+    break;
+  }
+  case AcRx::kUnloadDwgMsg: {
+    AcApDocument *document = acDocManager->curDocument();
+    const int status = undefineLispFunctions();
+    if (objectArxBridge) {
+      objectArxBridge->setLispFunctionsDefined(document, false);
+    }
+    if (status != RTNORM) {
+      syslog(LOG_ERR, "acadctl plugin could not undefine acadctl:println: %d",
+             status);
     }
     break;
   }
