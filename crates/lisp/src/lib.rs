@@ -34,26 +34,92 @@ pub struct ScanError {
     pub column: usize,
 }
 
-pub fn scan(source: &str) -> Result<Vec<FormSpan>, ScanError> {
-    let mut cursor = Cursor::new(source);
-    let mut forms = Vec::new();
+pub fn scan(source: &str) -> Scanner<'_> {
+    Scanner::new(source)
+}
 
-    cursor.skip_trivia()?;
-    while !cursor.is_end() {
-        let byte_start = cursor.byte;
-        let line = cursor.line;
-        let column = cursor.column;
-        cursor.scan_form()?;
-        forms.push(FormSpan {
-            byte_start,
-            byte_end: cursor.byte,
-            line,
-            column,
-        });
-        cursor.skip_trivia()?;
+pub fn validate(source: &str) -> Result<usize, ScanError> {
+    scan(source).try_fold(0usize, |count, form| {
+        form.map(|_| count.checked_add(1).expect("form count overflowed usize"))
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanPosition {
+    byte: usize,
+    line: usize,
+    column: usize,
+    finished: bool,
+}
+
+pub struct Scanner<'a> {
+    cursor: Cursor<'a>,
+    finished: bool,
+}
+
+impl<'a> Scanner<'a> {
+    const fn new(source: &'a str) -> Self {
+        Self {
+            cursor: Cursor::new(source),
+            finished: false,
+        }
     }
 
-    Ok(forms)
+    pub const fn position(&self) -> ScanPosition {
+        ScanPosition {
+            byte: self.cursor.byte,
+            line: self.cursor.line,
+            column: self.cursor.column,
+            finished: self.finished,
+        }
+    }
+
+    pub const fn resume(source: &'a str, position: ScanPosition) -> Self {
+        Self {
+            cursor: Cursor {
+                source,
+                byte: position.byte,
+                line: position.line,
+                column: position.column,
+            },
+            finished: position.finished,
+        }
+    }
+}
+
+impl Iterator for Scanner<'_> {
+    type Item = Result<FormSpan, ScanError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if let Err(error) = self.cursor.skip_trivia() {
+            self.finished = true;
+            return Some(Err(error));
+        }
+        if self.cursor.is_end() {
+            self.finished = true;
+            return None;
+        }
+
+        let form = FormSpan {
+            byte_start: self.cursor.byte,
+            byte_end: 0,
+            line: self.cursor.line,
+            column: self.cursor.column,
+        };
+        match self.cursor.scan_form() {
+            Ok(()) => Some(Ok(FormSpan {
+                byte_end: self.cursor.byte,
+                ..form
+            })),
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
 }
 
 struct Cursor<'a> {
@@ -154,9 +220,18 @@ impl<'a> Cursor<'a> {
     }
 
     fn scan_atom(&mut self) {
-        while self.peek().is_some_and(|character| {
-            !character.is_whitespace() && !matches!(character, '(' | ')' | '"' | '\'' | ';')
-        }) {
+        let token_end = self
+            .remaining()
+            .find(is_atom_delimiter)
+            .unwrap_or(self.source.len() - self.byte);
+        let token = &self.remaining()[..token_end];
+        let byte_count = match token.find('.') {
+            Some(0) => token.len(),
+            Some(period) if !is_decimal(token) => period,
+            _ => token.len(),
+        };
+        let end = self.byte + byte_count;
+        while self.byte < end {
             self.advance();
         }
     }
@@ -245,20 +320,54 @@ impl<'a> Cursor<'a> {
     }
 }
 
+fn is_atom_delimiter(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '(' | ')' | '"' | '\'' | ';')
+}
+
+fn is_decimal(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let mut cursor = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
+    let integer_start = cursor;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if cursor == integer_start || bytes.get(cursor) != Some(&b'.') {
+        return false;
+    }
+    cursor += 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    if matches!(bytes.get(cursor), Some(b'e') | Some(b'E')) {
+        cursor += 1;
+        if matches!(bytes.get(cursor), Some(b'+') | Some(b'-')) {
+            cursor += 1;
+        }
+        let exponent_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == exponent_start {
+            return false;
+        }
+    }
+    cursor == bytes.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn scans_empty_and_comment_only_sources() {
-        assert_eq!(scan("").unwrap(), []);
-        assert_eq!(scan(" \t\r\n; line\r\n;| block\ncomment |; ").unwrap(), []);
+        assert_eq!(forms(""), []);
+        assert_eq!(forms(" \t\r\n; line\r\n;| block\ncomment |; "), []);
     }
 
     #[test]
     fn scans_atoms_lists_and_adjacent_forms() {
         let source = "nil  42\n(foo (bar . baz))'qux\"text\"";
-        let forms = scan(source).unwrap();
+        let forms = forms(source);
         let text = forms
             .iter()
             .map(|span| &source[span.byte_start..span.byte_end])
@@ -271,7 +380,7 @@ mod tests {
     #[test]
     fn keeps_quote_prefixes_and_intervening_trivia_with_their_form() {
         let source = "'' ; explain\n ;| more |; (a b) next";
-        let forms = scan(source).unwrap();
+        let forms = forms(source);
 
         assert_eq!(forms.len(), 2);
         assert_eq!(
@@ -284,7 +393,7 @@ mod tests {
     #[test]
     fn ignores_reader_characters_inside_strings_and_comments() {
         let source = "(list \"\\\" ); (still string)\" ; line )\n ;| ) ( |; '(x))\nend";
-        let forms = scan(source).unwrap();
+        let forms = forms(source);
         let text = forms
             .iter()
             .map(|span| &source[span.byte_start..span.byte_end])
@@ -302,7 +411,7 @@ mod tests {
     #[test]
     fn reports_unicode_locations_across_crlf() {
         let source = "字\r\n  (未完";
-        let forms = scan(source).unwrap_err();
+        let forms = scan(source).find_map(Result::err).unwrap();
 
         assert_eq!(forms.kind, ScanErrorKind::UnterminatedList);
         assert_eq!((forms.line, forms.column), (2, 3));
@@ -317,14 +426,51 @@ mod tests {
         assert_error(" \n' ; none", ScanErrorKind::MissingQuotedForm, 2, 1);
     }
 
+    #[test]
+    fn follows_autolisp_period_and_decimal_boundaries() {
+        let source = "a.b .b 1.2 .5 1. 1.a a.1 +.5 1e-3 1.2.3";
+        let spans = forms(source);
+        let text = spans
+            .iter()
+            .map(|span| &source[span.byte_start..span.byte_end])
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            text,
+            [
+                "a", ".b", ".b", "1.2", ".5", "1.", "1", ".a", "a", ".1", "+", ".5", "1e-3", "1",
+                ".2.3"
+            ]
+        );
+    }
+
+    #[test]
+    fn resumes_from_a_constant_size_position() {
+        let source = "first (second) third";
+        let mut scanner = scan(source);
+        assert_eq!(scanner.next().unwrap().unwrap().byte_end, 5);
+        let position = scanner.position();
+        let mut resumed = Scanner::resume(source, position);
+
+        let second = resumed.next().unwrap().unwrap();
+        assert_eq!(&source[second.byte_start..second.byte_end], "(second)");
+        assert_eq!(validate(source).unwrap(), 3);
+    }
+
     fn assert_error(
         source: &str,
         expected: ScanErrorKind,
         expected_line: usize,
         expected_column: usize,
     ) {
-        let error = scan(source).unwrap_err();
+        let error = scan(source)
+            .find_map(Result::err)
+            .expect("source should fail scanning");
         assert_eq!(error.kind, expected);
         assert_eq!((error.line, error.column), (expected_line, expected_column));
+    }
+
+    fn forms(source: &str) -> Vec<FormSpan> {
+        scan(source).collect::<Result<_, _>>().unwrap()
     }
 }

@@ -559,3 +559,15 @@ Putting `kill` behind the plugin was rejected because the command is specificall
 The execution output path has a total queued-byte budget in addition to bounded message counts. A single `acadctl:println` argument can otherwise make a nominally bounded channel retain an unbounded string.
 
 A bounded channel of unrestricted strings was rejected as insufficient backpressure. Native output is divided into bounded transport chunks while preserving exact concatenated stdout and the one-newline `acadctl:println` contract.
+
+### 2026-08-13 — I-007: form spans are produced incrementally
+
+The shared scanner yields one exact form span at a time and exposes a constant-size resume position. Validation counts forms without retaining every span; execution retains the source, current span, and next scan position rather than a `Vec<FormSpan>` for the whole batch.
+
+This supersedes the conceptual eager `SourceBatch.forms` representation above. A valid 4 MiB source made only of tiny forms can contain more than two million spans, making the eager representation consume roughly 64 MiB before source and transport copies. An additional hidden form-count limit was rejected at this point because incremental scanning satisfies the memory requirement without narrowing the agreed source contract. A form-count admission limit remains possible only if live main-thread measurements justify a separate performance boundary.
+
+### 2026-08-13 — I-008: period boundaries follow the AutoLISP reader
+
+Live AutoCAD 2027 checks established that period is a reader delimiter except inside a complete decimal token that begins with digits. For example, `a.b` begins with form `a`, `1.a` begins with form `1`, `1.2` is one form, `1.` is one form, and leading-dot `.5` is a reader error.
+
+Treating every period as part of an atom was rejected because a per-form evaluator would otherwise read and execute only the prefix while silently leaving an invalid suffix inside the supplied span. Treating every period as a delimiter was also rejected because it would split valid decimals. The scanner therefore recognizes only enough decimal syntax to determine the boundary; AutoLISP remains authoritative for the resulting token's meaning.
