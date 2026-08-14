@@ -232,6 +232,7 @@ mod ffi {
 
 mod documents;
 mod execution;
+mod history;
 mod rpc_server;
 mod scheduler;
 

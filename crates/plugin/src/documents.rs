@@ -97,6 +97,10 @@ impl DocumentRegistry {
             })
             .map(document_target)
     }
+
+    pub fn native_keys(&self) -> impl Iterator<Item = NativeDocumentKey> + '_ {
+        self.documents.iter().map(|tracked| tracked.native_key)
+    }
 }
 
 fn public_document(id: String, native: NativeDocumentSnapshot) -> Document {
