@@ -496,7 +496,6 @@ pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
 pub fn start() {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
         scheduler.stopping = false;
-        scheduler.quarantined = false;
     }
 }
 
@@ -2060,6 +2059,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_does_not_clear_native_state_quarantine() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.stopping = true;
+            scheduler.quarantined = true;
+        }
+
+        start();
+
+        {
+            let scheduler = SCHEDULER.lock().unwrap();
+            assert!(!scheduler.stopping);
+            assert!(scheduler.quarantined);
+        }
+        assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
+        reset(Vec::new());
+        stop();
+    }
+
+    #[tokio::test]
     async fn retained_execution_state_quarantines_without_erasing_commit_evidence() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
@@ -2528,6 +2550,7 @@ mod tests {
 
     fn reset(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
         stop();
+        SCHEDULER.lock().unwrap().quarantined = false;
         replace_documents(documents);
         start();
     }

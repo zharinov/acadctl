@@ -945,3 +945,9 @@ Stdout start and write failures use the same interruptible stderr completion rec
 ### 2026-08-14 — I-060: observer failure disconnects output before reporting
 
 A stdout writer start or write failure first drops the live Execute response and only then waits for the stderr diagnostic receipt. Retaining the response while stderr was blocked would retain the plugin's `OutputStream`; its 256 KiB queue could fill and leave AutoCAD's main thread blocked in `acadctl:println` even though the client had already lost its output observer. Closing the response makes server-side output switch to disconnect/discard and is independent of whether the diagnostic pipe drains. The execution itself remains detached rather than implicitly cancelled, and the message keeps the unknown-outcome and no-blind-retry warning.
+
+### 2026-08-14 — I-061: native-state quarantine survives transport restart
+
+The mutation scheduler's process-level quarantine is monotonic for the lifetime of the loaded plugin. Starting or restarting the local RPC server clears only the scheduler's stopping flag; it cannot clear quarantine, reconstruct execution state, or make native mutation safe again. The scheduler begins unquarantined from its fresh-process initializer, and only a new AutoCAD process can restore that initial state.
+
+The earlier `start` implementation reset both stopping and quarantine before it even checked whether the RPC server was already running. That coupled transport availability to native lease recovery: a repeated server-start call could admit later drawing mutations after an unproved context, undo-group, or evaluator-state cleanup failure. Retaining that behavior was rejected before adding history provenance because a transport lifecycle has no evidence that the AutoCAD process recovered. Test-only scheduler reset remains explicit and cannot be called through the production bridge.
