@@ -14,7 +14,7 @@ use crate::execution::{
     Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep, bound_diagnostic,
 };
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
-use crate::history::HistoryLedger;
+use crate::history::HistoryProvenance;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -36,7 +36,7 @@ pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 
 struct MutationScheduler {
     documents: DocumentRegistry,
-    history: HistoryLedger,
+    provenance: HistoryProvenance,
     pending: VecDeque<MutationJob>,
     active: Option<MutationJob>,
     wake_pending: bool,
@@ -292,7 +292,7 @@ impl MutationScheduler {
     const fn new() -> Self {
         Self {
             documents: DocumentRegistry::new(),
-            history: HistoryLedger::new(),
+            provenance: HistoryProvenance::new(),
             pending: VecDeque::new(),
             active: None,
             wake_pending: false,
@@ -494,7 +494,7 @@ pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
         scheduler.documents.replace(documents);
         let keys = scheduler.documents.native_keys().collect::<Vec<_>>();
-        scheduler.history.reconcile_documents(keys);
+        scheduler.provenance.reconcile_documents(keys);
     }
 }
 
@@ -508,7 +508,7 @@ pub fn stop() {
     let stopped = SCHEDULER.lock().ok().map(|mut scheduler| {
         scheduler.stopping = true;
         scheduler.wake_pending = false;
-        scheduler.history.invalidate_all();
+        scheduler.provenance.invalidate_all();
         let active_output = scheduler.active.as_mut().and_then(|job| {
             if let Operation::Execute { execution, .. } = &mut job.operation {
                 let _ = execution.request_cancel();
@@ -605,7 +605,7 @@ pub fn take_native_action() -> NativeAction {
                                 database_token: action.database_token,
                             });
                         if let Some(target) = job.native_target {
-                            scheduler.history.invalidate(target);
+                            scheduler.provenance.invalidate(target);
                         }
                         scheduler.active = Some(job);
                         TakeDecision::Action(action)
@@ -678,7 +678,7 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
         let pending = if quarantine {
             scheduler.quarantined = true;
             scheduler.wake_pending = false;
-            scheduler.history.invalidate_all();
+            scheduler.provenance.invalidate_all();
             std::mem::take(&mut scheduler.pending)
                 .into_iter()
                 .map(|job| (job.completion, job.operation.output_sink()))
@@ -1361,13 +1361,13 @@ mod tests {
             document_token: 1,
             database_token: 101,
         };
-        SCHEDULER.lock().unwrap().history.seed_owned_step(key, 1);
+        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
 
         let first = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
-        assert!(!SCHEDULER.lock().unwrap().history.has_owned_step(key));
+        assert!(!SCHEDULER.lock().unwrap().provenance.has_owned_step(key));
 
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
@@ -2082,7 +2082,7 @@ mod tests {
         let id = list().unwrap()[0].id.clone();
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.history.seed_owned_step(
+            scheduler.provenance.seed_owned_step(
                 NativeDocumentKey {
                     document_token: 1,
                     database_token: 101,
@@ -2099,7 +2099,7 @@ mod tests {
             let scheduler = SCHEDULER.lock().unwrap();
             assert!(!scheduler.stopping);
             assert!(scheduler.quarantined);
-            assert!(scheduler.history.has_owned_step(NativeDocumentKey {
+            assert!(scheduler.provenance.has_owned_step(NativeDocumentKey {
                 document_token: 1,
                 database_token: 101,
             }));
@@ -2120,19 +2120,31 @@ mod tests {
         SCHEDULER
             .lock()
             .unwrap()
-            .history
+            .provenance
             .seed_owned_step(original, 1);
 
         replace_documents(vec![document(1, 101, true)]);
-        assert!(SCHEDULER.lock().unwrap().history.has_owned_step(original));
+        assert!(
+            SCHEDULER
+                .lock()
+                .unwrap()
+                .provenance
+                .has_owned_step(original)
+        );
 
         replace_documents(vec![document(1, 201, true)]);
-        assert!(!SCHEDULER.lock().unwrap().history.has_owned_step(original));
         assert!(
             !SCHEDULER
                 .lock()
                 .unwrap()
-                .history
+                .provenance
+                .has_owned_step(original)
+        );
+        assert!(
+            !SCHEDULER
+                .lock()
+                .unwrap()
+                .provenance
                 .has_owned_step(NativeDocumentKey {
                     document_token: 1,
                     database_token: 201,
@@ -2150,14 +2162,14 @@ mod tests {
             document_token: 1,
             database_token: 101,
         };
-        SCHEDULER.lock().unwrap().history.seed_owned_step(key, 1);
+        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
         let pending = tokio::spawn(save(id));
         tokio::task::yield_now().await;
 
         let action = take_native_action();
 
         assert_eq!(action.kind, NativeActionKind::Save);
-        assert!(!SCHEDULER.lock().unwrap().history.has_owned_step(key));
+        assert!(!SCHEDULER.lock().unwrap().provenance.has_owned_step(key));
         complete_native_action(action.job_id, result(NativeActionResultKind::SaveFailed));
         assert!(matches!(pending.await.unwrap(), Err(Error::SaveFailed(_))));
         stop();
@@ -2171,11 +2183,11 @@ mod tests {
             document_token: 1,
             database_token: 101,
         };
-        SCHEDULER.lock().unwrap().history.seed_owned_step(key, 1);
+        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
 
         stop();
 
-        assert!(!SCHEDULER.lock().unwrap().history.has_owned_step(key));
+        assert!(!SCHEDULER.lock().unwrap().provenance.has_owned_step(key));
     }
 
     #[tokio::test]
