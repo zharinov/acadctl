@@ -571,3 +571,27 @@ This supersedes the conceptual eager `SourceBatch.forms` representation above. A
 Live AutoCAD 2027 checks established that period is a reader delimiter except inside a complete decimal token that begins with digits. For example, `a.b` begins with form `a`, `1.a` begins with form `1`, `1.2` is one form, `1.` is one form, and leading-dot `.5` is a reader error.
 
 Treating every period as part of an atom was rejected because a per-form evaluator would otherwise read and execute only the prefix while silently leaving an invalid suffix inside the supplied span. Treating every period as a delimiter was also rejected because it would split valid decimals. The scanner therefore recognizes only enough decimal syntax to determine the boundary; AutoLISP remains authoritative for the resulting token's meaning.
+
+### 2026-08-13 — I-009: the boundary scanner remains hand-written
+
+`logos` and `winnow` were evaluated after the first scanner implementation. `logos` provides generated token recognition, spans, callbacks, and lexer extras, but the implementation would still need custom state for balanced lists, quote-plus-trivia attachment, unterminated construct origins, Unicode line and column accounting, AutoLISP's decimal-aware period rule, and an independent resume position. `winnow` provides located and stateful streams with checkpoints, but introduces parser-combinator and checkpoint machinery for a component that intentionally does not parse an AST.
+
+Both dependencies were rejected because neither reduced the net implementation or proof surface for this grammar. The decision can be revisited if the component later becomes a real parser rather than a form-boundary scanner. References: <https://docs.rs/logos/latest/logos/> and <https://docs.rs/winnow/latest/winnow/stream/>.
+
+### 2026-08-13 — I-010: variadic `acadctl:println` is a native registration
+
+Live AutoCAD 2027 testing and Autodesk's `defun` contract established that user-defined AutoLISP functions have fixed arity. `&rest` is not supported and produces a syntax error. The public arbitrary-arity `acadctl:println` is therefore registered through the ObjectARX external-function interface.
+
+C++ performs only mechanical conversion of the `resbuf` argument chain into bounded typed chunks and forwards them synchronously. Rust owns display formatting, opaque-value policy, output routing, byte-budget backpressure, and cancellation wakeups. A Lisp-defined variadic shim was rejected as infeasible; formatting whole values into one Lisp string was rejected because it bypasses the bounded-output contract.
+
+### 2026-08-13 — I-011: mutating native work outlives its RPC handler future
+
+The scheduler, not a tonic handler future, mutex guard, oneshot receiver, response stream, or spawned-task handle, owns every admitted mutating native operation through its terminal state. This applies to document lifecycle, execution, and history actions. Dropping a handler or connection detaches its observer but does not release serialization, abandon rollback, or remove already admitted work.
+
+The earlier lifecycle pattern placed a native action in a global queue and then awaited a oneshot while its handler held the serialization mutex. Dropping that future released the mutex while the queued or already taken native action could still run. Retaining mutation ownership in cancellable futures was rejected because it makes disconnect and server-restart races capable of admitting later work before the earlier outcome is known.
+
+### 2026-08-13 — I-012: cancellation has an atomic finalization boundary
+
+Queued cancellation, five-second admission expiry, and the main-loop claim of a job are resolved by one atomic state transition. After every evaluator return, including the final form, Rust records the evaluator result and checks cancellation before entering finalization. An observed evaluator failure takes precedence over a simultaneous cancellation; cancellation does not erase a real error. A cancellation accepted before finalization rolls back, while one arriving after the atomic transition to finalization is too late and the terminal execution outcome wins.
+
+Rollback retains its initiating cause, and rollback failure always produces failure with an unknown drawing outcome rather than `Cancelled`. This closes the previously unspecified interval after the last `exec` form and prevents cancellation from hiding a drawing state that could not be proved restored.
