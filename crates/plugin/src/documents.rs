@@ -15,14 +15,20 @@ pub struct DocumentRegistry {
 }
 
 struct TrackedDocument {
-    native_token: usize,
+    native_key: NativeDocumentKey,
     named: bool,
     document: Document,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeDocumentKey {
+    pub document_token: usize,
+    pub database_token: usize,
+}
+
 #[derive(Clone)]
 pub struct DocumentTarget {
-    pub native_token: usize,
+    pub native_key: NativeDocumentKey,
     pub named: bool,
     pub document: Document,
 }
@@ -51,7 +57,10 @@ impl DocumentRegistry {
             let id = take_document_id(&mut previous, native.token)
                 .unwrap_or_else(|| new_document_id(&mut reserved_ids));
             self.documents.push(TrackedDocument {
-                native_token: native.token,
+                native_key: NativeDocumentKey {
+                    document_token: native.token,
+                    database_token: native.database_token,
+                },
                 named: native.named,
                 document: Document {
                     id,
@@ -87,7 +96,7 @@ impl DocumentRegistry {
 
 fn document_target(tracked: &TrackedDocument) -> DocumentTarget {
     DocumentTarget {
-        native_token: tracked.native_token,
+        native_key: tracked.native_key,
         named: tracked.named,
         document: tracked.document.clone(),
     }
@@ -106,7 +115,7 @@ fn paths_equal(left: &str, right: &str) -> bool {
 fn take_document_id(documents: &mut Vec<TrackedDocument>, native_token: usize) -> Option<String> {
     let position = documents
         .iter()
-        .position(|document| document.native_token == native_token)?;
+        .position(|document| document.native_key.document_token == native_token)?;
     Some(documents.swap_remove(position).document.id)
 }
 
@@ -141,6 +150,7 @@ mod tests {
         let original_id = documents.list()[0].id.clone();
 
         documents.replace(vec![NativeDocumentState {
+            database_token: 99,
             modified: true,
             read_only: true,
             ..named_document(1, "/tmp/site.dwg")
@@ -152,6 +162,14 @@ mod tests {
         assert_eq!(listed[0].path, "/tmp/site.dwg");
         assert!(listed[0].modified);
         assert!(listed[0].read_only);
+        assert_eq!(
+            documents
+                .find_by_id(&original_id)
+                .unwrap()
+                .native_key
+                .database_token,
+            99
+        );
     }
 
     #[test]
@@ -197,14 +215,21 @@ mod tests {
         let listed = documents.list();
 
         let by_id = documents.find_by_id(&listed[0].id).unwrap();
-        assert_eq!(by_id.native_token, 1);
+        assert_eq!(
+            by_id.native_key,
+            NativeDocumentKey {
+                document_token: 1,
+                database_token: 101,
+            }
+        );
         assert!(by_id.named);
         assert_eq!(by_id.document.path, "/tmp/house.dwg");
         assert_eq!(
             documents
                 .find_by_path("/tmp/house.dwg")
                 .unwrap()
-                .native_token,
+                .native_key
+                .document_token,
             1
         );
         assert!(documents.find_by_path("Drawing1").is_none());
@@ -224,6 +249,7 @@ mod tests {
     fn named_document(token: usize, name: &str) -> NativeDocumentState {
         NativeDocumentState {
             token,
+            database_token: token + 100,
             name: name.into(),
             named: true,
             modified: false,

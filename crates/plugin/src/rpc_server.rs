@@ -78,7 +78,7 @@ impl Acadctl for Service {
         validate_save_target(&target, &id)?;
 
         if target.document.modified {
-            crate::native_actions::save(target.native_token)
+            crate::native_actions::save(target.native_key)
                 .await
                 .map_err(native_error)?;
         }
@@ -106,7 +106,7 @@ impl Acadctl for Service {
             return Err(unsaved_changes(&request.id));
         }
 
-        crate::native_actions::close(target.native_token, request.discard)
+        crate::native_actions::close(target.native_key, request.discard)
             .await
             .map_err(|error| match error {
                 NativeActionError::Dirty => unsaved_changes(&request.id),
@@ -324,6 +324,7 @@ mod tests {
         replace_documents(vec![
             crate::ffi::NativeDocumentState {
                 token: 1,
+                database_token: 101,
                 name: "/tmp/house.dwg".into(),
                 named: true,
                 modified: false,
@@ -331,6 +332,7 @@ mod tests {
             },
             crate::ffi::NativeDocumentState {
                 token: 2,
+                database_token: 102,
                 name: "/tmp/site.dwg".into(),
                 named: true,
                 modified: true,

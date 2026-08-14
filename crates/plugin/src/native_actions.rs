@@ -5,6 +5,7 @@ use std::sync::{LazyLock, Mutex};
 
 use tokio::sync::oneshot;
 
+use crate::documents::NativeDocumentKey;
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -22,6 +23,7 @@ pub enum Error {
     Stopped,
     PluginStopping,
     DocumentGone,
+    DocumentChanged,
     Unnamed,
     ReadOnly,
     Dirty,
@@ -51,6 +53,8 @@ impl fmt::Display for Error {
             Self::Stopped => formatter.write_str("the native operation stopped before completion"),
             Self::PluginStopping => formatter.write_str("the acadctl plugin is stopping"),
             Self::DocumentGone => formatter.write_str("The document is no longer open"),
+            Self::DocumentChanged => formatter
+                .write_str("The document changed before AutoCAD could perform the operation"),
             Self::Unnamed => formatter.write_str("The document has no file name"),
             Self::ReadOnly => formatter.write_str("The document is read-only"),
             Self::Dirty => formatter.write_str("The document has unsaved changes"),
@@ -102,28 +106,31 @@ pub async fn open(path: String) -> Result<(), Error> {
         request_id: 0,
         kind: NativeActionKind::Open,
         document_token: 0,
+        database_token: 0,
         path,
         discard: false,
     })
     .await
 }
 
-pub async fn save(document_token: usize) -> Result<(), Error> {
+pub async fn save(target: NativeDocumentKey) -> Result<(), Error> {
     dispatch(NativeAction {
         request_id: 0,
         kind: NativeActionKind::Save,
-        document_token,
+        document_token: target.document_token,
+        database_token: target.database_token,
         path: String::new(),
         discard: false,
     })
     .await
 }
 
-pub async fn close(document_token: usize, discard: bool) -> Result<(), Error> {
+pub async fn close(target: NativeDocumentKey, discard: bool) -> Result<(), Error> {
     dispatch(NativeAction {
         request_id: 0,
         kind: NativeActionKind::Close,
-        document_token,
+        document_token: target.document_token,
+        database_token: target.database_token,
         path: String::new(),
         discard,
     })
@@ -188,6 +195,7 @@ fn interpret(result: NativeActionResult) -> Result<(), Error> {
     match result.kind {
         NativeActionResultKind::Success => Ok(()),
         NativeActionResultKind::DocumentGone => Err(Error::DocumentGone),
+        NativeActionResultKind::DocumentChanged => Err(Error::DocumentChanged),
         NativeActionResultKind::Unnamed => Err(Error::Unnamed),
         NativeActionResultKind::ReadOnly => Err(Error::ReadOnly),
         NativeActionResultKind::Dirty => Err(Error::Dirty),
@@ -213,6 +221,7 @@ fn empty_action() -> NativeAction {
         request_id: 0,
         kind: NativeActionKind::None,
         document_token: 0,
+        database_token: 0,
         path: String::new(),
         discard: false,
     }
@@ -252,6 +261,10 @@ mod tests {
             Err(Error::DocumentGone)
         );
         assert_eq!(
+            interpret(result(NativeActionResultKind::DocumentChanged)),
+            Err(Error::DocumentChanged)
+        );
+        assert_eq!(
             interpret(result(NativeActionResultKind::Unnamed)),
             Err(Error::Unnamed)
         );
@@ -278,12 +291,16 @@ mod tests {
 
         assert!(pending.await.unwrap().is_ok());
 
-        let pending = tokio::spawn(save(42));
+        let pending = tokio::spawn(save(NativeDocumentKey {
+            document_token: 42,
+            database_token: 84,
+        }));
         tokio::task::yield_now().await;
 
         let action = take();
         assert_eq!(action.kind, NativeActionKind::Save);
         assert_eq!(action.document_token, 42);
+        assert_eq!(action.database_token, 84);
         complete(
             action.request_id,
             NativeActionResult {

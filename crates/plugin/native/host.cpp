@@ -155,6 +155,11 @@ acadctl::NativeActionResult nativeFailure(
   return {kind, static_cast<std::int32_t>(status), rust::String(detail.utf8Ptr())};
 }
 
+bool matchesDatabase(AcApDocument *document, std::size_t databaseToken) {
+  return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(
+             document->database())) == databaseToken;
+}
+
 ObjectArxBridge::ObjectArxBridge()
     : documentReactor_(*this), editorReactor_(*this) {}
 
@@ -199,14 +204,20 @@ void ObjectArxBridge::processPendingActions() {
       break;
     case acadctl::NativeActionKind::Save:
       if (AcApDocument *target = document(action.document_token)) {
-        actionResult = save(target);
+        actionResult =
+            matchesDatabase(target, action.database_token)
+                ? save(target)
+                : result(acadctl::NativeActionResultKind::DocumentChanged);
       } else {
         actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
       }
       break;
     case acadctl::NativeActionKind::Close:
       if (AcApDocument *target = document(action.document_token)) {
-        actionResult = close(target, action.discard);
+        actionResult =
+            matchesDatabase(target, action.database_token)
+                ? close(target, action.discard)
+                : result(acadctl::NativeActionResultKind::DocumentChanged);
       } else {
         actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
       }
@@ -336,6 +347,8 @@ void ObjectArxBridge::publishDocuments() {
     const AcString name(named ? document->fileName() : document->docTitle());
     states.push_back(acadctl::NativeDocumentState{
         static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
+        static_cast<std::size_t>(
+            reinterpret_cast<std::uintptr_t>(subscription.database)),
         rust::String(name.utf8Ptr()),
         named,
         acdbGetDbmod(subscription.database) != 0,

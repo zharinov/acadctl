@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod ffi {
     struct NativeDocumentState {
         token: usize,
+        database_token: usize,
         name: String,
         named: bool,
         modified: bool,
@@ -24,6 +25,7 @@ mod ffi {
     enum NativeActionResultKind {
         Success,
         DocumentGone,
+        DocumentChanged,
         Unnamed,
         ReadOnly,
         Dirty,
@@ -37,6 +39,7 @@ mod ffi {
         request_id: u64,
         kind: NativeActionKind,
         document_token: usize,
+        database_token: usize,
         path: String,
         discard: bool,
     }
