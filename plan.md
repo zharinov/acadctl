@@ -663,3 +663,23 @@ The normal rollback path remains a live proof gate. In addition to proving `_End
 The Rust execution owns one `Arc<String>` source and hands C++ borrowed form slices. The temporary macOS `AcString` form conversion is scoped only through `acedPutSym` and is destroyed before the evaluator runs, avoiding roughly 16 MiB of avoidable overlap for a 4 MiB ASCII form. The fixed evaluator conversion is constructed once per batch rather than once per form.
 
 Every reserved Lisp staging symbol is cleared before and after evaluation, and a failed clear is a native form failure rather than a reported success. Ignoring cleanup was rejected because `acadctl:*source*` or an arbitrarily large `acadctl:*value*` could remain globally rooted and contaminate later requests. Terminal outcomes and error details are moved out of the scheduler job instead of cloned when ownership can be transferred.
+
+### 2026-08-14 — I-023: output state is independent and fragment-coalescing
+
+Each accepted execution owns a separate output state shared by one synchronous producer and one asynchronous consumer. The producer blocks only on that output state's byte-budget condition variable; it never retains the scheduler, execution-state, or native-event mutex. The consumer removes a chunk only when its `next_chunk` future returns, so dropping a pending read cannot consume output. Cancellation, sink disconnect, and plugin stop are independent latches and all wake a blocked producer.
+
+The initial infrastructure budget is 256 KiB of queued UTF-8 divided into chunks no larger than 16 KiB. Adjacent fragments are coalesced into the current chunk, including across renderer calls, so many one-byte values cannot turn the byte budget into unbounded per-fragment allocation metadata. Chunks split only at UTF-8 boundaries and concatenating them reproduces stdout byte for byte. Disconnect clears queued data and makes later emission a no-op without clearing an already latched cancellation; cancellation stops later emission but retains bytes already queued for the still-connected client.
+
+A Tokio channel bounded only by message count was rejected because each message could contain an unrestricted string. Holding the scheduler lock while waiting for space was rejected because `acadctl:println` re-enters Rust synchronously on AutoCAD's main thread. Making async read ownership part of the queue entry was rejected because cancelling that future could lose an output chunk.
+
+### 2026-08-14 — I-024: output fragments become readable at bounded flush points
+
+Renderer fragments remain private to the producer until their chunk reaches 16 KiB or the completed `acadctl:println` or implicit eval value explicitly flushes it. Completed small lines are merged into the last unread transport chunk when capacity permits. A connected client therefore receives a completed line promptly, while a fast consumer cannot turn every string escape, list delimiter, or one-byte argument into a separate allocation and RPC event. Large values still expose full chunks incrementally and apply the same byte-budget backpressure before the value finishes.
+
+Notifying the consumer after every fragment was rejected after a clean-context performance audit demonstrated a schedule in which the consumer removed each one-byte partial tail before the next fragment arrived. Coalescing only while the consumer happened to lag did not establish the bounded-message property recorded in I-006 and I-023.
+
+### 2026-08-14 — I-025: output conditions are durable predicates and transport is single-flight
+
+Cancellation, disconnect, stop, completion, and available byte capacity are durable state predicates checked while holding the output mutex immediately before every condition-variable wait. Notifications only prompt another predicate check; they are never the evidence for a transition. Publishing a partial chunk does not introduce an unlock-and-relock interval before that check. This prevents cancellation or completion from being signalled just before a producer begins waiting and then being lost.
+
+The eventual RPC writer owns at most one removed 16 KiB chunk and awaits its transport send before reading the next. It does not feed a second task or queue. The infrastructure bound is therefore the 256 KiB shared queue plus one bounded in-flight chunk. Releasing queue accounting and then collecting several returned chunks was rejected because it would move unbounded retention outside the measured budget. The pending buffer grows only with actual content rather than reserving 16 KiB for every small flushed line; this avoids fixed-size allocation churn while preserving the same payload and chunk bounds.

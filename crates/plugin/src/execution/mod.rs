@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
 
+pub mod output;
+
 #[allow(
     dead_code,
     reason = "request admission stays private until the native proof gates pass"
