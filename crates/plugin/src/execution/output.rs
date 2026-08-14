@@ -67,6 +67,9 @@ pub fn channel() -> (OutputSink, OutputStream) {
 
 impl OutputSink {
     pub fn emit(&self, mut text: &str) -> EmitResult {
+        if text.is_empty() {
+            return emit_result(&lock(&self.shared.state));
+        }
         while !text.is_empty() {
             let mut state = lock(&self.shared.state);
             loop {
@@ -176,7 +179,7 @@ impl OutputStream {
                     self.shared.space_available.notify_all();
                     return Some(chunk);
                 }
-                if state.disconnected || state.stopped || state.finished {
+                if state.disconnected || state.cancelled || state.stopped || state.finished {
                     return None;
                 }
             }
@@ -392,5 +395,15 @@ mod tests {
 
         sink.finish();
         assert_eq!(reader.await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drains_published_output_then_ends_the_stream() {
+        let (sink, mut stream) = channel();
+        assert_eq!(sink.emit("before cancel"), EmitResult::Written);
+        sink.request_cancel();
+
+        assert_eq!(stream.next_chunk().await.as_deref(), Some("before cancel"));
+        assert_eq!(stream.next_chunk().await, None);
     }
 }

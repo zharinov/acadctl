@@ -683,3 +683,47 @@ Notifying the consumer after every fragment was rejected after a clean-context p
 Cancellation, disconnect, stop, completion, and available byte capacity are durable state predicates checked while holding the output mutex immediately before every condition-variable wait. Notifications only prompt another predicate check; they are never the evidence for a transition. Publishing a partial chunk does not introduce an unlock-and-relock interval before that check. This prevents cancellation or completion from being signalled just before a producer begins waiting and then being lost.
 
 The eventual RPC writer owns at most one removed 16 KiB chunk and awaits its transport send before reading the next. It does not feed a second task or queue. The infrastructure bound is therefore the 256 KiB shared queue plus one bounded in-flight chunk. Releasing queue accounting and then collecting several returned chunks was rejected because it would move unbounded retention outside the measured budget. The pending buffer grows only with actual content rather than reserving 16 KiB for every small flushed line; this avoids fixed-size allocation churn while preserving the same payload and chunk bounds.
+
+### 2026-08-14 — I-026: output limits account payload rather than allocator capacity
+
+The 256 KiB shared limit and 16 KiB single-flight limit bound live UTF-8 payload, not the allocator's exact retained bytes. Each nonempty string has at most one chunk of content and the number of ready and pending strings is bounded, but an allocator may reserve more capacity than the current length. The implementation and memory tests therefore report payload, chunk-count, and single-flight bounds separately from measured resident memory.
+
+Describing the payload limit as an allocator-exact heap limit was rejected after the memory audit showed that appending to an odd-sized `String` can grow its capacity beyond its final 16 KiB length. This remains bounded infrastructure overhead rather than an unbounded retention path, and live memory measurements remain a release gate for the native/RPC integration.
+
+### 2026-08-14 — I-027: Rust renders typed value events
+
+Rust's value printer consumes an iterative stream of structural and typed events: list begin and end, dotted-tail markers, strings in bounded chunks, symbols, numbers, points, and normalized opaque kinds. It owns list spacing, display versus readable string behavior, stable PascalCase opaque tags, payload sanitization, the final newline, and the explicit output flush. C++ only classifies documented `resbuf` fields and forwards bounded text; a private fixed-arity Lisp visitor may normalize symbols and unsupported opaque values before crossing the same event boundary.
+
+Live AutoCAD 2027 checks established that `prin1` and `princ` differ recursively for strings, while lists use conventional proper and dotted syntax. Readable strings escape quote, backslash, line feed, carriage return, and tab; literal Unicode remains literal. Stable acadctl opaque displays deliberately replace AutoCAD's pointer-bearing entity and function printers and path-bearing file printer. Whole-composite `vl-prin1-to-string`, native command-line capture, and C++ formatting policy remain rejected because they either allocate without the output budget, mix console output, or move load-bearing behavior into the bridge.
+
+Documented `resbuf` types do not cover every promised AutoLISP opaque family. Public arbitrary-value `acadctl:println`, nested opaque normalization, and the unavoidable AutoCAD-side allocation for a huge variadic argument graph therefore remain native live proof gates. The formatter being total for its typed event vocabulary is not treated as proof that AutoCAD can marshal every source value into that vocabulary.
+
+### 2026-08-14 — I-028: native numeric text and structural limits preserve Lisp semantics safely
+
+Real-number events carry a bounded, validated AutoLISP-normalized token rather than a raw binary float for Rust to format. Live AutoCAD 2027 checks showed identical `prin1` and `princ` results independent of `LUPREC`: `1.0`, `0.0` for negative zero, `1.23457`, `1.0e-12`, and `1.0e+20`. Rust's shortest-decimal formatting was rejected as materially different. Non-finite or syntactically non-real tokens are rejected at the event boundary. Integer text remains exact decimal, and point coordinates use the same normalized real tokens.
+
+String and symbol atoms cross in UTF-8 fragments no larger than 16 KiB. Readable strings additionally implement AutoLISP's `\e` escape and three-digit octal control escapes, not only quote, backslash, newline, return, and tab. Opaque entry points are kind-specific: entity handles are validated and uppercased, selection sets use descriptive numbers, class and function labels are bounded and reject pointer-like text, and files and errors accept no payload. This prevents the bridge from reintroducing native addresses or file paths through an arbitrary opaque string.
+
+The iterative list-state stack is one byte per open list and is limited to 65,536 levels. Deeper structure is represented honestly as `#<Object DepthLimit>` while its nested events are skipped with constant additional state. This bounds renderer-owned nesting metadata without recursion. A native or Lisp visitor must separately detect cycles or enforce a finite traversal-step policy; the typed stream alone has no source-object identity and cannot prove that a cyclic producer will terminate. An unbounded renderer stack and treating output backpressure as a bound on structural metadata were rejected.
+
+Cancellation publishes already formatted bytes, prevents later emission, and ends the output stream after those bytes drain. The execution outcome remains independently scheduler-owned, so a hung form may keep the request alive after its output substream has ended. Waiting for another output notification after cancellation was rejected because no producer can legally add more bytes once the cancellation latch is set.
+
+### 2026-08-14 — I-029: zero-output value events still observe terminal state
+
+Every typed value event checks the output sink even when it produces no visible bytes, including empty fragments and events inside the depth-limit fallback. Cancellation, disconnect, stop, and completion can therefore unwind a native traversal that is currently suppressing output instead of relying on a future printable event. The native visitor still owns a finite traversal-step or cycle policy because output polling cannot make a nonterminating producer structurally safe by itself.
+
+An empty symbol sequence is rejected rather than silently consuming a list position; list spacing is deferred until the first nonempty symbol fragment. Normalized real tokens require digits on both sides of the decimal point and a complete optional exponent, so `.5`, `1.`, and incomplete exponents cannot cross the typed boundary. Trusting Rust's more permissive floating-point parser as an AutoLISP grammar oracle was rejected.
+
+Readable control escapes are assembled from a fixed four-byte octal buffer. Formatting each control character through a temporary heap string was rejected after performance review showed that a single bounded 16 KiB atom could otherwise cause more than sixteen thousand tiny allocations.
+
+### 2026-08-14 — I-030: raw symbol names are the typed identity boundary
+
+Symbol events carry one or more bounded raw UTF-8 name fragments obtained from AutoLISP's symbol value, not rendered printer text. Live AutoCAD 2027 checks established that reader-created symbols cannot be empty or contain whitespace, parentheses, quote, semicolon, apostrophe, or period delimiters. Vertical bars are ordinary name characters rather than Common Lisp quoting syntax. Rust rejects delimiter-bearing fragments so a malformed native event cannot inject list structure into the output stream.
+
+Display mode emits the raw name. Readable mode duplicates every backslash, matching AutoLISP's observed `prin1` behavior, but adds no quotes or vertical-bar wrapper. AutoLISP itself does not read that doubled form back to the original backslash-bearing symbol, so rendered output is deliberately not treated as symbol identity or a general serialization format. Claiming readable value output is universally reader-round-trippable was rejected; the raw typed name remains the lossless internal boundary.
+
+### 2026-08-14 — I-031: symbol validity is checked with constant streaming state
+
+The symbol printer carries a small lexical state across chunks and rejects an empty name, exact case-insensitive `NIL`, a complete signed or unsigned integer, and a complete scientific real. Live AutoCAD 2027 checks established that `123`, `+123`, and `-123` are integers; `1e3` and `1e-3` are reals; and `+`, `-`, `123A`, `1E`, and incomplete exponents remain symbols. This distinction cannot be recovered from per-fragment character checks alone.
+
+Buffering an entire symbol before output was rejected because symbol names have no agreed total-size limit. The formatter instead retains only a constant-size number state and `NIL` matcher. The native producer must emit `Symbol` only for an actual AutoLISP symbol and `nil` through its distinct event; the Rust checks fail closed if that invariant is violated. A malformed internal event can be diagnosed after earlier chunks were streamed, but it cannot arise from a correctly typed value. Treating defensive validation as a reason to duplicate an arbitrarily long symbol in memory was rejected.

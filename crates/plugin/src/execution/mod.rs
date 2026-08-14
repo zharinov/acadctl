@@ -3,6 +3,7 @@ use std::sync::Arc;
 use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
 
 pub mod output;
+pub mod value;
 
 #[allow(
     dead_code,
