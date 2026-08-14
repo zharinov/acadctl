@@ -1,4 +1,5 @@
 pub mod close;
+pub mod execute;
 pub mod ls;
 pub mod open;
 pub mod save;

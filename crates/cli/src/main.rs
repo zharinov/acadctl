@@ -1,10 +1,11 @@
 mod commands;
 mod instances;
+mod source;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(version, about = "Control AutoCAD from the command line")]
@@ -44,6 +45,19 @@ enum Command {
         #[arg(long)]
         discard: bool,
     },
+    /// Evaluate one AutoLISP form and print its value.
+    Eval(ExecutionArgs),
+    /// Execute an AutoLISP batch without implicit value output.
+    Exec(ExecutionArgs),
+}
+
+#[derive(Args)]
+struct ExecutionArgs {
+    /// Document ID shown by `acadctl ls`.
+    id: String,
+
+    /// AutoLISP file, or - for stdin. Reads stdin when omitted.
+    file: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -53,6 +67,22 @@ async fn main() -> ExitCode {
         Command::Open { path, pid } => commands::open::run(path, pid).await,
         Command::Save { id } => commands::save::run(id).await,
         Command::Close { id, discard } => commands::close::run(id, discard).await,
+        Command::Eval(arguments) => {
+            commands::execute::run(
+                arguments.id,
+                arguments.file,
+                acadctl_rpc::ExecutionMode::Eval,
+            )
+            .await
+        }
+        Command::Exec(arguments) => {
+            commands::execute::run(
+                arguments.id,
+                arguments.file,
+                acadctl_rpc::ExecutionMode::Exec,
+            )
+            .await
+        }
     }
 }
 
@@ -74,7 +104,9 @@ mod tests {
     #[test]
     fn does_not_keep_superseded_or_unimplemented_commands() {
         assert!(Cli::try_parse_from(["acadctl", "status"]).is_err());
-        assert!(Cli::try_parse_from(["acadctl", "exec"]).is_err());
+        assert!(Cli::try_parse_from(["acadctl", "undo", "k7m2qx"]).is_err());
+        assert!(Cli::try_parse_from(["acadctl", "redo", "k7m2qx"]).is_err());
+        assert!(Cli::try_parse_from(["acadctl", "kill"]).is_err());
     }
 
     #[test]
@@ -97,5 +129,23 @@ mod tests {
             cli.command,
             Command::Close { id, discard: true } if id == "k7m2qx"
         ));
+    }
+
+    #[test]
+    fn parses_eval_and_exec_source_selection() {
+        let cli = Cli::try_parse_from(["acadctl", "eval", "k7m2qx"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Eval(ExecutionArgs { id, file: None }) if id == "k7m2qx"
+        ));
+
+        let cli = Cli::try_parse_from(["acadctl", "exec", "k7m2qx", "script.lsp"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Exec(ExecutionArgs { id, file: Some(file) })
+                if id == "k7m2qx" && file == std::path::Path::new("script.lsp")
+        ));
+
+        assert!(Cli::try_parse_from(["acadctl", "exec", "k7m2qx", "a.lsp", "b.lsp"]).is_err());
     }
 }

@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::time::Duration;
 
-use acadctl_rpc::{Document, DocumentServiceClient, ListRequest};
+use acadctl_rpc::{Document, DocumentServiceClient, ExecutionServiceClient, ListRequest};
 use sysinfo::System;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -78,6 +78,14 @@ pub async fn connect_documents(
     process_id: u32,
 ) -> Result<DocumentServiceClient<Channel>, QueryError> {
     acadctl_rpc::connect_documents(process_id)
+        .await
+        .map_err(|_| QueryError::CannotConnect)
+}
+
+pub async fn connect_execution(
+    process_id: u32,
+) -> Result<ExecutionServiceClient<Channel>, QueryError> {
+    acadctl_rpc::connect_execution(process_id)
         .await
         .map_err(|_| QueryError::CannotConnect)
 }

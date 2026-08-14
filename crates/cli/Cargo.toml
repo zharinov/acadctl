@@ -6,8 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+acadctl-lisp = { path = "../lisp" }
 acadctl-rpc = { path = "../rpc" }
+bytes.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 sysinfo.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tonic.workspace = true

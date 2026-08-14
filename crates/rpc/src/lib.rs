@@ -27,6 +27,7 @@ mod protocol {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub const MAX_DRAWING_PATH_BYTES: usize = 32 * 1024;
+pub const MAX_EXECUTION_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SOURCE_NAME_BYTES: usize = 4 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 pub const MAX_DOCUMENT_REQUEST_BYTES: usize = 64 * 1024;

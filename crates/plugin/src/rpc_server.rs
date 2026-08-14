@@ -794,18 +794,18 @@ mod tests {
             execute_and_cancel(
                 &mut client,
                 &document_id,
-                Bytes::from(vec![b'x'; crate::execution::MAX_SOURCE_BYTES]),
+                Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES]),
             )
             .await;
 
-            let mut with_bom = Vec::with_capacity(crate::execution::MAX_SOURCE_BYTES + 3);
+            let mut with_bom = Vec::with_capacity(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3);
             with_bom.extend_from_slice(&[0xef, 0xbb, 0xbf]);
-            with_bom.resize(crate::execution::MAX_SOURCE_BYTES + 3, b'x');
+            with_bom.resize(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3, b'x');
             execute_and_cancel(&mut client, &document_id, Bytes::from(with_bom)).await;
 
             let request = execution_request(
                 &document_id,
-                Bytes::from(vec![b'x'; crate::execution::MAX_SOURCE_BYTES + 1]),
+                Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1]),
             );
             let mut response = client
                 .execute(stream::iter([request]))

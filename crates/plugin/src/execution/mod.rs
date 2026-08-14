@@ -9,7 +9,6 @@ pub mod value;
 pub mod value_bridge;
 pub(crate) mod visitor;
 
-pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 pub const EVALUATOR_SOURCE: &str = include_str!("../../lisp/acadctl.lsp");
 
 pub(crate) fn bound_diagnostic(message: &mut String) {
@@ -352,7 +351,7 @@ impl Execution {
         if source.starts_with(&[0xef, 0xbb, 0xbf]) {
             source = source.slice(3..);
         }
-        if source.len() > MAX_SOURCE_BYTES {
+        if source.len() > acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES {
             return Err(SourceValidationError::SourceTooLarge);
         }
         let source_text =
@@ -1063,7 +1062,7 @@ mod tests {
             Execution::new(
                 ExecutionMode::Exec,
                 "<stdin>".into(),
-                "x".repeat(MAX_SOURCE_BYTES).into(),
+                "x".repeat(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES).into(),
             )
             .is_ok()
         );
@@ -1071,7 +1070,11 @@ mod tests {
             Execution::new(
                 ExecutionMode::Exec,
                 "<stdin>".into(),
-                format!("\u{feff}{}", "x".repeat(MAX_SOURCE_BYTES)).into(),
+                format!(
+                    "\u{feff}{}",
+                    "x".repeat(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES)
+                )
+                .into(),
             )
             .is_ok()
         );
@@ -1079,7 +1082,8 @@ mod tests {
             Execution::new(
                 ExecutionMode::Exec,
                 "<stdin>".into(),
-                "x".repeat(MAX_SOURCE_BYTES + 1).into(),
+                "x".repeat(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1)
+                    .into(),
             )
             .err()
             .unwrap(),
