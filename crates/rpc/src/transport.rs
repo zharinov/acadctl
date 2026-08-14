@@ -8,8 +8,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::server::Connected;
 
-const MAX_CONNECTIONS: usize = 32;
-
 pub type ClientStream = platform::ClientStream;
 pub type Incoming = Pin<Box<dyn Stream<Item = io::Result<ServerStream>> + Send>>;
 
@@ -19,7 +17,7 @@ pub async fn connect(process_id: u32) -> io::Result<ClientStream> {
 
 pub fn incoming(process_id: u32) -> io::Result<Incoming> {
     let listener = platform::Listener::bind(process_id)?;
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(super::MAX_SERVER_CONNECTIONS));
     let connections = futures_util::stream::try_unfold(
         (listener, permits),
         |(mut listener, permits)| async move {

@@ -9,6 +9,10 @@ service Acadctl {
   rpc Close(CloseRequest) returns (CloseResponse);
 }
 
+service Executor {
+  rpc Execute(stream ExecuteClientMessage) returns (stream ExecuteServerEvent);
+}
+
 message ListRequest {}
 
 message ListResponse {
@@ -37,6 +41,90 @@ message CloseRequest {
 }
 
 message CloseResponse {}
+
+message ExecuteClientMessage {
+  oneof message {
+    ExecutionRequest request = 1;
+    ExecutionCancel cancel = 2;
+  }
+}
+
+message ExecutionRequest {
+  string document_id = 1;
+  ExecutionMode mode = 2;
+  string source_name = 3;
+  bytes source = 4;
+}
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_EVAL = 1;
+  EXECUTION_MODE_EXEC = 2;
+}
+
+message ExecutionCancel {}
+
+message ExecuteServerEvent {
+  oneof event {
+    ExecutionAccepted accepted = 1;
+    ExecutionOutput output = 2;
+    ExecutionFinished finished = 3;
+    ExecutionCancellation cancellation = 4;
+  }
+}
+
+message ExecutionAccepted {}
+
+message ExecutionOutput {
+  string text = 1;
+}
+
+message ExecutionFinished {
+  ExecutionOutcome outcome = 1;
+}
+
+message ExecutionOutcome {
+  oneof outcome {
+    ExecutionSuccess success = 1;
+    ExecutionFailure failure = 2;
+    ExecutionCancelled cancelled = 3;
+  }
+}
+
+message ExecutionSuccess {}
+
+message ExecutionCancelled {}
+
+message ExecutionCancellation {
+  ExecutionCancellationResult result = 1;
+}
+
+enum ExecutionCancellationResult {
+  EXECUTION_CANCELLATION_RESULT_UNSPECIFIED = 0;
+  EXECUTION_CANCELLATION_RESULT_ACCEPTED = 1;
+  EXECUTION_CANCELLATION_RESULT_TOO_LATE = 2;
+}
+
+message ExecutionFailure {
+  string message = 1;
+  optional uint64 form_index = 2;
+  SourceLocation location = 3;
+  DrawingOutcome drawing_outcome = 4;
+}
+
+message SourceLocation {
+  string source_name = 1;
+  uint64 line = 2;
+  uint64 column = 3;
+}
+
+enum DrawingOutcome {
+  DRAWING_OUTCOME_UNSPECIFIED = 0;
+  DRAWING_OUTCOME_NOT_STARTED = 1;
+  DRAWING_OUTCOME_ROLLED_BACK = 2;
+  DRAWING_OUTCOME_COMMITTED = 3;
+  DRAWING_OUTCOME_UNKNOWN = 4;
+}
 
 message Document {
   string id = 1;

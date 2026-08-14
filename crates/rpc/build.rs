@@ -4,6 +4,8 @@ fn main() {
     // Cargo runs build scripts single-threaded, before code generation reads this variable.
     unsafe { std::env::set_var("PROTOC", protoc) };
 
-    tonic_prost_build::compile_protos("proto/acadctl.proto")
+    tonic_prost_build::configure()
+        .bytes(".acadctl.ExecutionRequest.source")
+        .compile_protos(&["proto/acadctl.proto"], &["proto"])
         .expect("failed to compile the RPC schema");
 }

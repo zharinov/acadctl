@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "the bounded sink stays private until execution reaches the streaming RPC"
-)]
-
 use std::{
     collections::VecDeque,
     sync::{
@@ -137,6 +132,7 @@ impl OutputSink {
         self.wake_all();
     }
 
+    #[cfg(test)]
     pub fn cancel_requested(&self) -> bool {
         lock(&self.shared.state).cancelled
     }
@@ -149,10 +145,6 @@ impl OutputSink {
         self.wake_all();
     }
 
-    #[allow(
-        dead_code,
-        reason = "wired when the private execution sink reaches RPC shutdown"
-    )]
     pub fn stop(&self) {
         let mut state = lock(&self.shared.state);
         state.stopped = true;
@@ -169,7 +161,7 @@ impl OutputSink {
     }
 
     #[cfg(test)]
-    fn queued_bytes(&self) -> usize {
+    pub(crate) fn queued_bytes(&self) -> usize {
         lock(&self.shared.state).queued_bytes
     }
 

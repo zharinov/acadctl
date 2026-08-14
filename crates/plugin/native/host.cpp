@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <syslog.h>
 #include <vector>
 
@@ -104,18 +105,23 @@ private:
     void documentCreated(AcApDocument *document) override {
       bridge_.subscribe(document);
       bridge_.syncDocuments();
+      acadctl::native_state_may_be_ready();
     }
 
     void documentToBeDestroyed(AcApDocument *document) override {
       bridge_.unsubscribe(document);
       bridge_.syncDocuments();
+      acadctl::native_state_may_be_ready();
     }
 
     void documentTitleUpdated(AcApDocument *) override {
       bridge_.syncDocuments();
     }
 
-    void documentActivated(AcApDocument *) override { bridge_.syncDocuments(); }
+    void documentActivated(AcApDocument *) override {
+      bridge_.syncDocuments();
+      acadctl::native_state_may_be_ready();
+    }
 
   private:
     ObjectArxBridge &bridge_;
@@ -125,17 +131,30 @@ private:
   public:
     explicit EditorReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
 
-    void commandEnded(const ACHAR *) override { bridge_.syncDirtyDocuments(); }
+    void commandEnded(const ACHAR *) override {
+      bridge_.syncDirtyDocuments();
+      acadctl::native_state_may_be_ready();
+    }
 
     void commandCancelled(const ACHAR *) override {
       bridge_.syncDirtyDocuments();
+      acadctl::native_state_may_be_ready();
     }
 
-    void commandFailed(const ACHAR *) override { bridge_.syncDirtyDocuments(); }
+    void commandFailed(const ACHAR *) override {
+      bridge_.syncDirtyDocuments();
+      acadctl::native_state_may_be_ready();
+    }
 
-    void lispEnded() override { bridge_.syncDirtyDocuments(); }
+    void lispEnded() override {
+      bridge_.syncDirtyDocuments();
+      acadctl::native_state_may_be_ready();
+    }
 
-    void lispCancelled() override { bridge_.syncDirtyDocuments(); }
+    void lispCancelled() override {
+      bridge_.syncDirtyDocuments();
+      acadctl::native_state_may_be_ready();
+    }
 
     void saveComplete(AcDbDatabase *, const ACHAR *) override {
       bridge_.syncDocuments();
@@ -204,6 +223,7 @@ constexpr std::size_t kWideValueChunkUnits = 4096;
 thread_local acadctl::NativeValueWriter *activeEvalValueWriter = nullptr;
 
 std::size_t boundedWideChunkLength(const ACHAR *text);
+rust::String boundedDiagnostic(const ACHAR *text, const char *fallback);
 int integerValue(const resbuf *value);
 bool matchesExecutionContext(AcApDocument *document,
                              std::size_t databaseToken,
@@ -262,6 +282,44 @@ std::size_t boundedWideChunkLength(const ACHAR *text) {
     }
   }
   return length;
+}
+
+rust::String boundedDiagnostic(const ACHAR *text, const char *fallback) {
+  if (!text) {
+    return rust::String(fallback);
+  }
+
+  const std::size_t captureUnits = acadctl::native_diagnostic_capture_units();
+  if (captureUnits < 2) {
+    return rust::String(fallback);
+  }
+  std::size_t length = 0;
+  while (length < captureUnits && text[length] != 0) {
+    ++length;
+  }
+  const bool truncated = length == captureUnits && text[length] != 0;
+  if constexpr (sizeof(ACHAR) == 2) {
+    if (truncated) {
+      const auto last = static_cast<std::uint32_t>(text[length - 1]);
+      const auto next = static_cast<std::uint32_t>(text[length]);
+      if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 &&
+          next <= 0xdfff) {
+        --length;
+      }
+    }
+  }
+
+  const AcString captured(text, static_cast<Adesk::UInt32>(length));
+  const char *utf8 = captured.utf8Ptr();
+  if (!utf8) {
+    return rust::String(fallback);
+  }
+  std::string bounded(utf8);
+  const std::size_t byteLimit = captureUnits - 1;
+  if (truncated && bounded.size() <= byteLimit) {
+    bounded.resize(byteLimit + 1, ' ');
+  }
+  return rust::String(bounded);
 }
 
 bool writeString(acadctl::NativeValueWriter &writer, const ACHAR *text) {
@@ -734,8 +792,8 @@ ReservedStateStepResult evaluateForm(
   rust::String detail("AutoLISP evaluation failed");
   if (errorResult == RTNORM && error && error->restype == RTSTR &&
       error->resval.rstring) {
-    const AcString errorText(error->resval.rstring);
-    detail = rust::String(errorText.utf8Ptr());
+    detail = boundedDiagnostic(error->resval.rstring,
+                               "AutoLISP evaluation failed");
   }
   return finishEvaluation(
       {acadctl::NativeExecutionStepResultKind::LispError, 0, lispErrnoValue,
@@ -793,8 +851,8 @@ acadctl::NativeExecutionStepResult valueVisitorOutcome(int commandStatus) {
   rust::String detail("AutoLISP eval value traversal failed");
   if (errorResult == RTNORM && error && error->restype == RTSTR &&
       error->resval.rstring) {
-    const AcString errorText(error->resval.rstring);
-    detail = rust::String(errorText.utf8Ptr());
+    detail = boundedDiagnostic(error->resval.rstring,
+                               "AutoLISP eval value traversal failed");
   }
   return {acadctl::NativeExecutionStepResultKind::LispError, 0,
           lispErrnoValue, std::move(detail), 0};

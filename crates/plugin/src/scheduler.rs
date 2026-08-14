@@ -1,19 +1,31 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use acadctl_rpc::Document;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
-use crate::execution::output::OutputSink;
+use crate::execution::output::{OutputSink, OutputStream};
 use crate::execution::value_bridge::NativeValueWriter;
-use crate::execution::{Execution, NativeExecutionStep, Outcome as ExecutionOutcome, StepResult};
+use crate::execution::{
+    Execution, NativeExecutionStep, Outcome as ExecutionOutcome, StepResult, bound_diagnostic,
+};
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER: LazyLock<Mutex<Scheduler>> = LazyLock::new(|| Mutex::new(Scheduler::new()));
+static TIMERS_CHANGED: Notify = Notify::const_new();
+
+pub const EXECUTION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_DURABLE_MUTATIONS: usize = 32;
+pub const MAX_ADMITTED_EXECUTIONS: usize = 8;
+pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(50);
+const BUSY_RETRY_MAX: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -31,7 +43,26 @@ struct Job {
     request_id: u64,
     operation: Operation,
     native_target: Option<NativeDocumentKey>,
+    admission_deadline: Option<Instant>,
+    waiting_for_readiness: bool,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
+    _execution_reservation: Option<ExecutionReservation>,
     completion: oneshot::Sender<Result<OperationOutcome, Error>>,
+}
+
+#[derive(Clone)]
+pub struct ExecutionReservation {
+    _inner: Arc<ExecutionReservationInner>,
+}
+
+struct ExecutionReservationInner;
+
+impl Drop for ExecutionReservationInner {
+    fn drop(&mut self) {
+        let previous = EXECUTION_RESERVATIONS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+    }
 }
 
 enum Operation {
@@ -45,10 +76,6 @@ enum Operation {
         id: String,
         discard: bool,
     },
-    #[allow(
-        dead_code,
-        reason = "request admission stays private until the native proof gates pass"
-    )]
     Execute {
         id: String,
         execution: Box<Execution>,
@@ -58,10 +85,6 @@ enum Operation {
 enum OperationOutcome {
     Document(Document),
     Closed,
-    #[allow(
-        dead_code,
-        reason = "request admission stays private until the native proof gates pass"
-    )]
     Execution(ExecutionOutcome),
 }
 
@@ -75,14 +98,21 @@ enum TakeDecision {
     Complete(
         oneshot::Sender<Result<OperationOutcome, Error>>,
         Result<OperationOutcome, Error>,
+        Option<OutputSink>,
     ),
     Empty,
 }
 
-#[allow(
-    dead_code,
-    reason = "execution cancellation is private until the Execute RPC is exposed"
-)]
+pub struct ExecutionAdmission {
+    request_id: u64,
+    output: OutputStream,
+    completion: ExecutionCompletion,
+}
+
+pub struct ExecutionCompletion {
+    receiver: oneshot::Receiver<Result<OperationOutcome, Error>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelResult {
     Accepted,
@@ -119,6 +149,8 @@ pub enum Error {
     ExecutionStateCleanupFailed(NativeFailure),
     ExecutionBridgeFailed(NativeFailure),
     ExecutionNotFinished,
+    MutationCapacity,
+    ExecutionCapacity,
     NativeStateUnknown,
     UnknownResult(u8),
 }
@@ -200,6 +232,12 @@ impl fmt::Display for Error {
             Self::ExecutionNotFinished => {
                 formatter.write_str("The native execution ended without a terminal outcome")
             }
+            Self::MutationCapacity => {
+                formatter.write_str("AutoCAD already has the maximum number of pending operations")
+            }
+            Self::ExecutionCapacity => formatter.write_str(
+                "AutoCAD already has the maximum number or total size of execution requests",
+            ),
             Self::NativeStateUnknown => formatter.write_str(
                 "AutoCAD's mutation context is unknown; restart AutoCAD before issuing another mutation",
             ),
@@ -261,11 +299,32 @@ impl Scheduler {
         self.active.is_none() && self.pending.is_empty() && !self.wake_pending
     }
 
+    fn execution_usage(&self) -> (usize, usize) {
+        self.pending
+            .iter()
+            .chain(self.active.iter())
+            .filter_map(|job| match &job.operation {
+                Operation::Execute { execution, .. } => Some(execution.source_bytes()),
+                Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => None,
+            })
+            .fold((0, 0), |(count, bytes), source_bytes| {
+                (count + 1, bytes + source_bytes)
+            })
+    }
+
+    fn durable_mutation_count(&self) -> usize {
+        self.pending.len() + usize::from(self.active.is_some())
+    }
+
     fn request_wake(&mut self) -> bool {
         if self.stopping
             || self.quarantined
             || self.active.is_some()
             || self.pending.is_empty()
+            || self
+                .pending
+                .front()
+                .is_some_and(|job| job.waiting_for_readiness)
             || self.wake_pending
         {
             return false;
@@ -298,10 +357,117 @@ pub async fn close(id: String, discard: bool) -> Result<(), Error> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "request admission stays private until the native proof gates pass"
-)]
+pub fn admit_execution(
+    id: String,
+    execution: Execution,
+    output: OutputStream,
+    reservation: ExecutionReservation,
+) -> Result<ExecutionAdmission, Error> {
+    let deadline = Instant::now() + EXECUTION_ADMISSION_TIMEOUT;
+    let (request_id, receiver, should_wake, immediate) = {
+        let mut scheduler = SCHEDULER.lock().map_err(|_| Error::StateUnavailable)?;
+        if scheduler.stopping {
+            return Err(Error::PluginStopping);
+        }
+        if scheduler.quarantined {
+            return Err(Error::NativeStateUnknown);
+        }
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let (completion, receiver) = oneshot::channel();
+        if execution.outcome().is_some() {
+            let operation = Operation::Execute {
+                id,
+                execution: Box::new(execution),
+            };
+            let outcome = match prepare(&operation, &scheduler.documents) {
+                Prepared::Immediate(outcome) => outcome,
+                Prepared::Native(_) => Err(Error::ExecutionNotFinished),
+            };
+            let output = operation.output_sink();
+            (
+                request_id,
+                receiver,
+                false,
+                Some((completion, outcome, output)),
+            )
+        } else {
+            if scheduler.durable_mutation_count() >= MAX_DURABLE_MUTATIONS {
+                return Err(Error::MutationCapacity);
+            }
+
+            let (execution_count, source_bytes) = scheduler.execution_usage();
+            if execution_count >= MAX_ADMITTED_EXECUTIONS
+                || source_bytes.saturating_add(execution.source_bytes()) > MAX_ADMITTED_SOURCE_BYTES
+            {
+                return Err(Error::ExecutionCapacity);
+            }
+
+            scheduler.pending.push_back(Job {
+                request_id,
+                operation: Operation::Execute {
+                    id,
+                    execution: Box::new(execution),
+                },
+                native_target: None,
+                admission_deadline: Some(deadline),
+                waiting_for_readiness: false,
+                retry_at: None,
+                retry_delay: BUSY_RETRY_INITIAL,
+                _execution_reservation: Some(reservation),
+                completion,
+            });
+            let should_wake = scheduler.request_wake();
+            (request_id, receiver, should_wake, None)
+        }
+    };
+
+    if let Some((completion, outcome, output)) = immediate {
+        if let Some(output) = output {
+            output.finish();
+        }
+        let _ = completion.send(outcome);
+    }
+    if should_wake {
+        schedule_native_actions();
+    }
+    TIMERS_CHANGED.notify_one();
+
+    Ok(ExecutionAdmission {
+        request_id,
+        output,
+        completion: ExecutionCompletion { receiver },
+    })
+}
+
+pub fn try_reserve_execution() -> Option<ExecutionReservation> {
+    EXECUTION_RESERVATIONS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < MAX_ADMITTED_EXECUTIONS).then_some(current + 1)
+        })
+        .ok()
+        .map(|_| ExecutionReservation {
+            _inner: Arc::new(ExecutionReservationInner),
+        })
+}
+
+impl ExecutionAdmission {
+    pub fn into_parts(self) -> (u64, OutputStream, ExecutionCompletion) {
+        (self.request_id, self.output, self.completion)
+    }
+}
+
+impl ExecutionCompletion {
+    pub async fn wait(self) -> Result<ExecutionOutcome, Error> {
+        match self.receiver.await.map_err(|_| Error::Stopped)?? {
+            OperationOutcome::Execution(outcome) => Ok(outcome),
+            OperationOutcome::Document(_) | OperationOutcome::Closed => {
+                Err(Error::ExecutionNotFinished)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub async fn execute(id: String, execution: Execution) -> Result<ExecutionOutcome, Error> {
     match dispatch(Operation::Execute {
         id,
@@ -365,6 +531,7 @@ pub fn stop() {
             let _ = completion.send(Err(Error::PluginStopping));
         }
     }
+    TIMERS_CHANGED.notify_one();
 }
 
 async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
@@ -375,6 +542,9 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
         }
         if scheduler.quarantined {
             return Err(Error::NativeStateUnknown);
+        }
+        if scheduler.durable_mutation_count() >= MAX_DURABLE_MUTATIONS {
+            return Err(Error::MutationCapacity);
         }
         if scheduler.idle()
             && let Prepared::Immediate(outcome) = prepare(&operation, &scheduler.documents)
@@ -388,6 +558,11 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
             request_id,
             operation,
             native_target: None,
+            admission_deadline: None,
+            waiting_for_readiness: false,
+            retry_at: None,
+            retry_delay: BUSY_RETRY_INITIAL,
+            _execution_reservation: None,
             completion,
         });
         let should_wake = scheduler.request_wake();
@@ -409,17 +584,25 @@ pub fn take() -> NativeAction {
         if scheduler.stopping || scheduler.quarantined || scheduler.active.is_some() {
             TakeDecision::Empty
         } else if let Some(mut job) = scheduler.pending.pop_front() {
-            match prepare(&job.operation, &scheduler.documents) {
-                Prepared::Immediate(outcome) => TakeDecision::Complete(job.completion, outcome),
-                Prepared::Native(mut action) => {
-                    action.request_id = job.request_id;
-                    job.native_target = matches!(&job.operation, Operation::Execute { .. })
-                        .then_some(NativeDocumentKey {
-                            document_token: action.document_token,
-                            database_token: action.database_token,
-                        });
-                    scheduler.active = Some(job);
-                    TakeDecision::Action(action)
+            if job.waiting_for_readiness {
+                scheduler.pending.push_front(job);
+                TakeDecision::Empty
+            } else {
+                job.expire_if_due(Instant::now());
+                match prepare(&job.operation, &scheduler.documents) {
+                    Prepared::Immediate(outcome) => {
+                        TakeDecision::Complete(job.completion, outcome, job.operation.output_sink())
+                    }
+                    Prepared::Native(mut action) => {
+                        action.request_id = job.request_id;
+                        job.native_target = matches!(&job.operation, Operation::Execute { .. })
+                            .then_some(NativeDocumentKey {
+                                document_token: action.document_token,
+                                database_token: action.database_token,
+                            });
+                        scheduler.active = Some(job);
+                        TakeDecision::Action(action)
+                    }
                 }
             }
         } else {
@@ -429,7 +612,10 @@ pub fn take() -> NativeAction {
 
     match decision {
         TakeDecision::Action(action) => action,
-        TakeDecision::Complete(completion, outcome) => {
+        TakeDecision::Complete(completion, outcome, output) => {
+            if let Some(output) = output {
+                output.finish();
+            }
             let _ = completion.send(outcome);
             empty_action()
         }
@@ -437,7 +623,8 @@ pub fn take() -> NativeAction {
     }
 }
 
-pub fn complete(request_id: u64, result: NativeActionResult) {
+pub fn complete(request_id: u64, mut result: NativeActionResult) {
+    bound_diagnostic(&mut result.native_detail);
     let quarantine = matches!(
         result.kind,
         NativeActionResultKind::ContextCleanupFailed
@@ -456,8 +643,31 @@ pub fn complete(request_id: u64, result: NativeActionResult) {
             return;
         }
 
+        let settled_before_start = if result.kind == NativeActionResultKind::NotQuiescent
+            && job.execution_has_not_started()
+        {
+            if job.finish_cancel_before_start()
+                || job.expire_if_due(Instant::now())
+                || job.execution_has_outcome()
+            {
+                true
+            } else {
+                job.native_target = None;
+                job.defer_for_readiness(Instant::now());
+                scheduler.pending.push_front(job);
+                TIMERS_CHANGED.notify_one();
+                return;
+            }
+        } else {
+            false
+        };
+
         let output = job.operation.output_sink();
-        let outcome = complete_operation(result, &mut job.operation, &scheduler.documents);
+        let outcome = if settled_before_start {
+            finalize(&mut job.operation, &scheduler.documents)
+        } else {
+            complete_operation(result, &mut job.operation, &scheduler.documents)
+        };
         let pending = if quarantine {
             scheduler.quarantined = true;
             scheduler.wake_pending = false;
@@ -482,14 +692,14 @@ pub fn complete(request_id: u64, result: NativeActionResult) {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "execution cancellation is private until the Execute RPC is exposed"
-)]
 pub fn cancel_execution(request_id: u64) -> CancelResult {
     enum Action {
         Active(OutputSink),
-        Pending(OutputSink, oneshot::Sender<Result<OperationOutcome, Error>>),
+        Pending {
+            output: OutputSink,
+            completion: oneshot::Sender<Result<OperationOutcome, Error>>,
+            should_wake: bool,
+        },
         Result(CancelResult),
     }
 
@@ -525,7 +735,12 @@ pub fn cancel_execution(request_id: u64) -> CancelResult {
             };
             if let Some(output) = output {
                 let job = scheduler.pending.remove(index).expect("queued job exists");
-                Action::Pending(output, job.completion)
+                let should_wake = scheduler.request_wake();
+                Action::Pending {
+                    output,
+                    completion: job.completion,
+                    should_wake,
+                }
             } else {
                 Action::Result(CancelResult::TooLate)
             }
@@ -539,13 +754,121 @@ pub fn cancel_execution(request_id: u64) -> CancelResult {
             output.request_cancel();
             CancelResult::Accepted
         }
-        Action::Pending(output, completion) => {
+        Action::Pending {
+            output,
+            completion,
+            should_wake,
+        } => {
             output.request_cancel();
             let _ = completion.send(Ok(OperationOutcome::Execution(ExecutionOutcome::Cancelled)));
+            if should_wake {
+                schedule_native_actions();
+            }
+            TIMERS_CHANGED.notify_one();
             CancelResult::Accepted
         }
         Action::Result(result) => result,
     }
+}
+
+pub async fn drive_timers() {
+    loop {
+        let changed = TIMERS_CHANGED.notified();
+        match next_timer_deadline() {
+            Some(deadline) => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        process_due_timers(Instant::now());
+                    }
+                    _ = changed => {}
+                }
+            }
+            None => changed.await,
+        }
+    }
+}
+
+fn next_timer_deadline() -> Option<Instant> {
+    let scheduler = SCHEDULER.lock().ok()?;
+    let admission = scheduler
+        .pending
+        .iter()
+        .chain(scheduler.active.iter())
+        .filter(|job| job.execution_admission_pending())
+        .filter_map(|job| job.admission_deadline)
+        .min();
+    let retry = scheduler
+        .pending
+        .front()
+        .filter(|job| job.waiting_for_readiness)
+        .and_then(|job| job.retry_at);
+    admission.into_iter().chain(retry).min()
+}
+
+fn process_due_timers(now: Instant) {
+    let Some((expired, should_wake)) = SCHEDULER.lock().ok().map(|mut scheduler| {
+        if let Some(active) = scheduler.active.as_mut() {
+            active.expire_if_due(now);
+        }
+
+        let mut expired = Vec::new();
+        let mut index = 0;
+        while index < scheduler.pending.len() {
+            let should_expire = scheduler.pending[index].deadline_is_due(now);
+            if !should_expire {
+                index += 1;
+                continue;
+            }
+
+            let mut job = scheduler.pending.remove(index).expect("queued job exists");
+            if job.expire_if_due(now) {
+                let output = job.operation.output_sink();
+                let outcome = finalize(&mut job.operation, &scheduler.documents);
+                expired.push((job.completion, outcome, output));
+            } else {
+                scheduler.pending.insert(index, job);
+                index += 1;
+            }
+        }
+
+        if let Some(head) = scheduler.pending.front_mut()
+            && head.waiting_for_readiness
+            && head.retry_at.is_some_and(|retry_at| now >= retry_at)
+        {
+            head.waiting_for_readiness = false;
+            head.retry_at = None;
+        }
+
+        let should_wake = scheduler.request_wake();
+        (expired, should_wake)
+    }) else {
+        return;
+    };
+
+    for (completion, outcome, output) in expired {
+        if let Some(output) = output {
+            output.finish();
+        }
+        let _ = completion.send(outcome);
+    }
+    if should_wake {
+        schedule_native_actions();
+    }
+}
+
+pub fn native_state_may_be_ready() {
+    let should_wake = SCHEDULER.lock().is_ok_and(|mut scheduler| {
+        if let Some(job) = scheduler.pending.front_mut() {
+            job.waiting_for_readiness = false;
+            job.retry_at = None;
+            job.retry_delay = BUSY_RETRY_INITIAL;
+        }
+        scheduler.request_wake()
+    });
+    if should_wake {
+        schedule_native_actions();
+    }
+    TIMERS_CHANGED.notify_one();
 }
 
 pub fn take_execution_step(execution_id: u64) -> NativeExecutionStep {
@@ -558,6 +881,7 @@ pub fn take_execution_step(execution_id: u64) -> NativeExecutionStep {
     if job.request_id != execution_id {
         return NativeExecutionStep::invalid();
     }
+    job.expire_if_due(Instant::now());
     match &mut job.operation {
         Operation::Execute { execution, .. } => execution.take_step(),
         Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
@@ -621,7 +945,8 @@ pub fn begin_eval_value(
     lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::eval_value)
 }
 
-pub fn complete_execution_step(execution_id: u64, result: StepResult) -> bool {
+pub fn complete_execution_step(execution_id: u64, mut result: StepResult) -> bool {
+    bound_diagnostic(&mut result.detail);
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return false;
     };
@@ -637,7 +962,8 @@ pub fn complete_execution_step(execution_id: u64, result: StepResult) -> bool {
     }
 }
 
-pub fn abandon_execution(execution_id: u64, result: StepResult) -> bool {
+pub fn abandon_execution(execution_id: u64, mut result: StepResult) -> bool {
+    bound_diagnostic(&mut result.detail);
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return false;
     };
@@ -785,6 +1111,19 @@ fn complete_operation(
     operation: &mut Operation,
     documents: &DocumentRegistry,
 ) -> Result<OperationOutcome, Error> {
+    if matches!(
+        operation,
+        Operation::Execute { execution, .. } if execution.outcome().is_some()
+    ) && !matches!(
+        result.kind,
+        NativeActionResultKind::ContextCleanupFailed
+            | NativeActionResultKind::ExecutionLeaseFailed
+            | NativeActionResultKind::ExecutionStateCleanupFailed
+            | NativeActionResultKind::ExecutionBridgeFailed
+    ) {
+        return finalize(operation, documents);
+    }
+
     if result.kind == NativeActionResultKind::ExecutionStateCleanupFailed
         && let Operation::Execute { execution, .. } = operation
         && matches!(execution.outcome(), Some(ExecutionOutcome::Failure(_)))
@@ -861,6 +1200,68 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         }
         NativeActionResultKind::ExecutionBridgeFailed => Err(Error::ExecutionBridgeFailed(failure)),
         kind => Err(Error::UnknownResult(kind.repr)),
+    }
+}
+
+impl Job {
+    fn deadline_is_due(&self, now: Instant) -> bool {
+        self.admission_deadline
+            .is_some_and(|deadline| now >= deadline)
+            && self.execution_admission_pending()
+    }
+
+    fn expire_if_due(&mut self, now: Instant) -> bool {
+        if !self.deadline_is_due(now) {
+            return false;
+        }
+        match &mut self.operation {
+            Operation::Execute { execution, .. } => execution.expire_before_start(format!(
+                "execution did not start within {} seconds",
+                EXECUTION_ADMISSION_TIMEOUT.as_secs()
+            )),
+            Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
+        }
+    }
+
+    fn execution_has_not_started(&self) -> bool {
+        matches!(
+            &self.operation,
+            Operation::Execute { execution, .. } if !execution.form_started()
+        )
+    }
+
+    fn execution_admission_pending(&self) -> bool {
+        matches!(
+            &self.operation,
+            Operation::Execute { execution, .. } if execution.admission_deadline_pending()
+        )
+    }
+
+    fn execution_has_outcome(&self) -> bool {
+        matches!(
+            &self.operation,
+            Operation::Execute { execution, .. } if execution.outcome().is_some()
+        )
+    }
+
+    fn finish_cancel_before_start(&mut self) -> bool {
+        match &mut self.operation {
+            Operation::Execute { execution, .. }
+                if !execution.form_started() && execution.cancellation_requested() =>
+            {
+                execution.cancel_before_start()
+            }
+            Operation::Execute { .. }
+            | Operation::Open { .. }
+            | Operation::Save { .. }
+            | Operation::Close { .. } => false,
+        }
+    }
+
+    fn defer_for_readiness(&mut self, now: Instant) {
+        self.waiting_for_readiness = true;
+        self.retry_at = Some(now + self.retry_delay);
+        self.retry_delay = self.retry_delay.saturating_mul(2).min(BUSY_RETRY_MAX);
     }
 }
 
@@ -1745,6 +2146,369 @@ mod tests {
         assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
         assert_eq!(take().kind, NativeActionKind::None);
         stop();
+    }
+
+    #[tokio::test]
+    async fn queued_execution_expires_without_starting_a_form() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, true)]);
+        let id = list().unwrap()[0].id.clone();
+        let saving = tokio::spawn(save(id.clone()));
+        tokio::task::yield_now().await;
+        let save_action = take();
+        assert_eq!(save_action.kind, NativeActionKind::Save);
+
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, mut output, completion) = admission.into_parts();
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            let job = scheduler
+                .pending
+                .iter_mut()
+                .find(|job| job.request_id == request_id)
+                .unwrap();
+            job.admission_deadline = Some(Instant::now() - Duration::from_millis(1));
+        }
+        process_due_timers(Instant::now());
+
+        assert_eq!(output.next_chunk().await, None);
+        assert_eq!(
+            completion.wait().await.unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                message: "execution did not start within 5 seconds".into(),
+                form_index: None,
+                location: None,
+                drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
+            })
+        );
+        assert_eq!(take().kind, NativeActionKind::None);
+
+        replace_documents(vec![document(1, 101, false)]);
+        complete(
+            save_action.request_id,
+            result(NativeActionResultKind::Success),
+        );
+        assert!(saving.await.unwrap().is_ok());
+        stop();
+    }
+
+    #[tokio::test]
+    async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, _output, completion) = admission.into_parts();
+
+        let first = take();
+        assert_eq!(first.kind, NativeActionKind::RunExecution);
+        complete(
+            first.request_id,
+            result(NativeActionResultKind::NotQuiescent),
+        );
+        assert_eq!(take().kind, NativeActionKind::None);
+
+        process_due_timers(Instant::now() + BUSY_RETRY_MAX);
+        let retried = take();
+        assert_eq!(retried.kind, NativeActionKind::RunExecution);
+        assert_eq!(retried.request_id, request_id);
+        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        assert_eq!(
+            take_execution_step(request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(request_id, result(NativeActionResultKind::Success));
+        assert_eq!(
+            completion.wait().await.unwrap(),
+            ExecutionOutcome::Cancelled
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn deadline_wins_while_the_busy_probe_is_in_flight() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, _output, completion) = admission.into_parts();
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.active.as_mut().unwrap().admission_deadline =
+                Some(Instant::now() - Duration::from_millis(1));
+        }
+        process_due_timers(Instant::now());
+        complete(request_id, result(NativeActionResultKind::NotQuiescent));
+
+        assert!(matches!(
+            completion.wait().await.unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
+                ..
+            })
+        ));
+        assert_eq!(take().kind, NativeActionKind::None);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn deadline_winner_survives_a_native_preflight_failure() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, _output, completion) = admission.into_parts();
+        assert_eq!(take().kind, NativeActionKind::RunExecution);
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.active.as_mut().unwrap().admission_deadline =
+                Some(Instant::now() - Duration::from_millis(1));
+        }
+        process_due_timers(Instant::now());
+        complete(request_id, result(NativeActionResultKind::UndoDisabled));
+
+        assert_eq!(
+            completion.wait().await.unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                message: "execution did not start within 5 seconds".into(),
+                form_index: None,
+                location: None,
+                drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
+            })
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn deadline_winner_survives_a_failing_begin_step() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, _output, completion) = admission.into_parts();
+        assert_eq!(take().kind, NativeActionKind::RunExecution);
+        assert_eq!(
+            take_execution_step(request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.active.as_mut().unwrap().admission_deadline =
+                Some(Instant::now() - Duration::from_millis(1));
+        }
+        process_due_timers(Instant::now());
+        assert!(complete_execution_step(
+            request_id,
+            StepResult {
+                kind: crate::execution::StepResultKind::NativeError,
+                native_status: 42,
+                lisp_errno: 0,
+                detail: "undo begin failed".into(),
+                cleanup_status: 0,
+            }
+        ));
+        assert_eq!(
+            take_execution_step(request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(request_id, result(NativeActionResultKind::Success));
+
+        let ExecutionOutcome::Failure(failure) = completion.wait().await.unwrap() else {
+            panic!("the admission deadline must remain the terminal cause");
+        };
+        assert!(
+            failure
+                .message
+                .starts_with("execution did not start within 5 seconds")
+        );
+        assert!(failure.message.contains("undo begin failed"));
+        assert_eq!(
+            failure.drawing_outcome,
+            crate::execution::DrawingOutcome::NotStarted
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn admitted_execution_survives_dropped_rpc_observers() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, output, completion) = admission.into_parts();
+        drop(output);
+        drop(completion);
+
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        assert_eq!(action.request_id, request_id);
+        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        assert_eq!(
+            take_execution_step(request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(request_id, result(NativeActionResultKind::Success));
+        assert_eq!(take().kind, NativeActionKind::None);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn execution_count_capacity_is_released_by_queued_cancellation() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let mut admissions = Vec::new();
+        for _ in 0..MAX_ADMITTED_EXECUTIONS {
+            let (execution, output) =
+                Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+            admissions.push(admit_test_execution(id.clone(), execution, output).unwrap());
+        }
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        assert!(matches!(
+            admit_test_execution(id.clone(), execution, output),
+            Err(Error::ExecutionCapacity)
+        ));
+
+        for admission in admissions {
+            let (request_id, _output, completion) = admission.into_parts();
+            assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+            assert_eq!(
+                completion.wait().await.unwrap(),
+                ExecutionOutcome::Cancelled
+            );
+        }
+
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let replacement = admit_test_execution(id, execution, output).unwrap();
+        let (request_id, _output, completion) = replacement.into_parts();
+        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        assert_eq!(
+            completion.wait().await.unwrap(),
+            ExecutionOutcome::Cancelled
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn detached_execution_retains_its_shared_admission_reservation() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let response_reservation = try_reserve_execution().unwrap();
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission =
+            admit_execution(id, execution, output, response_reservation.clone()).unwrap();
+        let (request_id, output, completion) = admission.into_parts();
+        drop(output);
+        drop(completion);
+        drop(response_reservation);
+
+        let other_reservations = (1..MAX_ADMITTED_EXECUTIONS)
+            .map(|_| try_reserve_execution().unwrap())
+            .collect::<Vec<_>>();
+        assert!(try_reserve_execution().is_none());
+
+        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        let replacement = try_reserve_execution().unwrap();
+        drop(replacement);
+        drop(other_reservations);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_and_deadline_have_one_serialized_winner() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id.clone(), execution, output).unwrap();
+        let (expired_id, _output, expired_completion) = admission.into_parts();
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler
+                .pending
+                .iter_mut()
+                .find(|job| job.request_id == expired_id)
+                .unwrap()
+                .admission_deadline = Some(Instant::now() - Duration::from_millis(1));
+        }
+        process_due_timers(Instant::now());
+        assert_eq!(cancel_execution(expired_id), CancelResult::NotFound);
+        assert!(matches!(
+            expired_completion.wait().await.unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
+                ..
+            })
+        ));
+
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (cancelled_id, _output, cancelled_completion) = admission.into_parts();
+        assert_eq!(cancel_execution(cancelled_id), CancelResult::Accepted);
+        process_due_timers(Instant::now() + EXECUTION_ADMISSION_TIMEOUT);
+        assert_eq!(
+            cancelled_completion.wait().await.unwrap(),
+            ExecutionOutcome::Cancelled
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn durable_mutation_capacity_bounds_disconnected_waiters() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, true)]);
+        let id = list().unwrap()[0].id.clone();
+        let active = tokio::spawn(save(id.clone()));
+        tokio::task::yield_now().await;
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::Save);
+
+        let mut queued = Vec::new();
+        for _ in 1..MAX_DURABLE_MUTATIONS {
+            queued.push(tokio::spawn(save(id.clone())));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(save(id).await, Err(Error::MutationCapacity));
+
+        stop();
+        complete(
+            action.request_id,
+            result(NativeActionResultKind::SaveFailed),
+        );
+        assert!(matches!(active.await.unwrap(), Err(Error::SaveFailed(_))));
+        for waiter in queued {
+            assert_eq!(waiter.await.unwrap(), Err(Error::PluginStopping));
+        }
+    }
+
+    fn admit_test_execution(
+        id: String,
+        execution: Execution,
+        output: OutputStream,
+    ) -> Result<ExecutionAdmission, Error> {
+        let reservation = try_reserve_execution().ok_or(Error::ExecutionCapacity)?;
+        admit_execution(id, execution, output, reservation)
     }
 
     fn result(kind: NativeActionResultKind) -> NativeActionResult {

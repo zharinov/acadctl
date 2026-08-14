@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
+use bytes::Bytes;
 use output::{OutputSink, OutputStream};
 
 pub mod output;
@@ -8,21 +9,37 @@ pub mod value;
 pub mod value_bridge;
 pub(crate) mod visitor;
 
-#[allow(
-    dead_code,
-    reason = "request admission stays private until the native proof gates pass"
-)]
 pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 pub const EVALUATOR_SOURCE: &str = include_str!("../../lisp/acadctl.lsp");
 
+pub(crate) fn bound_diagnostic(message: &mut String) {
+    const SUFFIX: &str = "... [truncated]";
+    if message.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES {
+        return;
+    }
+    let mut end = acadctl_rpc::MAX_DIAGNOSTIC_BYTES - SUFFIX.len();
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push_str(SUFFIX);
+}
+
+pub(crate) fn bounded_diagnostic(mut message: String) -> String {
+    bound_diagnostic(&mut message);
+    message
+}
+
+fn append_diagnostic(message: &mut String, detail: &str) {
+    message.push_str("; ");
+    message.push_str(detail);
+    bound_diagnostic(message);
+}
+
 pub struct Execution {
-    #[allow(
-        dead_code,
-        reason = "the stored mode is consumed when public output is wired"
-    )]
     mode: ExecutionMode,
     source_name: String,
-    source: Arc<String>,
+    source: Bytes,
     next_scan: ScanPosition,
     next_form_index: usize,
     phase: Phase,
@@ -72,23 +89,16 @@ pub(crate) enum ValueBridgeFailure {
     MissingValue,
 }
 
-#[allow(
-    dead_code,
-    reason = "request admission stays private until the native proof gates pass"
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionMode {
     Eval,
     Exec,
 }
 
-#[allow(
-    dead_code,
-    reason = "request admission stays private until the native proof gates pass"
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
     SourceTooLarge,
+    InvalidUtf8,
     NullCharacter,
     ExpectedOneForm { actual: usize },
     Scan(ScanError),
@@ -139,7 +149,7 @@ pub enum StepKind {
 
 pub struct NativeExecutionStep {
     kind: StepKind,
-    source: Option<Arc<String>>,
+    source: Option<Bytes>,
     span: Option<FormSpan>,
     retain_value: bool,
 }
@@ -161,10 +171,6 @@ pub struct StepResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    #[allow(
-        dead_code,
-        reason = "request admission stays private until the native proof gates pass"
-    )]
     Begin,
     AwaitingBegin,
     BetweenForms,
@@ -337,30 +343,28 @@ impl ValueBridgeFailure {
 }
 
 impl Execution {
-    #[allow(
-        dead_code,
-        reason = "request admission stays private until the native proof gates pass"
-    )]
     pub fn new(
         mode: ExecutionMode,
         source_name: String,
-        mut source: String,
+        source: Bytes,
     ) -> Result<(Self, OutputStream), ValidationError> {
-        if source.starts_with('\u{feff}') {
-            source.drain(..'\u{feff}'.len_utf8());
+        let mut source = source;
+        if source.starts_with(&[0xef, 0xbb, 0xbf]) {
+            source = source.slice(3..);
         }
         if source.len() > MAX_SOURCE_BYTES {
             return Err(ValidationError::SourceTooLarge);
         }
-        if source.contains('\0') {
+        let source_text = std::str::from_utf8(&source).map_err(|_| ValidationError::InvalidUtf8)?;
+        if source_text.contains('\0') {
             return Err(ValidationError::NullCharacter);
         }
 
-        let form_count = acadctl_lisp::validate(&source).map_err(ValidationError::Scan)?;
+        let form_count = acadctl_lisp::validate(source_text).map_err(ValidationError::Scan)?;
         if mode == ExecutionMode::Eval && form_count != 1 {
             return Err(ValidationError::ExpectedOneForm { actual: form_count });
         }
-        let next_scan = acadctl_lisp::scan(&source).position();
+        let next_scan = acadctl_lisp::scan(source_text).position();
         let empty = form_count == 0;
         let (output, stream) = output::channel();
         let io = Arc::new(ExecutionIo {
@@ -374,7 +378,7 @@ impl Execution {
             Self {
                 mode,
                 source_name,
-                source: Arc::new(source),
+                source,
                 next_scan,
                 next_form_index: 1,
                 phase: if empty { Phase::Terminal } else { Phase::Begin },
@@ -390,10 +394,7 @@ impl Execution {
         ))
     }
 
-    #[allow(
-        dead_code,
-        reason = "the stored mode is consumed when public output is wired"
-    )]
+    #[cfg(test)]
     pub const fn mode(&self) -> ExecutionMode {
         self.mode
     }
@@ -408,6 +409,25 @@ impl Execution {
 
     pub fn output_sink(&self) -> OutputSink {
         self.io.output.clone()
+    }
+
+    pub fn source_bytes(&self) -> usize {
+        self.source.len()
+    }
+
+    pub fn form_started(&self) -> bool {
+        self.form_attempted
+    }
+
+    pub fn cancellation_requested(&self) -> bool {
+        self.cancel_requested
+    }
+
+    pub fn admission_deadline_pending(&self) -> bool {
+        !self.form_attempted
+            && self.outcome.is_none()
+            && !self.cancel_requested
+            && self.rollback.is_none()
     }
 
     pub(crate) fn acquire_form_output(&self) -> Option<ValueOutputLease> {
@@ -425,6 +445,9 @@ impl Execution {
     pub fn request_cancel(&mut self) -> bool {
         if self.cancel_requested {
             return true;
+        }
+        if self.rollback.is_some() {
+            return false;
         }
         if matches!(
             self.phase,
@@ -446,10 +469,45 @@ impl Execution {
         true
     }
 
-    #[allow(
-        dead_code,
-        reason = "queued cancellation is private until the Execute RPC is exposed"
-    )]
+    pub fn expire_before_start(&mut self, message: String) -> bool {
+        if self.form_attempted || self.outcome.is_some() || self.cancel_requested {
+            return false;
+        }
+
+        let failure = Failure {
+            message,
+            form_index: None,
+            location: None,
+            drawing_outcome: DrawingOutcome::NotStarted,
+        };
+        match self.phase {
+            Phase::Begin => {
+                self.outcome = Some(Outcome::Failure(failure));
+                self.phase = Phase::Terminal;
+            }
+            Phase::AwaitingBegin => {
+                self.rollback = Some(RollbackCause::Failure(failure));
+            }
+            Phase::BetweenForms => {
+                self.rollback = Some(RollbackCause::Failure(failure));
+                self.phase = Phase::Abort;
+            }
+            Phase::AwaitingForm { .. }
+            | Phase::AwaitingCommit
+            | Phase::EmitValue
+            | Phase::AwaitingEmitValue
+            | Phase::ClearValue
+            | Phase::AwaitingClearValue
+            | Phase::Abort
+            | Phase::AwaitingAbort
+            | Phase::Rollback
+            | Phase::AwaitingRollback
+            | Phase::Terminal
+            | Phase::Done => return false,
+        }
+        true
+    }
+
     pub fn cancel_before_start(&mut self) -> bool {
         if self.outcome.is_some() || !matches!(self.phase, Phase::Begin) {
             return false;
@@ -482,7 +540,9 @@ impl Execution {
                         }
                         continue;
                     }
-                    let mut scanner = acadctl_lisp::Scanner::resume(&self.source, self.next_scan);
+                    let source = std::str::from_utf8(&self.source)
+                        .expect("validated execution source remains UTF-8");
+                    let mut scanner = acadctl_lisp::Scanner::resume(source, self.next_scan);
                     match scanner.next() {
                         Some(Ok(span)) => {
                             self.next_scan = scanner.position();
@@ -503,7 +563,7 @@ impl Execution {
                             self.io.begin_value_output(ValueOutputKind::Form);
                             self.form_attempted = true;
                             return NativeExecutionStep::form(
-                                Arc::clone(&self.source),
+                                self.source.clone(),
                                 span,
                                 self.mode == ExecutionMode::Eval,
                             );
@@ -563,13 +623,24 @@ impl Execution {
         match self.phase {
             Phase::AwaitingBegin => {
                 if result.succeeded() {
-                    if self.cancel_requested {
+                    if self.rollback.is_some() {
+                        self.phase = Phase::Abort;
+                    } else if self.cancel_requested {
                         self.rollback = Some(RollbackCause::Cancelled);
                         self.phase = Phase::Abort;
                     } else {
                         self.phase = Phase::BetweenForms;
                     }
+                } else if matches!(self.rollback, Some(RollbackCause::Failure(_))) {
+                    let Some(RollbackCause::Failure(mut failure)) = self.rollback.take() else {
+                        unreachable!("the rollback cause was just matched")
+                    };
+                    let begin = result.into_message("could not begin the undo group");
+                    append_diagnostic(&mut failure.message, &begin);
+                    self.outcome = Some(Outcome::Failure(failure));
+                    self.phase = Phase::Terminal;
                 } else {
+                    self.rollback = None;
                     self.outcome = Some(Outcome::Failure(Failure {
                         message: result.into_message("could not begin the undo group"),
                         form_index: None,
@@ -602,7 +673,7 @@ impl Execution {
                 } else if let Some(failure) = bridge_failure {
                     let mut message = failure.message().to_owned();
                     if let Some(cleanup) = result.cleanup_message() {
-                        message = format!("{message}; {cleanup}");
+                        append_diagnostic(&mut message, &cleanup);
                     }
                     self.queue_rollback(RollbackCause::Failure(Failure {
                         message,
@@ -663,7 +734,7 @@ impl Execution {
                 } else if let Some(bridge_failure) = bridge_failure {
                     let mut message = bridge_failure.message().to_owned();
                     if let Some(cleanup) = result.cleanup_message() {
-                        message = format!("{message}; {cleanup}");
+                        append_diagnostic(&mut message, &cleanup);
                     }
                     Some(message)
                 } else if !result.succeeded() {
@@ -692,19 +763,27 @@ impl Execution {
                 self.phase = Phase::Rollback;
             }
             Phase::AwaitingAbort => {
-                let Some(RollbackCause::Cancelled) = self.rollback.take() else {
+                let Some(cause) = self.rollback.take() else {
                     return false;
                 };
-                if result.succeeded() {
-                    self.outcome = Some(Outcome::Cancelled);
-                } else {
-                    self.outcome = Some(Outcome::Failure(Failure {
+                self.outcome = Some(match cause {
+                    RollbackCause::Cancelled if result.succeeded() => Outcome::Cancelled,
+                    RollbackCause::Cancelled => Outcome::Failure(Failure {
                         message: result.into_message("could not close the cancelled undo group"),
                         form_index: None,
                         location: None,
                         drawing_outcome: DrawingOutcome::Unknown,
-                    }));
-                }
+                    }),
+                    RollbackCause::Failure(failure) if result.succeeded() => {
+                        Outcome::Failure(failure)
+                    }
+                    RollbackCause::Failure(mut failure) => {
+                        let cleanup = result.into_message("could not close the expired undo group");
+                        append_diagnostic(&mut failure.message, &cleanup);
+                        failure.drawing_outcome = DrawingOutcome::Unknown;
+                        Outcome::Failure(failure)
+                    }
+                });
                 self.phase = Phase::Terminal;
             }
             Phase::AwaitingRollback => {
@@ -717,7 +796,7 @@ impl Execution {
                             failure.drawing_outcome = DrawingOutcome::RolledBack;
                         } else {
                             let rollback = result.into_message("drawing rollback failed");
-                            failure.message = format!("{}; {rollback}", failure.message);
+                            append_diagnostic(&mut failure.message, &rollback);
                             failure.drawing_outcome = DrawingOutcome::Unknown;
                         }
                         Outcome::Failure(failure)
@@ -761,7 +840,7 @@ impl Execution {
     fn record_value_cleanup_failure(&mut self, cleanup: String) {
         let cause = match self.rollback.take() {
             Some(RollbackCause::Failure(mut failure)) => {
-                failure.message = format!("{}; {cleanup}", failure.message);
+                append_diagnostic(&mut failure.message, &cleanup);
                 RollbackCause::Failure(failure)
             }
             Some(RollbackCause::Cancelled) | None => {
@@ -773,7 +852,7 @@ impl Execution {
 
     fn eval_failure(&self, message: String, drawing_outcome: DrawingOutcome) -> Failure {
         Failure {
-            message,
+            message: bounded_diagnostic(message),
             form_index: Some(1),
             location: self.eval_location.clone(),
             drawing_outcome,
@@ -793,7 +872,7 @@ impl Execution {
                 drawing_outcome: DrawingOutcome::Unknown,
             },
             Outcome::Failure(mut failure) => {
-                failure.message = format!("{}; {cleanup}", failure.message);
+                append_diagnostic(&mut failure.message, &cleanup);
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
@@ -830,7 +909,7 @@ impl Execution {
                 drawing_outcome: DrawingOutcome::Unknown,
             },
             Some(Outcome::Failure(mut failure)) => {
-                failure.message = format!("{}; {message}", failure.message);
+                append_diagnostic(&mut failure.message, &message);
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
@@ -889,7 +968,7 @@ impl NativeExecutionStep {
         }
     }
 
-    fn form(source: Arc<String>, span: FormSpan, retain_value: bool) -> Self {
+    fn form(source: Bytes, span: FormSpan, retain_value: bool) -> Self {
         Self {
             kind: StepKind::Form,
             source: Some(source),
@@ -904,7 +983,11 @@ impl NativeExecutionStep {
 
     pub fn source(&self) -> &str {
         match (&self.source, &self.span) {
-            (Some(source), Some(span)) => &source[span.byte_start..span.byte_end],
+            (Some(source), Some(span)) => {
+                let source =
+                    std::str::from_utf8(source).expect("validated execution source remains UTF-8");
+                &source[span.byte_start..span.byte_end]
+            }
             _ => "",
         }
     }
@@ -945,12 +1028,12 @@ impl StepResult {
         } else {
             Some(fallback.to_owned())
         };
-        match (primary, cleanup) {
+        bounded_diagnostic(match (primary, cleanup) {
             (Some(primary), Some(cleanup)) => format!("{primary}; {cleanup}"),
             (Some(primary), None) => primary,
             (None, Some(cleanup)) => cleanup,
             (None, None) => fallback.to_owned(),
-        }
+        })
     }
 }
 
@@ -960,12 +1043,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_composition_preserves_the_stored_byte_limit() {
+        let mut message = bounded_diagnostic("é".repeat(acadctl_rpc::MAX_DIAGNOSTIC_BYTES));
+        append_diagnostic(&mut message, &"x".repeat(acadctl_rpc::MAX_DIAGNOSTIC_BYTES));
+        assert!(message.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES);
+        assert!(message.ends_with("... [truncated]"));
+        assert!(std::str::from_utf8(message.as_bytes()).is_ok());
+    }
+
+    #[test]
     fn validates_source_before_native_admission() {
         assert!(
             Execution::new(
                 ExecutionMode::Exec,
                 "<stdin>".into(),
-                "x".repeat(MAX_SOURCE_BYTES),
+                "x".repeat(MAX_SOURCE_BYTES).into(),
             )
             .is_ok()
         );
@@ -973,7 +1065,7 @@ mod tests {
             Execution::new(
                 ExecutionMode::Exec,
                 "<stdin>".into(),
-                format!("\u{feff}{}", "x".repeat(MAX_SOURCE_BYTES)),
+                format!("\u{feff}{}", "x".repeat(MAX_SOURCE_BYTES)).into(),
             )
             .is_ok()
         );
@@ -981,7 +1073,7 @@ mod tests {
             Execution::new(
                 ExecutionMode::Exec,
                 "<stdin>".into(),
-                "x".repeat(MAX_SOURCE_BYTES + 1),
+                "x".repeat(MAX_SOURCE_BYTES + 1).into(),
             )
             .err()
             .unwrap(),
@@ -993,10 +1085,35 @@ mod tests {
                 .unwrap(),
             ValidationError::NullCharacter
         );
+        assert_eq!(
+            Execution::new(
+                ExecutionMode::Exec,
+                "<stdin>".into(),
+                Bytes::from_static(b"\xff"),
+            )
+            .err()
+            .unwrap(),
+            ValidationError::InvalidUtf8
+        );
         assert!(matches!(
             Execution::new(ExecutionMode::Exec, "<stdin>".into(), "(unfinished".into(),),
             Err(ValidationError::Scan(_))
         ));
+    }
+
+    #[test]
+    fn bom_removal_and_native_steps_share_the_source_allocation() {
+        let source = Bytes::from_static(b"\xef\xbb\xbfform");
+        let expected = source.as_ref()[3..].as_ptr();
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "<stdin>".into(), source).unwrap();
+        assert_eq!(execution.source.as_ptr(), expected);
+        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert!(execution.complete_step(success()));
+        let form = execution.take_step();
+        assert_eq!(form.kind(), StepKind::Form);
+        assert_eq!(form.source.as_ref().unwrap().as_ptr(), expected);
+        assert_eq!(form.source(), "form");
     }
 
     #[test]

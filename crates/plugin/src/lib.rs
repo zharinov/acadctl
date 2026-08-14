@@ -180,6 +180,8 @@ mod ffi {
 
         fn native_actions_need_wake() -> bool;
 
+        fn native_state_may_be_ready();
+
         fn native_action_wake_failed(status: i32);
 
         fn take_execution_step(execution_id: u64) -> Box<NativeExecutionStep>;
@@ -193,6 +195,8 @@ mod ffi {
         fn execution_evaluator_source() -> &'static str;
 
         fn execution_value_source() -> &'static str;
+
+        fn native_diagnostic_capture_units() -> usize;
 
         fn complete_execution_step(execution_id: u64, result: NativeExecutionStepResult) -> bool;
 
@@ -264,6 +268,10 @@ fn native_actions_need_wake() -> bool {
     scheduler::native_actions_need_wake()
 }
 
+fn native_state_may_be_ready() {
+    scheduler::native_state_may_be_ready();
+}
+
 fn native_action_wake_failed(status: i32) {
     scheduler::wake_failed(status);
 }
@@ -300,6 +308,10 @@ fn execution_evaluator_source() -> &'static str {
 
 fn execution_value_source() -> &'static str {
     execution::visitor::source()
+}
+
+fn native_diagnostic_capture_units() -> usize {
+    acadctl_rpc::MAX_DIAGNOSTIC_BYTES + 1
 }
 
 fn complete_execution_step(execution_id: u64, result: ffi::NativeExecutionStepResult) -> bool {

@@ -10,6 +10,13 @@ const DOCUMENT_ID_ALPHABET: [char; 31] = [
     'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
+pub(crate) fn valid_document_id(id: &str) -> bool {
+    id.len() == DOCUMENT_ID_LENGTH
+        && id
+            .chars()
+            .all(|character| DOCUMENT_ID_ALPHABET.contains(&character))
+}
+
 pub struct DocumentRegistry {
     documents: Vec<TrackedDocument>,
 }
@@ -142,6 +149,16 @@ fn document_path(mut name: String, named: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_public_document_ids_exactly() {
+        assert!(valid_document_id("2az789"));
+        assert!(!valid_document_id(""));
+        assert!(!valid_document_id("2az78"));
+        assert!(!valid_document_id("2az7890"));
+        assert!(!valid_document_id("2az7i9"));
+        assert!(!valid_document_id("2AZ789"));
+    }
 
     #[test]
     fn preserves_identity_while_replacing_native_state() {

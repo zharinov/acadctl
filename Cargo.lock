@@ -23,8 +23,10 @@ version = "0.7.2"
 dependencies = [
  "acadctl-lisp",
  "acadctl-rpc",
+ "bytes",
  "cxx",
  "cxx-build",
+ "futures-util",
  "nanoid",
  "tokio",
  "tonic",
@@ -34,6 +36,7 @@ dependencies = [
 name = "acadctl-rpc"
 version = "0.7.2"
 dependencies = [
+ "bytes",
  "futures-util",
  "hyper-util",
  "objc2-foundation",
