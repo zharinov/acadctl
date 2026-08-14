@@ -517,3 +517,45 @@ The first implementation artifact is a narrow native vertical slice for routing,
 - AutoLISP comments include `;` line comments and `;| ... |;` block comments: <https://help.autodesk.com/cloudhelp/2024/ENU/AutoCAD-LT-AutoLISP/files/GUID-4D4664AD-301F-4E6E-AD65-4B7CE6A258B8.htm>
 - AutoLISP `read` returns the first list or atom from a string: <https://help.autodesk.com/cloudhelp/2023/ENU/AutoCAD-AutoLISP-Reference/files/GUID-5B50BB3E-C244-46E8-85D8-6A2D48B1FE51.htm>
 - Clojure's launcher triages read and execution errors around source, location, phase, and cause: <https://clojure.org/reference/repl_and_main#error_printing>
+
+## Implementation decision log
+
+This log is append-only. It records implementation discoveries without rewriting the agreed design above. A later entry may explicitly supersede an earlier implementation choice, but the original entry remains visible.
+
+### 2026-08-13 — I-001: shared Lisp boundary crate
+
+The scanner lives in a small `acadctl-lisp` workspace crate shared by the CLI and plugin. Both sides require identical form boundaries: the CLI for local diagnostics and the plugin for authoritative validation and execution.
+
+Keeping the scanner in the RPC crate was rejected because lexical policy is not transport policy. Duplicating it in the CLI and plugin was rejected because even a small drift could make locally accepted source fail after admission or make the two sides report different form locations.
+
+Scanner byte spans refer to the UTF-8 source after BOM removal. Lines and columns are one-based, columns count Unicode scalar values, and CRLF counts as one line break. An incomplete list, string, block comment, or quoted form points to the opening construct; a stray closing parenthesis points to itself. These choices make diagnostics stable without claiming an inner AutoLISP parser location.
+
+### 2026-08-13 — I-002: one native execution lease per batch
+
+One `eval` or `exec` request enters ObjectARX as one native action and retains the application-context callback, target-document context, write lock, and undo scope across all top-level forms. Rust hands the bridge one owned form step at a time while retaining execution policy and state.
+
+Enqueuing one native action per form was rejected. The existing asynchronous completion path would return to the host between actions, allow unrelated work to interleave, and break the batch's single undo and document-context guarantees.
+
+### 2026-08-13 — I-003: document identity includes the database generation
+
+Execution and history state key a target by both its document token and its current database token. A document object can survive replacement of its underlying database, so the document token alone is insufficient evidence that history still belongs to the same drawing state.
+
+Preserving provenance across a database replacement was rejected. Replacement or an unrecognized token transition clears ownership conservatively, even when this creates a false negative.
+
+### 2026-08-13 — I-004: native calls never retain a Rust state lock
+
+Every Rust-to-C++ execution step is owned data obtained after releasing scheduler state. Lisp evaluation, document changes, and `acadctl:println` can call synchronously back into Rust through reactors or the registered Lisp function.
+
+Holding the queue, execution, output, or provenance mutex across an ObjectARX call was rejected because a reentrant callback could deadlock the AutoCAD main thread. History invalidation events are nevertheless delivered synchronously to Rust so a safe undo decision cannot overtake an earlier user event.
+
+### 2026-08-13 — I-005: process termination is a CLI platform operation
+
+`kill` selects and terminates an operating-system process from the CLI. It does not depend on an RPC or native-plugin action. Graceful termination uses the platform's normal application-termination mechanism and observes the process for five seconds; forced termination targets the selected PID directly.
+
+Putting `kill` behind the plugin was rejected because the command is specifically required to remain useful when the plugin, RPC runtime, or AutoCAD main loop is unresponsive.
+
+### 2026-08-13 — I-006: output capacity is measured in bytes
+
+The execution output path has a total queued-byte budget in addition to bounded message counts. A single `acadctl:println` argument can otherwise make a nominally bounded channel retain an unbounded string.
+
+A bounded channel of unrestricted strings was rejected as insufficient backpressure. Native output is divided into bounded transport chunks while preserving exact concatenated stdout and the one-newline `acadctl:println` contract.
