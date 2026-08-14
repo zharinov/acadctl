@@ -116,6 +116,7 @@ pub enum Error {
     ContextFailed(NativeFailure),
     ContextCleanupFailed(NativeFailure),
     ExecutionLeaseFailed(NativeFailure),
+    ExecutionStateCleanupFailed(NativeFailure),
     ExecutionBridgeFailed(NativeFailure),
     ExecutionNotFinished,
     NativeStateUnknown,
@@ -189,6 +190,10 @@ impl fmt::Display for Error {
                 formatter,
                 "Could not close the AutoCAD execution lease safely",
             ),
+            Self::ExecutionStateCleanupFailed(failure) => failure.fmt_with_context(
+                formatter,
+                "Could not clear the reserved AutoLISP execution state",
+            ),
             Self::ExecutionBridgeFailed(failure) => {
                 failure.fmt_with_context(formatter, "The AutoLISP execution bridge failed")
             }
@@ -232,6 +237,7 @@ impl Error {
                 | Self::ContextFailed(_)
                 | Self::ContextCleanupFailed(_)
                 | Self::ExecutionLeaseFailed(_)
+                | Self::ExecutionStateCleanupFailed(_)
                 | Self::ExecutionBridgeFailed(_)
                 | Self::ExecutionNotFinished
                 | Self::NativeStateUnknown
@@ -434,7 +440,9 @@ pub fn take() -> NativeAction {
 pub fn complete(request_id: u64, result: NativeActionResult) {
     let quarantine = matches!(
         result.kind,
-        NativeActionResultKind::ContextCleanupFailed | NativeActionResultKind::ExecutionLeaseFailed
+        NativeActionResultKind::ContextCleanupFailed
+            | NativeActionResultKind::ExecutionLeaseFailed
+            | NativeActionResultKind::ExecutionStateCleanupFailed
     );
     let (completion, pending) = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
@@ -581,6 +589,36 @@ pub fn begin_println(document_token: usize, database_token: usize) -> NativeValu
     };
 
     lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::println)
+}
+
+pub fn begin_eval_value(
+    execution_id: u64,
+    document_token: usize,
+    database_token: usize,
+) -> NativeValueWriter {
+    let lease = {
+        let Ok(scheduler) = SCHEDULER.lock() else {
+            return NativeValueWriter::inactive();
+        };
+        let Some(job) = scheduler.active.as_ref() else {
+            return NativeValueWriter::inactive();
+        };
+        if job.request_id != execution_id
+            || job.native_target
+                != Some(NativeDocumentKey {
+                    document_token,
+                    database_token,
+                })
+        {
+            return NativeValueWriter::inactive();
+        }
+        match &job.operation {
+            Operation::Execute { execution, .. } => execution.acquire_eval_value_output(),
+            Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => None,
+        }
+    };
+
+    lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::eval_value)
 }
 
 pub fn complete_execution_step(execution_id: u64, result: StepResult) -> bool {
@@ -747,6 +785,13 @@ fn complete_operation(
     operation: &mut Operation,
     documents: &DocumentRegistry,
 ) -> Result<OperationOutcome, Error> {
+    if result.kind == NativeActionResultKind::ExecutionStateCleanupFailed
+        && let Operation::Execute { execution, .. } = operation
+        && matches!(execution.outcome(), Some(ExecutionOutcome::Failure(_)))
+    {
+        return finalize(operation, documents);
+    }
+
     if matches!(
         result.kind,
         NativeActionResultKind::ContextCleanupFailed | NativeActionResultKind::ExecutionLeaseFailed
@@ -758,6 +803,7 @@ fn complete_operation(
             native_status: result.native_status,
             lisp_errno: 0,
             detail: std::mem::take(&mut result.native_detail),
+            cleanup_status: 0,
         });
         debug_assert!(recorded);
         return finalize(operation, documents);
@@ -810,6 +856,9 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         NativeActionResultKind::ContextFailed => Err(Error::ContextFailed(failure)),
         NativeActionResultKind::ContextCleanupFailed => Err(Error::ContextCleanupFailed(failure)),
         NativeActionResultKind::ExecutionLeaseFailed => Err(Error::ExecutionLeaseFailed(failure)),
+        NativeActionResultKind::ExecutionStateCleanupFailed => {
+            Err(Error::ExecutionStateCleanupFailed(failure))
+        }
         NativeActionResultKind::ExecutionBridgeFailed => Err(Error::ExecutionBridgeFailed(failure)),
         kind => Err(Error::UnknownResult(kind.repr)),
     }
@@ -1071,6 +1120,63 @@ mod tests {
             rendered.push_str(&chunk);
         }
         assert_eq!(rendered, "created: 3\n");
+        stop();
+    }
+
+    #[tokio::test]
+    async fn routes_the_eval_value_only_after_commit_and_only_once() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        let form = take_execution_step(action.request_id);
+        assert_eq!(form.kind(), crate::execution::StepKind::Form);
+        assert!(form.retain_value());
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Commit
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::EmitValue
+        );
+
+        assert!(!begin_println(1, 101).active());
+        assert!(!begin_eval_value(action.request_id + 1, 1, 101).active());
+        assert!(!begin_eval_value(action.request_id, 2, 101).active());
+        assert!(!begin_eval_value(action.request_id, 1, 202).active());
+        let mut writer = begin_eval_value(action.request_id, 1, 101);
+        assert!(writer.active());
+        assert!(!begin_eval_value(action.request_id, 1, 101).active());
+        assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
+        assert_eq!(writer.finish(), WriteResult::Continue);
+        assert!(!begin_eval_value(action.request_id, 1, 101).active());
+
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
+        let mut rendered = String::new();
+        while let Some(chunk) = output.next_chunk().await {
+            rendered.push_str(&chunk);
+        }
+        assert_eq!(rendered, "12\n");
         stop();
     }
 
@@ -1561,6 +1667,86 @@ mod tests {
         stop();
     }
 
+    #[tokio::test]
+    async fn retained_execution_state_quarantines_without_erasing_commit_evidence() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, _output) =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id.clone(), execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Commit
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::EmitValue
+        );
+
+        let mut writer = begin_eval_value(action.request_id, 1, 101);
+        assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
+        assert_eq!(writer.finish(), WriteResult::Continue);
+        assert!(complete_execution_step(
+            action.request_id,
+            StepResult {
+                kind: crate::execution::StepResultKind::NativeError,
+                native_status: 42,
+                lisp_errno: 0,
+                detail: "could not clear the retained AutoLISP value".into(),
+                cleanup_status: 0,
+            }
+        ));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+
+        let blocked = tokio::spawn(save(id.clone()));
+        tokio::task::yield_now().await;
+        complete(
+            action.request_id,
+            NativeActionResult {
+                kind: NativeActionResultKind::ExecutionStateCleanupFailed,
+                native_status: 42,
+                native_detail: "reserved evaluator state remains".into(),
+            },
+        );
+
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                message: "could not clear the retained AutoLISP value".into(),
+                form_index: Some(1),
+                location: Some(crate::execution::SourceLocation {
+                    source_name: "inspect.lsp".into(),
+                    line: 1,
+                    column: 1,
+                }),
+                drawing_outcome: crate::execution::DrawingOutcome::Committed,
+            })
+        );
+        assert_eq!(blocked.await.unwrap(), Err(Error::NativeStateUnknown));
+        assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
+        assert_eq!(take().kind, NativeActionKind::None);
+        stop();
+    }
+
     fn result(kind: NativeActionResultKind) -> NativeActionResult {
         NativeActionResult {
             kind,
@@ -1575,6 +1761,7 @@ mod tests {
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
+            cleanup_status: 0,
         }
     }
 

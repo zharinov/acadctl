@@ -1,6 +1,6 @@
 use super::output::EmitResult;
 use super::value::{PrintError, PrintMode, ValuePrinter};
-use super::{FormOutputLease, ValueBridgeFailure};
+use super::{ValueBridgeFailure, ValueOutputLease};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteResult {
@@ -39,6 +39,7 @@ pub enum ValueEvent<'a> {
     ErrorObject,
     Void,
     Unsupported(Option<u32>),
+    Object(Option<&'a str>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,7 +50,7 @@ enum RootPolicy {
 
 pub struct NativeValueWriter {
     printer: Option<ValuePrinter>,
-    lease: Option<FormOutputLease>,
+    lease: Option<ValueOutputLease>,
     root_policy: RootPolicy,
     result: WriteResult,
 }
@@ -64,16 +65,15 @@ impl NativeValueWriter {
         }
     }
 
-    pub(crate) fn println(lease: FormOutputLease) -> Self {
+    pub(crate) fn println(lease: ValueOutputLease) -> Self {
         Self::new(lease, PrintMode::Display, RootPolicy::Any)
     }
 
-    #[cfg(test)]
-    fn eval_value(lease: FormOutputLease) -> Self {
+    pub(crate) fn eval_value(lease: ValueOutputLease) -> Self {
         Self::new(lease, PrintMode::Readable, RootPolicy::ExactlyOne)
     }
 
-    fn new(lease: FormOutputLease, mode: PrintMode, root_policy: RootPolicy) -> Self {
+    fn new(lease: ValueOutputLease, mode: PrintMode, root_policy: RootPolicy) -> Self {
         let sink = lease.output_sink();
         let status = sink.emit("");
         let result = emit_result(status);
@@ -84,8 +84,7 @@ impl NativeValueWriter {
             result,
         };
         if status != EmitResult::Written {
-            let failure =
-                (status == EmitResult::Finished).then_some(ValueBridgeFailure::OutputFinished);
+            let failure = output_failure(root_policy, status);
             writer.retire(failure, result);
         }
         writer
@@ -93,14 +92,14 @@ impl NativeValueWriter {
 
     pub fn active(&self) -> bool {
         self.result == WriteResult::Continue
-            && self.lease.as_ref().is_some_and(FormOutputLease::is_open)
+            && self.lease.as_ref().is_some_and(ValueOutputLease::is_open)
     }
 
     pub fn write(&mut self, event: ValueEvent<'_>) -> WriteResult {
         if self.result != WriteResult::Continue {
             return self.result;
         }
-        if !self.lease.as_ref().is_some_and(FormOutputLease::is_open) {
+        if !self.lease.as_ref().is_some_and(ValueOutputLease::is_open) {
             self.retire(None, WriteResult::Inactive);
             return self.result;
         }
@@ -135,6 +134,7 @@ impl NativeValueWriter {
             ValueEvent::ErrorObject => printer.error_object(),
             ValueEvent::Void => printer.void(),
             ValueEvent::Unsupported(native_type) => printer.unsupported(native_type),
+            ValueEvent::Object(label) => printer.object(label),
         };
         self.handle(result)
     }
@@ -143,7 +143,7 @@ impl NativeValueWriter {
         if self.result != WriteResult::Continue {
             return self.result;
         }
-        if !self.lease.as_ref().is_some_and(FormOutputLease::is_open) {
+        if !self.lease.as_ref().is_some_and(ValueOutputLease::is_open) {
             self.retire(None, WriteResult::Inactive);
             return self.result;
         }
@@ -179,11 +179,11 @@ impl NativeValueWriter {
                 ValueBridgeFailure::LimitExceeded,
                 WriteResult::LimitExceeded,
             ),
-            Err(PrintError::Output(EmitResult::Finished)) => {
-                self.fail(ValueBridgeFailure::OutputFinished, WriteResult::Finished)
-            }
             Err(PrintError::Output(result)) => {
-                self.retire(None, emit_result(result));
+                self.retire(
+                    output_failure(self.root_policy, result),
+                    emit_result(result),
+                );
                 self.result
             }
         }
@@ -213,6 +213,16 @@ const fn emit_result(result: EmitResult) -> WriteResult {
     }
 }
 
+const fn output_failure(root_policy: RootPolicy, result: EmitResult) -> Option<ValueBridgeFailure> {
+    match (root_policy, result) {
+        (_, EmitResult::Finished) => Some(ValueBridgeFailure::OutputFinished),
+        (RootPolicy::ExactlyOne, EmitResult::Cancelled) => {
+            Some(ValueBridgeFailure::PostCommitCancelled)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -235,7 +245,10 @@ mod tests {
         assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
         assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
-        assert_eq!(io.close_form_output(), None);
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::Form),
+            None
+        );
         terminal.finish();
 
         assert_eq!(collect(&mut stream).await, "created: 12\n");
@@ -244,11 +257,11 @@ mod tests {
     #[test]
     fn eval_value_requires_exactly_one_root() {
         let (io, _stream) = execution_io();
-        let writer = NativeValueWriter::eval_value(form_lease(&io));
+        let writer = NativeValueWriter::eval_value(eval_value_lease(&io));
 
         assert_eq!(writer.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            io.close_form_output(),
+            io.close_value_output(super::super::ValueOutputKind::EvalValue),
             Some(ValueBridgeFailure::InvalidSequence)
         );
     }
@@ -256,21 +269,82 @@ mod tests {
     #[test]
     fn eval_value_accepts_one_nested_root_and_rejects_two_roots() {
         let (one_io, _one_stream) = execution_io();
-        let mut one = NativeValueWriter::eval_value(form_lease(&one_io));
+        let mut one = NativeValueWriter::eval_value(eval_value_lease(&one_io));
         assert_eq!(one.write(ValueEvent::BeginList), WriteResult::Continue);
         assert_eq!(one.write(ValueEvent::Integer(1)), WriteResult::Continue);
         assert_eq!(one.write(ValueEvent::EndList), WriteResult::Continue);
         assert_eq!(one.finish(), WriteResult::Continue);
-        assert_eq!(one_io.close_form_output(), None);
+        assert_eq!(
+            one_io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            None
+        );
 
         let (two_io, _two_stream) = execution_io();
-        let mut two = NativeValueWriter::eval_value(form_lease(&two_io));
+        let mut two = NativeValueWriter::eval_value(eval_value_lease(&two_io));
         assert_eq!(two.write(ValueEvent::Integer(1)), WriteResult::Continue);
         assert_eq!(two.write(ValueEvent::Integer(2)), WriteResult::Continue);
         assert_eq!(two.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            two_io.close_form_output(),
+            two_io.close_value_output(super::super::ValueOutputKind::EvalValue),
             Some(ValueBridgeFailure::InvalidSequence)
+        );
+    }
+
+    #[test]
+    fn eval_value_epoch_requires_exactly_one_writer_claim() {
+        let (io, _stream) = execution_io();
+        io.begin_value_output(super::super::ValueOutputKind::EvalValue);
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            Some(ValueBridgeFailure::MissingValue)
+        );
+
+        io.begin_value_output(super::super::ValueOutputKind::EvalValue);
+        let mut writer = NativeValueWriter::eval_value(
+            io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
+                .expect("first claim succeeds"),
+        );
+        assert!(
+            io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
+                .is_none()
+        );
+        assert_eq!(writer.write(ValueEvent::Nil), WriteResult::Continue);
+        assert_eq!(writer.finish(), WriteResult::Continue);
+        assert!(
+            io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
+                .is_none()
+        );
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            None
+        );
+    }
+
+    #[test]
+    fn disconnected_eval_writer_still_satisfies_the_required_claim() {
+        let (io, stream) = execution_io();
+        let lease = eval_value_lease(&io);
+        drop(stream);
+
+        let writer = NativeValueWriter::eval_value(lease);
+        assert_eq!(writer.result, WriteResult::Disconnected);
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            None
+        );
+    }
+
+    #[test]
+    fn impossible_post_commit_cancellation_is_classified_in_rust() {
+        let (io, _stream) = execution_io();
+        let lease = eval_value_lease(&io);
+        io.output.request_cancel();
+
+        let writer = NativeValueWriter::eval_value(lease);
+        assert_eq!(writer.result, WriteResult::Cancelled);
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            Some(ValueBridgeFailure::PostCommitCancelled)
         );
     }
 
@@ -279,7 +353,10 @@ mod tests {
         let (io, _stream) = execution_io();
         drop(NativeValueWriter::println(form_lease(&io)));
 
-        assert_eq!(io.close_form_output(), Some(ValueBridgeFailure::Abandoned));
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::Form),
+            Some(ValueBridgeFailure::Abandoned)
+        );
     }
 
     #[test]
@@ -292,7 +369,10 @@ mod tests {
         assert_eq!(writer.result, WriteResult::Disconnected);
         assert!(writer.printer.is_none());
         assert!(writer.lease.is_none());
-        assert_eq!(io.close_form_output(), None);
+        assert_eq!(
+            io.close_value_output(super::super::ValueOutputKind::Form),
+            None
+        );
     }
 
     fn execution_io() -> (Arc<ExecutionIo>, OutputStream) {
@@ -306,9 +386,16 @@ mod tests {
         )
     }
 
-    fn form_lease(io: &Arc<ExecutionIo>) -> FormOutputLease {
-        io.begin_form_output();
-        io.acquire_form_output().expect("form output is open")
+    fn form_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
+        io.begin_value_output(super::super::ValueOutputKind::Form);
+        io.acquire_value_output(super::super::ValueOutputKind::Form)
+            .expect("form output is open")
+    }
+
+    fn eval_value_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
+        io.begin_value_output(super::super::ValueOutputKind::EvalValue);
+        io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
+            .expect("eval value output is open")
     }
 
     async fn collect(stream: &mut OutputStream) -> String {

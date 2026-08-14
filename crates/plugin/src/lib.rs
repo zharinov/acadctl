@@ -39,6 +39,7 @@ mod ffi {
         ContextFailed,
         ContextCleanupFailed,
         ExecutionLeaseFailed,
+        ExecutionStateCleanupFailed,
         ExecutionBridgeFailed,
     }
 
@@ -49,6 +50,8 @@ mod ffi {
         Begin,
         Form,
         Commit,
+        EmitValue,
+        ClearValue,
         Abort,
         Rollback,
         Done,
@@ -89,6 +92,7 @@ mod ffi {
         ErrorObject,
         Void,
         Unsupported,
+        Object,
     }
 
     #[derive(Debug)]
@@ -102,6 +106,17 @@ mod ffi {
         Finished,
         InvalidSequence,
         LimitExceeded,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeLispPayloadKind {
+        Invalid,
+        Nil,
+        Integer,
+        Real,
+        String,
+        Entity,
     }
 
     struct NativeAction {
@@ -124,6 +139,7 @@ mod ffi {
         native_status: i32,
         lisp_errno: i32,
         detail: String,
+        cleanup_status: i32,
     }
 
     struct NativeValueEvent {
@@ -136,6 +152,14 @@ mod ffi {
         y: f64,
         z: f64,
         has_payload: bool,
+    }
+
+    struct NativeLispValueEvent {
+        code: i32,
+        payload_kind: NativeLispPayloadKind,
+        integer: i64,
+        real: f64,
+        has_text: bool,
     }
 
     extern "Rust" {
@@ -164,7 +188,11 @@ mod ffi {
 
         fn execution_step_source(step: &NativeExecutionStep) -> &str;
 
+        fn execution_step_retain_value(step: &NativeExecutionStep) -> bool;
+
         fn execution_evaluator_source() -> &'static str;
+
+        fn execution_value_source() -> &'static str;
 
         fn complete_execution_step(execution_id: u64, result: NativeExecutionStepResult) -> bool;
 
@@ -172,11 +200,23 @@ mod ffi {
 
         fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter>;
 
+        fn begin_eval_value(
+            execution_id: u64,
+            document_token: usize,
+            database_token: usize,
+        ) -> Box<NativeValueWriter>;
+
         fn value_writer_active(writer: &NativeValueWriter) -> bool;
 
         fn write_value_event(
             writer: &mut NativeValueWriter,
             event: NativeValueEvent,
+            text: &str,
+        ) -> NativeValueWriteResult;
+
+        fn write_lisp_value_event(
+            writer: &mut NativeValueWriter,
+            event: NativeLispValueEvent,
             text: &str,
         ) -> NativeValueWriteResult;
 
@@ -238,6 +278,8 @@ fn execution_step_kind(step: &NativeExecutionStep) -> ffi::NativeExecutionStepKi
         execution::StepKind::Begin => ffi::NativeExecutionStepKind::Begin,
         execution::StepKind::Form => ffi::NativeExecutionStepKind::Form,
         execution::StepKind::Commit => ffi::NativeExecutionStepKind::Commit,
+        execution::StepKind::EmitValue => ffi::NativeExecutionStepKind::EmitValue,
+        execution::StepKind::ClearValue => ffi::NativeExecutionStepKind::ClearValue,
         execution::StepKind::Abort => ffi::NativeExecutionStepKind::Abort,
         execution::StepKind::Rollback => ffi::NativeExecutionStepKind::Rollback,
         execution::StepKind::Done => ffi::NativeExecutionStepKind::Done,
@@ -248,8 +290,16 @@ fn execution_step_source(step: &NativeExecutionStep) -> &str {
     step.source()
 }
 
+fn execution_step_retain_value(step: &NativeExecutionStep) -> bool {
+    step.retain_value()
+}
+
 fn execution_evaluator_source() -> &'static str {
     execution::EVALUATOR_SOURCE
+}
+
+fn execution_value_source() -> &'static str {
+    execution::visitor::source()
 }
 
 fn complete_execution_step(execution_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
@@ -262,6 +312,18 @@ fn abandon_execution(execution_id: u64, result: ffi::NativeExecutionStepResult) 
 
 fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter> {
     Box::new(scheduler::begin_println(document_token, database_token))
+}
+
+fn begin_eval_value(
+    execution_id: u64,
+    document_token: usize,
+    database_token: usize,
+) -> Box<NativeValueWriter> {
+    Box::new(scheduler::begin_eval_value(
+        execution_id,
+        document_token,
+        database_token,
+    ))
 }
 
 fn value_writer_active(writer: &NativeValueWriter) -> bool {
@@ -306,8 +368,28 @@ fn write_value_event(
         ffi::NativeValueEventKind::Unsupported => {
             ValueEvent::Unsupported(event.has_payload.then_some(event.native_type))
         }
+        ffi::NativeValueEventKind::Object => ValueEvent::Object(event.has_payload.then_some(text)),
         _ => ValueEvent::Invalid,
     };
+    native_value_write_result(writer.write(value))
+}
+
+fn write_lisp_value_event(
+    writer: &mut NativeValueWriter,
+    event: ffi::NativeLispValueEvent,
+    text: &str,
+) -> ffi::NativeValueWriteResult {
+    use execution::visitor::Payload;
+
+    let payload = match event.payload_kind {
+        ffi::NativeLispPayloadKind::Nil => Payload::Nil,
+        ffi::NativeLispPayloadKind::Integer => Payload::Integer(event.integer),
+        ffi::NativeLispPayloadKind::Real => Payload::Real(event.real),
+        ffi::NativeLispPayloadKind::String => Payload::String(text),
+        ffi::NativeLispPayloadKind::Entity => Payload::Entity(event.has_text.then_some(text)),
+        _ => Payload::Invalid,
+    };
+    let value = execution::visitor::value_event(event.code, payload);
     native_value_write_result(writer.write(value))
 }
 
@@ -344,6 +426,7 @@ fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::S
         native_status: result.native_status,
         lisp_errno: result.lisp_errno,
         detail: result.detail,
+        cleanup_status: result.cleanup_status,
     }
 }
 

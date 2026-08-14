@@ -6,6 +6,7 @@ pub const MAX_VALUE_TEXT_BYTES: usize = OUTPUT_CHUNK_BYTES;
 const MAX_ENTITY_HANDLE_BYTES: usize = 32;
 const MAX_CLASS_NAME_BYTES: usize = 128;
 const MAX_FUNCTION_NAME_BYTES: usize = 256;
+const MAX_OBJECT_LABEL_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrintMode {
@@ -359,6 +360,13 @@ impl ValuePrinter {
     pub fn unsupported(&mut self, native_type: Option<u32>) -> Result<(), PrintError> {
         let native_type = native_type.map(|native_type| format!("RT{native_type}"));
         self.opaque_value(OpaqueKind::Object, native_type.as_deref())
+    }
+
+    pub fn object(&mut self, label: Option<&str>) -> Result<(), PrintError> {
+        self.opaque_value(
+            OpaqueKind::Object,
+            label.filter(|label| valid_label(label, MAX_OBJECT_LABEL_BYTES)),
+        )
     }
 
     pub fn void(&mut self) -> Result<(), PrintError> {
@@ -762,13 +770,15 @@ mod tests {
         printer.file().unwrap();
         printer.function(Some("TWICE")).unwrap();
         printer.function(Some("#<SUBR @123>")).unwrap();
+        printer.object(Some("Cycle")).unwrap();
+        printer.object(Some("bad label")).unwrap();
         printer.end_list().unwrap();
         printer.finish().unwrap();
         terminal.finish();
 
         assert_eq!(
             collect(stream).await,
-            "(#<Entity 5A2> #<SelectionSet 7> #<File> #<Function TWICE> #<Function>)\n"
+            "(#<Entity 5A2> #<SelectionSet 7> #<File> #<Function TWICE> #<Function> #<Object Cycle> #<Object>)\n"
         );
     }
 

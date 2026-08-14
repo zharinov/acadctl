@@ -6,6 +6,7 @@ use output::{OutputSink, OutputStream};
 pub mod output;
 pub mod value;
 pub mod value_bridge;
+pub(crate) mod visitor;
 
 #[allow(
     dead_code,
@@ -26,6 +27,8 @@ pub struct Execution {
     next_form_index: usize,
     phase: Phase,
     form_attempted: bool,
+    value_retained: bool,
+    eval_location: Option<SourceLocation>,
     cancel_requested: bool,
     rollback: Option<RollbackCause>,
     outcome: Option<Outcome>,
@@ -40,15 +43,23 @@ pub(crate) struct ExecutionIo {
 #[derive(Default)]
 struct ValueBridgeState {
     generation: u64,
-    form_open: bool,
-    active_writers: usize,
+    open_kind: Option<ValueOutputKind>,
+    writer_active: bool,
+    writer_claimed: bool,
     failure: Option<ValueBridgeFailure>,
 }
 
-pub(crate) struct FormOutputLease {
+pub(crate) struct ValueOutputLease {
     io: Arc<ExecutionIo>,
     generation: u64,
+    kind: ValueOutputKind,
     released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValueOutputKind {
+    Form,
+    EvalValue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +67,9 @@ pub(crate) enum ValueBridgeFailure {
     InvalidSequence,
     LimitExceeded,
     OutputFinished,
+    PostCommitCancelled,
     Abandoned,
+    MissingValue,
 }
 
 #[allow(
@@ -107,6 +120,7 @@ pub struct SourceLocation {
 pub enum DrawingOutcome {
     NotStarted,
     RolledBack,
+    Committed,
     Unknown,
 }
 
@@ -116,6 +130,8 @@ pub enum StepKind {
     Begin,
     Form,
     Commit,
+    EmitValue,
+    ClearValue,
     Abort,
     Rollback,
     Done,
@@ -125,6 +141,7 @@ pub struct NativeExecutionStep {
     kind: StepKind,
     source: Option<Arc<String>>,
     span: Option<FormSpan>,
+    retain_value: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +156,7 @@ pub struct StepResult {
     pub native_status: i32,
     pub lisp_errno: i32,
     pub detail: String,
+    pub cleanup_status: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +174,10 @@ enum Phase {
         column: usize,
     },
     AwaitingCommit,
+    EmitValue,
+    AwaitingEmitValue,
+    ClearValue,
+    AwaitingClearValue,
     Abort,
     AwaitingAbort,
     Rollback,
@@ -174,78 +196,93 @@ impl ExecutionIo {
         self.output.clone()
     }
 
-    fn begin_form_output(&self) {
+    fn begin_value_output(&self, kind: ValueOutputKind) {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.form_open || state.active_writers != 0 {
+        if state.open_kind.is_some() || state.writer_active {
             state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
         }
         state.generation = state.generation.wrapping_add(1).max(1);
-        state.form_open = true;
-        state.active_writers = 0;
+        state.open_kind = Some(kind);
+        state.writer_active = false;
+        state.writer_claimed = false;
     }
 
-    fn acquire_form_output(self: &Arc<Self>) -> Option<FormOutputLease> {
+    fn acquire_value_output(self: &Arc<Self>, kind: ValueOutputKind) -> Option<ValueOutputLease> {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.form_open || state.failure.is_some() || state.active_writers != 0 {
+        if state.open_kind != Some(kind)
+            || state.failure.is_some()
+            || state.writer_active
+            || (kind == ValueOutputKind::EvalValue && state.writer_claimed)
+        {
             return None;
         }
-        let Some(active_writers) = state.active_writers.checked_add(1) else {
-            state
-                .failure
-                .get_or_insert(ValueBridgeFailure::LimitExceeded);
-            return None;
-        };
-        state.active_writers = active_writers;
-        Some(FormOutputLease {
+        state.writer_active = true;
+        state.writer_claimed = true;
+        Some(ValueOutputLease {
             io: Arc::clone(self),
             generation: state.generation,
+            kind,
             released: false,
         })
     }
 
-    fn close_form_output(&self) -> Option<ValueBridgeFailure> {
+    fn close_value_output(&self, kind: ValueOutputKind) -> Option<ValueBridgeFailure> {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.form_open = false;
-        if state.active_writers != 0 {
+        if state.open_kind != Some(kind) {
+            state
+                .failure
+                .get_or_insert(ValueBridgeFailure::InvalidSequence);
+        }
+        state.open_kind = None;
+        if state.writer_active {
             state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
+        }
+        state.writer_active = false;
+        if kind == ValueOutputKind::EvalValue && !state.writer_claimed {
+            state
+                .failure
+                .get_or_insert(ValueBridgeFailure::MissingValue);
         }
         state.failure.take()
     }
 
-    fn form_output_is_open(&self, generation: u64) -> bool {
+    fn value_output_is_open(&self, generation: u64, kind: ValueOutputKind) -> bool {
         let state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.form_open
+        state.open_kind == Some(kind)
             && state.generation == generation
-            && state.active_writers == 1
+            && state.writer_active
             && state.failure.is_none()
     }
 
-    fn release_form_output(&self, generation: u64, failure: Option<ValueBridgeFailure>) {
+    fn release_value_output(
+        &self,
+        generation: u64,
+        kind: ValueOutputKind,
+        failure: Option<ValueBridgeFailure>,
+    ) {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.generation != generation {
+        if state.generation != generation || state.open_kind != Some(kind) {
             return;
         }
-        if state.form_open
-            && let Some(failure) = failure
-        {
+        if let Some(failure) = failure {
             state.failure.get_or_insert(failure);
         }
-        state.active_writers = state.active_writers.saturating_sub(1);
+        state.writer_active = false;
     }
 
     #[cfg(test)]
@@ -258,26 +295,30 @@ impl ExecutionIo {
     }
 }
 
-impl FormOutputLease {
+impl ValueOutputLease {
     pub(crate) fn output_sink(&self) -> OutputSink {
         self.io.output_sink()
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.io.form_output_is_open(self.generation)
+        self.io.value_output_is_open(self.generation, self.kind)
     }
 
     pub(crate) fn release(mut self, failure: Option<ValueBridgeFailure>) {
-        self.io.release_form_output(self.generation, failure);
+        self.io
+            .release_value_output(self.generation, self.kind, failure);
         self.released = true;
     }
 }
 
-impl Drop for FormOutputLease {
+impl Drop for ValueOutputLease {
     fn drop(&mut self) {
         if !self.released {
-            self.io
-                .release_form_output(self.generation, Some(ValueBridgeFailure::Abandoned));
+            self.io.release_value_output(
+                self.generation,
+                self.kind,
+                Some(ValueBridgeFailure::Abandoned),
+            );
         }
     }
 }
@@ -288,7 +329,9 @@ impl ValueBridgeFailure {
             Self::InvalidSequence => "the AutoLISP output bridge emitted an invalid value sequence",
             Self::LimitExceeded => "the AutoLISP output bridge exceeded its structural limit",
             Self::OutputFinished => "execution output ended while AutoLISP was still producing it",
+            Self::PostCommitCancelled => "eval result output was cancelled after commit",
             Self::Abandoned => "the AutoLISP output bridge abandoned an unfinished value",
+            Self::MissingValue => "the AutoLISP evaluator did not emit its result value",
         }
     }
 }
@@ -336,6 +379,8 @@ impl Execution {
                 next_form_index: 1,
                 phase: if empty { Phase::Terminal } else { Phase::Begin },
                 form_attempted: false,
+                value_retained: false,
+                eval_location: None,
                 cancel_requested: false,
                 rollback: None,
                 outcome: empty.then_some(Outcome::Success),
@@ -365,9 +410,15 @@ impl Execution {
         self.io.output.clone()
     }
 
-    pub(crate) fn acquire_form_output(&self) -> Option<FormOutputLease> {
+    pub(crate) fn acquire_form_output(&self) -> Option<ValueOutputLease> {
         matches!(self.phase, Phase::AwaitingForm { .. })
-            .then(|| self.io.acquire_form_output())
+            .then(|| self.io.acquire_value_output(ValueOutputKind::Form))
+            .flatten()
+    }
+
+    pub(crate) fn acquire_eval_value_output(&self) -> Option<ValueOutputLease> {
+        matches!(self.phase, Phase::AwaitingEmitValue)
+            .then(|| self.io.acquire_value_output(ValueOutputKind::EvalValue))
             .flatten()
     }
 
@@ -378,6 +429,10 @@ impl Execution {
         if matches!(
             self.phase,
             Phase::AwaitingCommit
+                | Phase::EmitValue
+                | Phase::AwaitingEmitValue
+                | Phase::ClearValue
+                | Phase::AwaitingClearValue
                 | Phase::Abort
                 | Phase::AwaitingAbort
                 | Phase::Rollback
@@ -419,12 +474,12 @@ impl Execution {
                 }
                 Phase::BetweenForms => {
                     if self.cancel_requested {
-                        self.rollback = Some(RollbackCause::Cancelled);
-                        self.phase = if self.form_attempted {
-                            Phase::Rollback
+                        if self.form_attempted {
+                            self.queue_rollback(RollbackCause::Cancelled);
                         } else {
-                            Phase::Abort
-                        };
+                            self.rollback = Some(RollbackCause::Cancelled);
+                            self.phase = Phase::Abort;
+                        }
                         continue;
                     }
                     let mut scanner = acadctl_lisp::Scanner::resume(&self.source, self.next_scan);
@@ -438,12 +493,23 @@ impl Execution {
                                 line: span.line,
                                 column: span.column,
                             };
-                            self.io.begin_form_output();
+                            if self.mode == ExecutionMode::Eval {
+                                self.eval_location = Some(SourceLocation {
+                                    source_name: self.source_name.clone(),
+                                    line: span.line,
+                                    column: span.column,
+                                });
+                            }
+                            self.io.begin_value_output(ValueOutputKind::Form);
                             self.form_attempted = true;
-                            return NativeExecutionStep::form(Arc::clone(&self.source), span);
+                            return NativeExecutionStep::form(
+                                Arc::clone(&self.source),
+                                span,
+                                self.mode == ExecutionMode::Eval,
+                            );
                         }
                         Some(Err(error)) => {
-                            self.rollback = Some(RollbackCause::Failure(Failure {
+                            self.queue_rollback(RollbackCause::Failure(Failure {
                                 message: error.kind.message().to_owned(),
                                 form_index: None,
                                 location: Some(SourceLocation {
@@ -453,13 +519,21 @@ impl Execution {
                                 }),
                                 drawing_outcome: DrawingOutcome::Unknown,
                             }));
-                            self.phase = Phase::Rollback;
                         }
                         None => {
                             self.phase = Phase::AwaitingCommit;
                             return NativeExecutionStep::new(StepKind::Commit);
                         }
                     }
+                }
+                Phase::EmitValue => {
+                    self.io.begin_value_output(ValueOutputKind::EvalValue);
+                    self.phase = Phase::AwaitingEmitValue;
+                    return NativeExecutionStep::new(StepKind::EmitValue);
+                }
+                Phase::ClearValue => {
+                    self.phase = Phase::AwaitingClearValue;
+                    return NativeExecutionStep::new(StepKind::ClearValue);
                 }
                 Phase::Abort => {
                     self.phase = Phase::AwaitingAbort;
@@ -476,6 +550,8 @@ impl Execution {
                 Phase::AwaitingBegin
                 | Phase::AwaitingForm { .. }
                 | Phase::AwaitingCommit
+                | Phase::AwaitingEmitValue
+                | Phase::AwaitingClearValue
                 | Phase::AwaitingAbort
                 | Phase::AwaitingRollback
                 | Phase::Done => return NativeExecutionStep::new(StepKind::Invalid),
@@ -486,7 +562,7 @@ impl Execution {
     pub fn complete_step(&mut self, result: StepResult) -> bool {
         match self.phase {
             Phase::AwaitingBegin => {
-                if result.kind == StepResultKind::Success {
+                if result.succeeded() {
                     if self.cancel_requested {
                         self.rollback = Some(RollbackCause::Cancelled);
                         self.phase = Phase::Abort;
@@ -508,9 +584,12 @@ impl Execution {
                 line,
                 column,
             } => {
-                let bridge_failure = self.io.close_form_output();
-                if result.kind != StepResultKind::Success {
-                    self.rollback = Some(RollbackCause::Failure(Failure {
+                let bridge_failure = self.io.close_value_output(ValueOutputKind::Form);
+                if self.mode == ExecutionMode::Eval && result.succeeded() {
+                    self.value_retained = true;
+                }
+                if result.primary_failed() {
+                    self.queue_rollback(RollbackCause::Failure(Failure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
                         location: Some(SourceLocation {
@@ -520,10 +599,13 @@ impl Execution {
                         }),
                         drawing_outcome: DrawingOutcome::Unknown,
                     }));
-                    self.phase = Phase::Rollback;
                 } else if let Some(failure) = bridge_failure {
-                    self.rollback = Some(RollbackCause::Failure(Failure {
-                        message: failure.message().to_owned(),
+                    let mut message = failure.message().to_owned();
+                    if let Some(cleanup) = result.cleanup_message() {
+                        message = format!("{message}; {cleanup}");
+                    }
+                    self.queue_rollback(RollbackCause::Failure(Failure {
+                        message,
                         form_index: Some(index),
                         location: Some(SourceLocation {
                             source_name: self.source_name.clone(),
@@ -532,35 +614,88 @@ impl Execution {
                         }),
                         drawing_outcome: DrawingOutcome::Unknown,
                     }));
-                    self.phase = Phase::Rollback;
+                } else if !result.succeeded() {
+                    self.queue_rollback(RollbackCause::Failure(Failure {
+                        message: result.into_message("form evaluation failed"),
+                        form_index: Some(index),
+                        location: Some(SourceLocation {
+                            source_name: self.source_name.clone(),
+                            line,
+                            column,
+                        }),
+                        drawing_outcome: DrawingOutcome::Unknown,
+                    }));
                 } else {
                     if self.cancel_requested {
-                        self.rollback = Some(RollbackCause::Cancelled);
-                        self.phase = Phase::Rollback;
+                        self.queue_rollback(RollbackCause::Cancelled);
                     } else {
                         self.phase = Phase::BetweenForms;
                     }
                 }
             }
             Phase::AwaitingCommit => {
-                if result.kind == StepResultKind::Success {
-                    self.outcome = Some(Outcome::Success);
-                    self.phase = Phase::Terminal;
+                if result.succeeded() {
+                    if self.mode == ExecutionMode::Eval && self.value_retained {
+                        self.phase = Phase::EmitValue;
+                    } else if self.mode == ExecutionMode::Eval {
+                        self.outcome = Some(Outcome::Failure(self.eval_failure(
+                            "the AutoLISP evaluator did not retain its result value".to_owned(),
+                            DrawingOutcome::Committed,
+                        )));
+                        self.phase = Phase::Terminal;
+                    } else {
+                        self.outcome = Some(Outcome::Success);
+                        self.phase = Phase::Terminal;
+                    }
                 } else {
-                    self.rollback = Some(RollbackCause::Failure(Failure {
+                    self.queue_rollback(RollbackCause::Failure(Failure {
                         message: result.into_message("could not finish the undo group"),
                         form_index: None,
                         location: None,
                         drawing_outcome: DrawingOutcome::Unknown,
                     }));
-                    self.phase = Phase::Rollback;
                 }
+            }
+            Phase::AwaitingEmitValue => {
+                let bridge_failure = self.io.close_value_output(ValueOutputKind::EvalValue);
+                let failure = if result.primary_failed() {
+                    Some(result.into_message("could not emit the eval result"))
+                } else if let Some(bridge_failure) = bridge_failure {
+                    let mut message = bridge_failure.message().to_owned();
+                    if let Some(cleanup) = result.cleanup_message() {
+                        message = format!("{message}; {cleanup}");
+                    }
+                    Some(message)
+                } else if !result.succeeded() {
+                    Some(result.into_message("could not emit the eval result"))
+                } else {
+                    None
+                };
+                if let Some(message) = failure {
+                    self.outcome = Some(Outcome::Failure(
+                        self.eval_failure(message, DrawingOutcome::Committed),
+                    ));
+                } else {
+                    self.value_retained = false;
+                    self.outcome = Some(Outcome::Success);
+                }
+                self.phase = Phase::Terminal;
+            }
+            Phase::AwaitingClearValue => {
+                if result.succeeded() {
+                    self.value_retained = false;
+                } else {
+                    let cleanup = result
+                        .into_message("could not clear the retained AutoLISP evaluator value");
+                    self.record_value_cleanup_failure(cleanup);
+                }
+                self.phase = Phase::Rollback;
             }
             Phase::AwaitingAbort => {
                 let Some(RollbackCause::Cancelled) = self.rollback.take() else {
                     return false;
                 };
-                if result.kind == StepResultKind::Success {
+                if result.succeeded() {
                     self.outcome = Some(Outcome::Cancelled);
                 } else {
                     self.outcome = Some(Outcome::Failure(Failure {
@@ -578,7 +713,7 @@ impl Execution {
                 };
                 self.outcome = Some(match cause {
                     RollbackCause::Failure(mut failure) => {
-                        if result.kind == StepResultKind::Success {
+                        if result.succeeded() {
                             failure.drawing_outcome = DrawingOutcome::RolledBack;
                         } else {
                             let rollback = result.into_message("drawing rollback failed");
@@ -588,7 +723,7 @@ impl Execution {
                         Outcome::Failure(failure)
                     }
                     RollbackCause::Cancelled => {
-                        if result.kind == StepResultKind::Success {
+                        if result.succeeded() {
                             Outcome::Cancelled
                         } else {
                             Outcome::Failure(Failure {
@@ -604,12 +739,45 @@ impl Execution {
             }
             Phase::Begin
             | Phase::BetweenForms
+            | Phase::EmitValue
+            | Phase::ClearValue
             | Phase::Abort
             | Phase::Rollback
             | Phase::Terminal
             | Phase::Done => return false,
         }
         true
+    }
+
+    fn queue_rollback(&mut self, cause: RollbackCause) {
+        self.rollback = Some(cause);
+        self.phase = if self.mode == ExecutionMode::Eval && self.form_attempted {
+            Phase::ClearValue
+        } else {
+            Phase::Rollback
+        };
+    }
+
+    fn record_value_cleanup_failure(&mut self, cleanup: String) {
+        let cause = match self.rollback.take() {
+            Some(RollbackCause::Failure(mut failure)) => {
+                failure.message = format!("{}; {cleanup}", failure.message);
+                RollbackCause::Failure(failure)
+            }
+            Some(RollbackCause::Cancelled) | None => {
+                RollbackCause::Failure(self.eval_failure(cleanup, DrawingOutcome::Unknown))
+            }
+        };
+        self.rollback = Some(cause);
+    }
+
+    fn eval_failure(&self, message: String, drawing_outcome: DrawingOutcome) -> Failure {
+        Failure {
+            message,
+            form_index: Some(1),
+            location: self.eval_location.clone(),
+            drawing_outcome,
+        }
     }
 
     pub fn record_terminal_failure(&mut self, result: StepResult) -> bool {
@@ -644,7 +812,9 @@ impl Execution {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
         if matches!(phase, Phase::AwaitingForm { .. }) {
-            let _ = self.io.close_form_output();
+            let _ = self.io.close_value_output(ValueOutputKind::Form);
+        } else if phase == Phase::AwaitingEmitValue {
+            let _ = self.io.close_value_output(ValueOutputKind::EvalValue);
         }
         let existing = self.outcome.take().or_else(|| {
             self.rollback.take().map(|cause| match cause {
@@ -684,6 +854,7 @@ impl Execution {
                             column,
                         }),
                     ),
+                    Phase::AwaitingEmitValue => (Some(1), self.eval_location.clone()),
                     _ => (None, None),
                 };
                 Failure {
@@ -714,14 +885,16 @@ impl NativeExecutionStep {
             kind,
             source: None,
             span: None,
+            retain_value: false,
         }
     }
 
-    fn form(source: Arc<String>, span: FormSpan) -> Self {
+    fn form(source: Arc<String>, span: FormSpan, retain_value: bool) -> Self {
         Self {
             kind: StepKind::Form,
             source: Some(source),
             span: Some(span),
+            retain_value,
         }
     }
 
@@ -735,24 +908,55 @@ impl NativeExecutionStep {
             _ => "",
         }
     }
+
+    pub const fn retain_value(&self) -> bool {
+        self.retain_value
+    }
 }
 
 impl StepResult {
+    fn succeeded(&self) -> bool {
+        self.kind == StepResultKind::Success && self.cleanup_status == 0
+    }
+
+    fn primary_failed(&self) -> bool {
+        self.kind != StepResultKind::Success
+    }
+
+    fn cleanup_message(&self) -> Option<String> {
+        (self.cleanup_status != 0).then(|| {
+            format!(
+                "could not clear the reserved AutoLISP execution state (native status {})",
+                self.cleanup_status
+            )
+        })
+    }
+
     fn into_message(self, fallback: &str) -> String {
-        if !self.detail.is_empty() {
-            self.detail
+        let cleanup = self.cleanup_message();
+        let primary = if self.kind == StepResultKind::Success {
+            None
+        } else if !self.detail.is_empty() {
+            Some(self.detail)
         } else if self.kind == StepResultKind::LispError && self.lisp_errno != 0 {
-            format!("{fallback} (ERRNO {})", self.lisp_errno)
+            Some(format!("{fallback} (ERRNO {})", self.lisp_errno))
         } else if self.native_status != 0 {
-            format!("{fallback} (native status {})", self.native_status)
+            Some(format!("{fallback} (native status {})", self.native_status))
         } else {
-            fallback.to_owned()
+            Some(fallback.to_owned())
+        };
+        match (primary, cleanup) {
+            (Some(primary), Some(cleanup)) => format!("{primary}; {cleanup}"),
+            (Some(primary), None) => primary,
+            (None, Some(cleanup)) => cleanup,
+            (None, None) => fallback.to_owned(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::value_bridge::{NativeValueWriter, ValueEvent, WriteResult};
     use super::*;
 
     #[test]
@@ -855,6 +1059,183 @@ mod tests {
     }
 
     #[test]
+    fn eval_retains_its_form_value_and_emits_it_only_after_commit() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "(+ 1 2)".into()).unwrap();
+        begin(&mut execution);
+
+        let form = execution.take_step();
+        assert_eq!(form.kind(), StepKind::Form);
+        assert!(form.retain_value());
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert!(!execution.request_cancel());
+        assert!(execution.complete_step(success()));
+
+        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        let lease = execution
+            .acquire_eval_value_output()
+            .expect("the post-commit value epoch is open");
+        let mut writer = NativeValueWriter::eval_value(lease);
+        assert_eq!(writer.write(ValueEvent::Integer(3)), WriteResult::Continue);
+        assert_eq!(writer.finish(), WriteResult::Continue);
+        assert!(execution.complete_step(success()));
+
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.outcome(), Some(&Outcome::Success));
+    }
+
+    #[test]
+    fn exec_forms_never_request_value_retention() {
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "(+ 1 2)".into())
+                .unwrap()
+                .0;
+        begin(&mut execution);
+
+        let form = execution.take_step();
+        assert_eq!(form.kind(), StepKind::Form);
+        assert!(!form.retain_value());
+    }
+
+    #[test]
+    fn a_missing_post_commit_writer_is_a_committed_failure() {
+        let mut execution = eval_through_commit();
+        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+
+        assert_eq!(
+            execution.outcome(),
+            Some(&Outcome::Failure(Failure {
+                message: "the AutoLISP evaluator did not emit its result value".into(),
+                form_index: Some(1),
+                location: Some(SourceLocation {
+                    source_name: "inspect.lsp".into(),
+                    line: 1,
+                    column: 1,
+                }),
+                drawing_outcome: DrawingOutcome::Committed,
+            }))
+        );
+    }
+
+    #[test]
+    fn a_post_commit_native_failure_never_requests_rollback() {
+        let mut execution = eval_through_commit();
+        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert!(execution.complete_step(native_error("value visitor failed", -5001)));
+
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected committed serialization failure");
+        };
+        assert_eq!(failure.message, "value visitor failed");
+        assert_eq!(failure.form_index, Some(1));
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
+    }
+
+    #[test]
+    fn post_commit_failure_keeps_visitor_and_cleanup_evidence() {
+        let mut execution = eval_through_commit();
+        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert!(
+            execution.complete_step(with_cleanup(lisp_error("value visitor failed", 7), -5001,))
+        );
+
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected committed serialization failure");
+        };
+        assert_eq!(
+            failure.message,
+            "value visitor failed; could not clear the reserved AutoLISP execution state (native status -5001)"
+        );
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
+    }
+
+    #[test]
+    fn post_commit_bridge_failure_keeps_cleanup_evidence() {
+        let mut execution = eval_through_commit();
+        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert!(execution.complete_step(with_cleanup(success(), -5001)));
+
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected committed serialization failure");
+        };
+        assert_eq!(
+            failure.message,
+            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP execution state (native status -5001)"
+        );
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
+    }
+
+    #[test]
+    fn eval_cancellation_clears_the_retained_value_before_rollback() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(success()));
+
+        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+    }
+
+    #[test]
+    fn eval_value_cleanup_failure_is_preserved_when_rollback_succeeds() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(success()));
+
+        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert!(execution.complete_step(native_error("value cleanup failed", -5001)));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected cleanup failure");
+        };
+        assert_eq!(failure.message, "value cleanup failed");
+        assert_eq!(failure.form_index, Some(1));
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
+    }
+
+    #[test]
+    fn form_failure_keeps_lisp_and_cleanup_evidence() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.complete_step(with_cleanup(lisp_error("bad argument type", 7), -5001,)));
+
+        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected evaluation failure");
+        };
+        assert_eq!(
+            failure.message,
+            "bad argument type; could not clear the reserved AutoLISP execution state (native status -5001)"
+        );
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
+    }
+
+    #[test]
     fn rolls_back_a_lisp_failure_at_its_form_location() {
         let mut execution =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok\n  bad".into())
@@ -926,6 +1307,29 @@ mod tests {
                 drawing_outcome: DrawingOutcome::RolledBack,
             }))
         );
+    }
+
+    #[test]
+    fn eval_commit_failure_clears_its_value_before_rollback() {
+        let mut execution = Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "ok".into())
+            .unwrap()
+            .0;
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert!(execution.complete_step(native_error("End failed", -5001)));
+
+        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected commit failure");
+        };
+        assert_eq!(failure.message, "End failed");
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
 
     #[test]
@@ -1115,6 +1519,30 @@ mod tests {
     }
 
     #[test]
+    fn output_bridge_failure_keeps_cleanup_evidence() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        begin(&mut execution);
+
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        execution
+            .io
+            .record_bridge_failure(ValueBridgeFailure::InvalidSequence);
+        assert!(execution.complete_step(with_cleanup(success(), -5001)));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected bridge failure");
+        };
+        assert_eq!(
+            failure.message,
+            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP execution state (native status -5001)"
+        );
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
+    }
+
+    #[test]
     fn output_bridge_failure_wins_over_concurrent_cancellation() {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
@@ -1208,12 +1636,26 @@ mod tests {
         execution
     }
 
+    fn eval_through_commit() -> Execution {
+        let mut execution =
+            Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "(+ 1 2)".into())
+                .unwrap()
+                .0;
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert!(execution.complete_step(success()));
+        execution
+    }
+
     fn success() -> StepResult {
         StepResult {
             kind: StepResultKind::Success,
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
+            cleanup_status: 0,
         }
     }
 
@@ -1223,6 +1665,7 @@ mod tests {
             native_status: 0,
             lisp_errno,
             detail: detail.into(),
+            cleanup_status: 0,
         }
     }
 
@@ -1232,6 +1675,12 @@ mod tests {
             native_status,
             lisp_errno: 0,
             detail: detail.into(),
+            cleanup_status: 0,
         }
+    }
+
+    fn with_cleanup(mut result: StepResult, cleanup_status: i32) -> StepResult {
+        result.cleanup_status = cleanup_status;
+        result
     }
 }
