@@ -11,6 +11,7 @@
 #include "dbmain.h"
 #include "rxregsvc.h"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -25,10 +26,108 @@ extern "C" int acadctl_wake_native_actions();
 
 namespace {
 
+std::atomic<std::uint32_t> applicationContextCallbacksOutstanding{0};
+std::atomic<bool> acceptNativeActionWakes{true};
+
+class ApplicationContextCallbackLease final {
+public:
+  ~ApplicationContextCallbackLease() {
+    applicationContextCallbacksOutstanding.fetch_sub(
+        1, std::memory_order_seq_cst);
+  }
+};
+
+constexpr std::uint32_t
+databaseActivityBit(acadctl::NativeDatabaseActivityKind kind) {
+  return 1U << static_cast<std::uint8_t>(kind);
+}
+
+class DatabaseReactor final : public AcDbDatabaseReactor {
+public:
+  void objectAppended(const AcDbDatabase *, const AcDbObject *) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::ObjectAppended));
+  }
+
+  void objectUnAppended(const AcDbDatabase *, const AcDbObject *) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::ObjectUnappended));
+  }
+
+  void objectReAppended(const AcDbDatabase *, const AcDbObject *) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::ObjectReappended));
+  }
+
+  void objectOpenedForModify(const AcDbDatabase *,
+                             const AcDbObject *) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::ObjectOpenedForModify));
+  }
+
+  void objectModified(const AcDbDatabase *, const AcDbObject *) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::ObjectModified));
+  }
+
+  void objectErased(const AcDbDatabase *, const AcDbObject *,
+                    bool erased) override {
+    record(databaseActivityBit(
+        erased ? acadctl::NativeDatabaseActivityKind::ObjectErased
+               : acadctl::NativeDatabaseActivityKind::ObjectUnerased));
+  }
+
+  void headerSysVarWillChange(const AcDbDatabase *, const ACHAR *) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::HeaderVariableWillChange));
+  }
+
+  void headerSysVarChanged(const AcDbDatabase *, const ACHAR *,
+                           bool success) override {
+    record(databaseActivityBit(
+        success ? acadctl::NativeDatabaseActivityKind::HeaderVariableChanged
+                : acadctl::NativeDatabaseActivityKind::HeaderVariableChangeFailed));
+  }
+
+  void proxyResurrectionCompleted(const AcDbDatabase *, const ACHAR *,
+                                  AcDbObjectIdArray &) override {
+    record(databaseActivityBit(
+        acadctl::NativeDatabaseActivityKind::ProxyResurrectionCompleted));
+  }
+
+  void goodbye(const AcDbDatabase *) override {
+    activity_.fetch_or(
+        databaseActivityBit(
+            acadctl::NativeDatabaseActivityKind::DatabaseGoodbye),
+        std::memory_order_release);
+    databaseGone_.store(true, std::memory_order_release);
+  }
+
+  std::uint32_t takeActivity() {
+    return activity_.exchange(0, std::memory_order_relaxed);
+  }
+
+  bool databaseGone() const {
+    return databaseGone_.load(std::memory_order_acquire);
+  }
+
+private:
+  void record(std::uint32_t activity) {
+    activity_.fetch_or(activity, std::memory_order_relaxed);
+  }
+
+  std::atomic<std::uint32_t> activity_{0};
+  std::atomic<bool> databaseGone_{false};
+};
+
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
+
 struct DocumentSubscription {
   AcApDocument *document;
   AcDbDatabase *database;
+  AcDbDatabase *retiredDatabase;
   bool lispFunctionsDefined;
+  DatabaseReactor *databaseReactor;
 };
 
 class ObjectArxBridge {
@@ -37,7 +136,7 @@ public:
 
   void start();
 
-  void stop();
+  bool stop();
 
   void processNextAction();
 
@@ -64,39 +163,43 @@ private:
 
   void refreshDocumentSnapshotIfStale();
 
+  void recordSparseHistoryEvent(
+      acadctl::NativeHistoryEventKind kind,
+      AcApDocument *eventDocument = nullptr,
+      AcDbDatabase *eventDatabase = nullptr,
+      std::int32_t argument0 = 0,
+      std::int32_t argument1 = 0);
+
+  void forwardHistoryEvent(acadctl::NativeHistoryEventKind kind,
+                           AcApDocument *eventDocument,
+                           AcDbDatabase *eventDatabase,
+                           std::int32_t argument0,
+                           std::int32_t argument1,
+                           std::uint32_t databaseActivity);
+
+  acadctl::NativeHistoryEvent makeHistoryEvent(
+      acadctl::NativeHistoryEventKind kind,
+      AcApDocument *eventDocument,
+      AcDbDatabase *eventDatabase,
+      std::int32_t argument0,
+      std::int32_t argument1,
+      std::uint32_t databaseActivity);
+
+  void drainDatabaseActivity();
+
+  void drainDatabaseActivity(DocumentSubscription &subscription);
+
+  void eraseDatabaseReactor(DatabaseReactor *reactor);
+
+  void detachDatabaseReactor(DocumentSubscription &subscription);
+
   void refreshSubscription(DocumentSubscription &subscription);
+
+  void databaseWillBeDestroyed(AcDbDatabase *database);
 
   void subscribe(AcApDocument *document);
 
   void unsubscribe(AcApDocument *document);
-
-  class DatabaseReactor final : public AcDbDatabaseReactor {
-  public:
-    void objectAppended(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_document_snapshot_stale();
-    }
-
-    void objectUnAppended(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_document_snapshot_stale();
-    }
-
-    void objectReAppended(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_document_snapshot_stale();
-    }
-
-    void objectModified(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_document_snapshot_stale();
-    }
-
-    void objectErased(const AcDbDatabase *, const AcDbObject *, bool) override {
-      acadctl::mark_document_snapshot_stale();
-    }
-
-    void headerSysVarChanged(const AcDbDatabase *, const ACHAR *,
-                             bool) override {
-      acadctl::mark_document_snapshot_stale();
-    }
-  };
 
   class DocumentReactor final : public AcApDocManagerReactor {
   public:
@@ -104,11 +207,15 @@ private:
 
     void documentCreated(AcApDocument *document) override {
       bridge_.subscribe(document);
+      bridge_.recordSparseHistoryEvent(
+          acadctl::NativeHistoryEventKind::DocumentCreated, document);
       bridge_.refreshDocumentSnapshot();
       acadctl::native_state_may_be_ready();
     }
 
     void documentToBeDestroyed(AcApDocument *document) override {
+      bridge_.recordSparseHistoryEvent(
+          acadctl::NativeHistoryEventKind::DocumentWillBeDestroyed, document);
       bridge_.unsubscribe(document);
       bridge_.refreshDocumentSnapshot();
       acadctl::native_state_may_be_ready();
@@ -118,7 +225,17 @@ private:
       bridge_.refreshDocumentSnapshot();
     }
 
-    void documentActivated(AcApDocument *) override {
+    void documentBecameCurrent(AcApDocument *document) override {
+      bridge_.recordSparseHistoryEvent(
+          acadctl::NativeHistoryEventKind::DocumentBecameCurrent, document);
+      bridge_.refreshDocumentSnapshot();
+      acadctl::native_state_may_be_ready();
+    }
+
+    void documentActivated(AcApDocument *document) override {
+      bridge_.recordSparseHistoryEvent(
+          acadctl::NativeHistoryEventKind::DocumentActivated,
+          document);
       bridge_.refreshDocumentSnapshot();
       acadctl::native_state_may_be_ready();
     }
@@ -131,29 +248,92 @@ private:
   public:
     explicit EditorReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
 
+    void commandWillStart(const ACHAR *) override {
+      record(acadctl::NativeHistoryEventKind::CommandWillStart);
+    }
+
     void commandEnded(const ACHAR *) override {
+      record(acadctl::NativeHistoryEventKind::CommandEnded);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void commandCancelled(const ACHAR *) override {
+      record(acadctl::NativeHistoryEventKind::CommandCancelled);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void commandFailed(const ACHAR *) override {
+      record(acadctl::NativeHistoryEventKind::CommandFailed);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
+    void lispWillStart(const ACHAR *) override {
+      record(acadctl::NativeHistoryEventKind::LispWillStart);
+    }
+
     void lispEnded() override {
+      record(acadctl::NativeHistoryEventKind::LispEnded);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void lispCancelled() override {
+      record(acadctl::NativeHistoryEventKind::LispCancelled);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
+    }
+
+    void sysVarWillChange(const ACHAR *) override {
+      record(acadctl::NativeHistoryEventKind::SystemVariableWillChange);
+    }
+
+    void sysVarChanged(const ACHAR *, bool success) override {
+      record(acadctl::NativeHistoryEventKind::SystemVariableChanged,
+             success ? 1 : 0);
+    }
+
+    void undoSubcommandAuto(int activity, bool state) override {
+      record(acadctl::NativeHistoryEventKind::UndoAuto, activity,
+             state ? 1 : 0);
+    }
+
+    void undoSubcommandControl(int activity, int option) override {
+      record(acadctl::NativeHistoryEventKind::UndoControl, activity, option);
+    }
+
+    void undoSubcommandBegin(int activity) override {
+      record(acadctl::NativeHistoryEventKind::UndoBegin, activity);
+    }
+
+    void undoSubcommandEnd(int activity) override {
+      record(acadctl::NativeHistoryEventKind::UndoEnd, activity);
+    }
+
+    void undoSubcommandMark(int activity) override {
+      record(acadctl::NativeHistoryEventKind::UndoMark, activity);
+    }
+
+    void undoSubcommandBack(int activity) override {
+      record(acadctl::NativeHistoryEventKind::UndoBack, activity);
+    }
+
+    void undoSubcommandNumber(int activity, int number) override {
+      record(acadctl::NativeHistoryEventKind::UndoNumber, activity, number);
+    }
+
+    void redoSubcommandNumber(int activity, int number) override {
+      record(acadctl::NativeHistoryEventKind::RedoNumber, activity, number);
+    }
+
+    void undoWriteBoundary(int boundaryType) override {
+      record(acadctl::NativeHistoryEventKind::UndoWriteBoundary, boundaryType);
+    }
+
+    void subcommandsWillBeUndone(int number) override {
+      record(acadctl::NativeHistoryEventKind::SubcommandsWillBeUndone, number);
     }
 
     void saveComplete(AcDbDatabase *, const ACHAR *) override {
@@ -170,14 +350,27 @@ private:
       bridge_.refreshDocumentSnapshot();
     }
 
+    void databaseToBeDestroyed(AcDbDatabase *database) override {
+      bridge_.databaseWillBeDestroyed(database);
+    }
+
   private:
+    void record(acadctl::NativeHistoryEventKind kind,
+                std::int32_t argument0 = 0,
+                std::int32_t argument1 = 0) {
+      bridge_.recordSparseHistoryEvent(kind, nullptr, nullptr, argument0,
+                                       argument1);
+    }
+
     ObjectArxBridge &bridge_;
   };
 
   std::vector<DocumentSubscription> subscriptions_;
-  DatabaseReactor databaseReactor_;
+  std::vector<std::unique_ptr<DatabaseReactor>> databaseReactors_;
   DocumentReactor documentReactor_;
   EditorReactor editorReactor_;
+  std::atomic<bool> documentSnapshotStale_{false};
+  bool databaseReactorOwnershipUncertain_ = false;
 };
 
 acadctl::NativeActionResult result(acadctl::NativeActionResultKind kind) {
@@ -1343,19 +1536,28 @@ void ObjectArxBridge::start() {
   refreshDocumentSnapshot();
 }
 
-void ObjectArxBridge::stop() {
-  acedEditor->removeReactor(&editorReactor_);
-  acDocManager->removeReactor(&documentReactor_);
-
-  for (const DocumentSubscription &subscription : subscriptions_) {
-    if (subscription.database) {
-      subscription.database->removeReactor(&databaseReactor_);
-    }
+bool ObjectArxBridge::stop() {
+  for (DocumentSubscription &subscription : subscriptions_) {
+    detachDatabaseReactor(subscription);
   }
   subscriptions_.clear();
+  databaseReactors_.erase(
+      std::remove_if(databaseReactors_.begin(), databaseReactors_.end(),
+                     [](const auto &uncertain) {
+                       return uncertain->databaseGone();
+                     }),
+      databaseReactors_.end());
+  if (!databaseReactors_.empty()) {
+    return false;
+  }
+
+  acedEditor->removeReactor(&editorReactor_);
+  acDocManager->removeReactor(&documentReactor_);
+  return true;
 }
 
 void ObjectArxBridge::processNextAction() {
+  drainDatabaseActivity();
   acadctl::NativeAction action = acadctl::take_native_action();
   if (action.kind == acadctl::NativeActionKind::None) {
     scheduleNextNativeAction();
@@ -1677,31 +1879,173 @@ void ObjectArxBridge::publishDocumentSnapshot() {
 }
 
 void ObjectArxBridge::refreshDocumentSnapshot() {
-  acadctl::take_document_snapshot_stale();
+  drainDatabaseActivity();
+  documentSnapshotStale_.store(false, std::memory_order_relaxed);
   publishDocumentSnapshot();
 }
 
 void ObjectArxBridge::refreshDocumentSnapshotIfStale() {
-  if (!acadctl::take_document_snapshot_stale()) {
+  drainDatabaseActivity();
+  if (!documentSnapshotStale_.exchange(false, std::memory_order_relaxed)) {
     return;
   }
 
   publishDocumentSnapshot();
 }
 
-void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
-  AcDbDatabase *database = subscription.document->database();
-  if (subscription.database == database) {
+void ObjectArxBridge::recordSparseHistoryEvent(
+    acadctl::NativeHistoryEventKind kind, AcApDocument *eventDocument,
+    AcDbDatabase *eventDatabase, std::int32_t argument0,
+    std::int32_t argument1) {
+  acadctl::NativeHistoryEvent event = makeHistoryEvent(
+      kind, eventDocument, eventDatabase, argument0, argument1, 0);
+  drainDatabaseActivity();
+  acadctl::record_native_history_event(std::move(event));
+}
+
+void ObjectArxBridge::forwardHistoryEvent(
+    acadctl::NativeHistoryEventKind kind, AcApDocument *eventDocument,
+    AcDbDatabase *eventDatabase, std::int32_t argument0,
+    std::int32_t argument1, std::uint32_t databaseActivity) {
+  acadctl::record_native_history_event(
+      makeHistoryEvent(kind, eventDocument, eventDatabase, argument0,
+                       argument1, databaseActivity));
+}
+
+acadctl::NativeHistoryEvent ObjectArxBridge::makeHistoryEvent(
+    acadctl::NativeHistoryEventKind kind, AcApDocument *eventDocument,
+    AcDbDatabase *eventDatabase, std::int32_t argument0,
+    std::int32_t argument1, std::uint32_t databaseActivity) {
+  AcApDocument *currentDocument = acDocManager->curDocument();
+  AcApDocument *activeDocument = acDocManager->mdiActiveDocument();
+  const auto token = [](const void *value) {
+    return static_cast<std::size_t>(
+        reinterpret_cast<std::uintptr_t>(value));
+  };
+  return acadctl::NativeHistoryEvent{
+      kind,
+      token(eventDocument),
+      token(eventDatabase),
+      token(currentDocument),
+      token(currentDocument ? currentDocument->database() : nullptr),
+      token(activeDocument),
+      token(activeDocument ? activeDocument->database() : nullptr),
+      argument0,
+      argument1,
+      databaseActivity,
+  };
+}
+
+void ObjectArxBridge::drainDatabaseActivity() {
+  for (DocumentSubscription &subscription : subscriptions_) {
+    drainDatabaseActivity(subscription);
+  }
+}
+
+void ObjectArxBridge::drainDatabaseActivity(
+    DocumentSubscription &subscription) {
+  if (!subscription.databaseReactor) {
+    return;
+  }
+  const std::uint32_t activity = subscription.databaseReactor->takeActivity();
+  if (activity == 0) {
+    return;
+  }
+  documentSnapshotStale_.store(true, std::memory_order_relaxed);
+  forwardHistoryEvent(acadctl::NativeHistoryEventKind::DatabaseActivity,
+                      nullptr, subscription.database, 0, 0, activity);
+}
+
+void ObjectArxBridge::eraseDatabaseReactor(DatabaseReactor *reactor) {
+  const auto owned = std::find_if(
+      databaseReactors_.begin(), databaseReactors_.end(),
+      [reactor](const auto &candidate) { return candidate.get() == reactor; });
+  if (owned != databaseReactors_.end()) {
+    databaseReactors_.erase(owned);
+  }
+}
+
+void ObjectArxBridge::detachDatabaseReactor(
+    DocumentSubscription &subscription) {
+  if (!subscription.databaseReactor) {
     return;
   }
 
-  if (subscription.database) {
-    subscription.database->removeReactor(&databaseReactor_);
+  if (subscription.databaseReactor->databaseGone()) {
+    drainDatabaseActivity(subscription);
+    DatabaseReactor *reactor = subscription.databaseReactor;
+    subscription.databaseReactor = nullptr;
+    eraseDatabaseReactor(reactor);
+    return;
   }
-  subscription.database = database;
-  subscription.lispFunctionsDefined = false;
-  if (subscription.database) {
-    subscription.database->addReactor(&databaseReactor_);
+
+  const Acad::ErrorStatus status =
+      subscription.database
+          ? subscription.database->removeReactor(
+                subscription.databaseReactor)
+          : Acad::eNullPtr;
+  drainDatabaseActivity(subscription);
+  if (status == Acad::eOk || status == Acad::eKeyNotFound) {
+    DatabaseReactor *reactor = subscription.databaseReactor;
+    subscription.databaseReactor = nullptr;
+    eraseDatabaseReactor(reactor);
+    return;
+  }
+
+  forwardHistoryEvent(
+      acadctl::NativeHistoryEventKind::DatabaseReactorDetachFailed, nullptr,
+      subscription.database, static_cast<std::int32_t>(status), 0, 0);
+  databaseReactorOwnershipUncertain_ = true;
+  subscription.databaseReactor = nullptr;
+}
+
+void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
+  if (subscription.databaseReactor &&
+      subscription.databaseReactor->databaseGone()) {
+    AcDbDatabase *retiredDatabase = subscription.database;
+    detachDatabaseReactor(subscription);
+    subscription.database = nullptr;
+    subscription.retiredDatabase = retiredDatabase;
+    subscription.lispFunctionsDefined = false;
+  }
+
+  AcDbDatabase *database = subscription.document->database();
+  if (database && database == subscription.retiredDatabase) {
+    documentSnapshotStale_.store(true, std::memory_order_relaxed);
+    return;
+  }
+  subscription.retiredDatabase = nullptr;
+  if (subscription.database != database) {
+    detachDatabaseReactor(subscription);
+    subscription.database = database;
+    subscription.lispFunctionsDefined = false;
+  }
+
+  if (subscription.databaseReactor) {
+    return;
+  }
+  if (!subscription.database || databaseReactorOwnershipUncertain_) {
+    documentSnapshotStale_.store(true, std::memory_order_relaxed);
+    return;
+  }
+
+  auto ownedReactor = std::make_unique<DatabaseReactor>();
+  DatabaseReactor *reactor = ownedReactor.get();
+  databaseReactors_.push_back(std::move(ownedReactor));
+  const Acad::ErrorStatus status =
+      subscription.database->addReactor(reactor);
+  if (status == Acad::eOk) {
+    subscription.databaseReactor = reactor;
+  } else {
+    documentSnapshotStale_.store(true, std::memory_order_relaxed);
+    if (status == Acad::eDuplicateKey) {
+      databaseReactorOwnershipUncertain_ = true;
+    } else {
+      eraseDatabaseReactor(reactor);
+    }
+    forwardHistoryEvent(
+        acadctl::NativeHistoryEventKind::DatabaseReactorAttachFailed, nullptr,
+        subscription.database, static_cast<std::int32_t>(status), 0, 0);
   }
 }
 
@@ -1715,8 +2059,30 @@ void ObjectArxBridge::subscribe(AcApDocument *document) {
     return;
   }
 
-  subscriptions_.push_back(DocumentSubscription{document, nullptr, false});
+  subscriptions_.push_back(
+      DocumentSubscription{document, nullptr, nullptr, false, nullptr});
   refreshSubscription(subscriptions_.back());
+}
+
+void ObjectArxBridge::databaseWillBeDestroyed(AcDbDatabase *database) {
+  recordSparseHistoryEvent(
+      acadctl::NativeHistoryEventKind::DatabaseWillBeDestroyed, nullptr,
+      database);
+  bool retiredSubscription = false;
+  for (DocumentSubscription &subscription : subscriptions_) {
+    if (subscription.database != database) {
+      continue;
+    }
+
+    detachDatabaseReactor(subscription);
+    subscription.database = nullptr;
+    subscription.retiredDatabase = database;
+    subscription.lispFunctionsDefined = false;
+    retiredSubscription = true;
+  }
+  if (retiredSubscription) {
+    documentSnapshotStale_.store(true, std::memory_order_relaxed);
+  }
 }
 
 void ObjectArxBridge::unsubscribe(AcApDocument *document) {
@@ -1729,15 +2095,14 @@ void ObjectArxBridge::unsubscribe(AcApDocument *document) {
     return;
   }
 
-  if (subscription->database) {
-    subscription->database->removeReactor(&databaseReactor_);
-  }
+  detachDatabaseReactor(*subscription);
   subscriptions_.erase(subscription);
 }
 
 std::unique_ptr<ObjectArxBridge> objectArxBridge;
 
 void processNextAction(void *) {
+  ApplicationContextCallbackLease callbackLease;
   if (objectArxBridge) {
     objectArxBridge->processNextAction();
   }
@@ -1746,8 +2111,21 @@ void processNextAction(void *) {
 } // namespace
 
 extern "C" int acadctl_wake_native_actions() {
-  return static_cast<int>(acDocManager->beginExecuteInApplicationContext(
-      processNextAction, nullptr));
+  applicationContextCallbacksOutstanding.fetch_add(1,
+                                                     std::memory_order_seq_cst);
+  if (!acceptNativeActionWakes.load(std::memory_order_seq_cst)) {
+    applicationContextCallbacksOutstanding.fetch_sub(
+        1, std::memory_order_seq_cst);
+    return static_cast<int>(Acad::eInvalidContext);
+  }
+  const int status =
+      static_cast<int>(acDocManager->beginExecuteInApplicationContext(
+          processNextAction, nullptr));
+  if (status != 0) {
+    applicationContextCallbacksOutstanding.fetch_sub(
+        1, std::memory_order_seq_cst);
+  }
+  return status;
 }
 
 extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
@@ -1755,14 +2133,36 @@ extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
   switch (message) {
   case AcRx::kInitAppMsg: {
     acrxDynamicLinker->registerAppMDIAware(applicationId);
-    objectArxBridge = std::make_unique<ObjectArxBridge>();
-    objectArxBridge->start();
+    try {
+      objectArxBridge = std::make_unique<ObjectArxBridge>();
+    } catch (...) {
+      syslog(LOG_ERR, "acadctl plugin could not allocate its native bridge");
+      return AcRx::kRetError;
+    }
+    const auto failInitialization = []() {
+      acceptNativeActionWakes.store(false, std::memory_order_seq_cst);
+      acadctl::stop_rpc_server();
+      if (applicationContextCallbacksOutstanding.load(
+              std::memory_order_seq_cst) != 0 ||
+          !objectArxBridge->stop()) {
+        syslog(LOG_ERR,
+               "acadctl plugin initialization failed after AutoCAD retained "
+               "a native callback; the inert module will remain loaded");
+        return AcRx::kRetOK;
+      }
+      objectArxBridge.reset();
+      return AcRx::kRetError;
+    };
+    try {
+      objectArxBridge->start();
+    } catch (...) {
+      syslog(LOG_ERR, "acadctl plugin initialization failed");
+      return failInitialization();
+    }
     rust::String error = acadctl::start_rpc_server();
     if (!error.empty()) {
       syslog(LOG_ERR, "acadctl plugin failed to start: %s", error.c_str());
-      objectArxBridge->stop();
-      objectArxBridge.reset();
-      return AcRx::kRetError;
+      return failInitialization();
     }
     break;
   }
@@ -1793,8 +2193,21 @@ extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
     break;
   }
   case AcRx::kUnloadAppMsg:
+    acceptNativeActionWakes.store(false, std::memory_order_seq_cst);
     acadctl::stop_rpc_server();
-    objectArxBridge->stop();
+    if (applicationContextCallbacksOutstanding.load(
+            std::memory_order_seq_cst) != 0) {
+      syslog(LOG_ERR,
+             "acadctl plugin cannot unload while a native action callback is "
+             "outstanding");
+      return AcRx::kRetError;
+    }
+    if (objectArxBridge && !objectArxBridge->stop()) {
+      syslog(LOG_ERR,
+             "acadctl plugin cannot unload while AutoCAD may retain a "
+             "database reactor");
+      return AcRx::kRetError;
+    }
     objectArxBridge.reset();
     break;
   default:

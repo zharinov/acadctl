@@ -14,7 +14,9 @@ use crate::execution::{
     Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep, bound_diagnostic,
 };
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
-use crate::history::HistoryProvenance;
+use crate::history::{
+    ActiveHistoryEvidence, HistoryObservationFailure, HistoryProvenance, NativeHistoryEvent,
+};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -37,6 +39,7 @@ pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 struct MutationScheduler {
     documents: DocumentRegistry,
     provenance: HistoryProvenance,
+    history_observation_failure: Option<HistoryObservationFailure>,
     pending: VecDeque<MutationJob>,
     active: Option<MutationJob>,
     wake_pending: bool,
@@ -48,6 +51,7 @@ struct MutationJob {
     job_id: MutationJobId,
     operation: Operation,
     native_target: Option<NativeDocumentKey>,
+    history_evidence: Option<ActiveHistoryEvidence>,
     start_deadline: Option<Instant>,
     waiting_for_readiness: bool,
     retry_at: Option<Instant>,
@@ -293,6 +297,7 @@ impl MutationScheduler {
         Self {
             documents: DocumentRegistry::new(),
             provenance: HistoryProvenance::new(),
+            history_observation_failure: None,
             pending: VecDeque::new(),
             active: None,
             wake_pending: false,
@@ -410,6 +415,7 @@ pub fn admit_execution(
                     execution: Box::new(execution),
                 },
                 native_target: None,
+                history_evidence: None,
                 start_deadline: Some(deadline),
                 waiting_for_readiness: false,
                 retry_at: None,
@@ -494,7 +500,45 @@ pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
         scheduler.documents.replace(documents);
         let keys = scheduler.documents.native_keys().collect::<Vec<_>>();
+        if let Some(job) = scheduler.active.as_mut()
+            && job
+                .native_target
+                .is_some_and(|target| !keys.contains(&target))
+        {
+            job.history_evidence = None;
+        }
         scheduler.provenance.reconcile_documents(keys);
+    }
+}
+
+pub fn record_native_history_event(event: NativeHistoryEvent) {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return;
+    };
+    let event_subject = scheduler.documents.resolve_native_key(
+        event.event_context.document_token,
+        event.event_context.database_token,
+    );
+
+    if scheduler.history_observation_failure.is_none() {
+        scheduler.history_observation_failure = event.observation_failure();
+    }
+
+    if scheduler.history_observation_failure.is_some() {
+        scheduler.provenance.invalidate_all();
+    } else if event.kind.invalidates_provenance() {
+        if let Some(key) = event_subject {
+            scheduler.provenance.invalidate(key);
+        } else {
+            scheduler.provenance.invalidate_all();
+        }
+    }
+
+    if let Some(job) = scheduler.active.as_mut()
+        && let Some(target) = job.native_target
+        && let Some(evidence) = job.history_evidence.as_mut()
+    {
+        evidence.record(target, event_subject, event);
     }
 }
 
@@ -510,6 +554,7 @@ pub fn stop() {
         scheduler.wake_pending = false;
         scheduler.provenance.invalidate_all();
         let active_output = scheduler.active.as_mut().and_then(|job| {
+            job.history_evidence = None;
             if let Operation::Execute { execution, .. } = &mut job.operation {
                 let _ = execution.request_cancel();
                 Some(execution.output_sink())
@@ -561,6 +606,7 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
             job_id,
             operation,
             native_target: None,
+            history_evidence: None,
             start_deadline: None,
             waiting_for_readiness: false,
             retry_at: None,
@@ -606,6 +652,7 @@ pub fn take_native_action() -> NativeAction {
                             });
                         if let Some(target) = job.native_target {
                             scheduler.provenance.invalidate(target);
+                            job.history_evidence = Some(ActiveHistoryEvidence::default());
                         }
                         scheduler.active = Some(job);
                         TakeDecision::Action(action)
@@ -660,6 +707,7 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
                 true
             } else {
                 job.native_target = None;
+                job.history_evidence = None;
                 job.defer_for_readiness(Instant::now());
                 scheduler.pending.push_front(job);
                 TIMERS_CHANGED.notify_one();
@@ -1326,6 +1374,7 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionMode;
     use crate::execution::value_bridge::{ValueEvent, WriteResult};
+    use crate::history::{HistoryContext, HistoryEventKind};
 
     #[test]
     fn preserves_native_guard_outcomes_as_types() {
@@ -2154,6 +2203,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_history_activity_invalidates_only_its_exact_subject() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false), document(2, 102, false)]);
+        let first = NativeDocumentKey {
+            document_token: 1,
+            database_token: 101,
+        };
+        let second = NativeDocumentKey {
+            document_token: 2,
+            database_token: 102,
+        };
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.provenance.seed_owned_step(first, 1);
+            scheduler.provenance.seed_owned_step(second, 2);
+        }
+
+        record_native_history_event(history_event(HistoryEventKind::DocumentActivated, first));
+        assert!(SCHEDULER.lock().unwrap().provenance.has_owned_step(first));
+        record_native_history_event(history_event(
+            HistoryEventKind::DocumentBecameCurrent,
+            first,
+        ));
+        assert!(SCHEDULER.lock().unwrap().provenance.has_owned_step(first));
+
+        let mut event = history_event(HistoryEventKind::CommandWillStart, first);
+        event.event_context.database_token = 0;
+        record_native_history_event(event);
+
+        let scheduler = SCHEDULER.lock().unwrap();
+        assert!(!scheduler.provenance.has_owned_step(first));
+        assert!(scheduler.provenance.has_owned_step(second));
+        drop(scheduler);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn unattributable_history_activity_invalidates_every_key() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false), document(2, 102, false)]);
+        let first = NativeDocumentKey {
+            document_token: 1,
+            database_token: 101,
+        };
+        let second = NativeDocumentKey {
+            document_token: 2,
+            database_token: 102,
+        };
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.provenance.seed_owned_step(first, 1);
+            scheduler.provenance.seed_owned_step(second, 2);
+        }
+        let mut event = history_event(HistoryEventKind::DatabaseActivity, first);
+        event.event_context.document_token = 0;
+        event.event_context.database_token = 0;
+        event.database_activity = u32::from(crate::history::DATABASE_OBJECT_MODIFIED);
+
+        record_native_history_event(event);
+
+        let scheduler = SCHEDULER.lock().unwrap();
+        assert!(!scheduler.provenance.has_owned_step(first));
+        assert!(!scheduler.provenance.has_owned_step(second));
+        drop(scheduler);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn malformed_history_event_latches_failure_and_invalidates_every_key() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false), document(2, 102, false)]);
+        let first = NativeDocumentKey {
+            document_token: 1,
+            database_token: 101,
+        };
+        let second = NativeDocumentKey {
+            document_token: 2,
+            database_token: 102,
+        };
+        {
+            let mut scheduler = SCHEDULER.lock().unwrap();
+            scheduler.provenance.seed_owned_step(first, 1);
+            scheduler.provenance.seed_owned_step(second, 2);
+        }
+        let mut malformed = history_event(HistoryEventKind::DatabaseActivity, first);
+        malformed.argument0 = 91;
+
+        record_native_history_event(malformed);
+
+        let scheduler = SCHEDULER.lock().unwrap();
+        assert!(!scheduler.provenance.has_owned_step(first));
+        assert!(!scheduler.provenance.has_owned_step(second));
+        assert_eq!(
+            scheduler.history_observation_failure,
+            Some(crate::history::HistoryObservationFailure {
+                kind: crate::history::HistoryObservationFailureKind::MalformedEvent,
+                raw_subject: HistoryContext {
+                    document_token: 1,
+                    database_token: 101,
+                },
+                native_status: 91,
+            })
+        );
+        drop(scheduler);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn first_history_observation_failure_survives_scheduler_restart() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let key = NativeDocumentKey {
+            document_token: 1,
+            database_token: 101,
+        };
+        let mut attach_failure = history_event(HistoryEventKind::DatabaseReactorAttachFailed, key);
+        attach_failure.event_context.document_token = 0;
+        attach_failure.argument0 = 42;
+
+        record_native_history_event(attach_failure);
+        assert_eq!(
+            SCHEDULER.lock().unwrap().history_observation_failure,
+            Some(crate::history::HistoryObservationFailure {
+                kind: crate::history::HistoryObservationFailureKind::DatabaseReactorAttach,
+                raw_subject: HistoryContext {
+                    document_token: 0,
+                    database_token: 101,
+                },
+                native_status: 42,
+            })
+        );
+
+        stop();
+        start();
+        let first_failure = SCHEDULER.lock().unwrap().history_observation_failure;
+        let mut detach_failure = history_event(HistoryEventKind::DatabaseReactorDetachFailed, key);
+        detach_failure.argument0 = 77;
+        record_native_history_event(detach_failure);
+        assert_eq!(
+            SCHEDULER.lock().unwrap().history_observation_failure,
+            first_failure
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn active_history_evidence_is_job_owned_and_never_creates_provenance() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, true)]);
+        let id = list().unwrap()[0].id.clone();
+        let key = NativeDocumentKey {
+            document_token: 1,
+            database_token: 101,
+        };
+        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
+        let pending = tokio::spawn(save(id));
+        tokio::task::yield_now().await;
+
+        let action = take_native_action();
+        assert_eq!(action.kind, NativeActionKind::Save);
+        assert_eq!(
+            SCHEDULER
+                .lock()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .history_evidence,
+            Some(ActiveHistoryEvidence::default())
+        );
+        let mut event = history_event(HistoryEventKind::DatabaseActivity, key);
+        event.event_context.document_token = 0;
+        event.database_activity = u32::from(crate::history::DATABASE_OBJECT_MODIFIED);
+        record_native_history_event(event);
+        assert_ne!(
+            SCHEDULER
+                .lock()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .history_evidence,
+            Some(ActiveHistoryEvidence::default())
+        );
+
+        replace_documents(vec![document(1, 101, false)]);
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+
+        assert!(pending.await.unwrap().is_ok());
+        let scheduler = SCHEDULER.lock().unwrap();
+        assert!(scheduler.active.is_none());
+        assert!(!scheduler.provenance.has_owned_step(key));
+        drop(scheduler);
+        stop();
+    }
+
+    #[tokio::test]
     async fn unproved_native_mutation_invalidates_history_before_issue() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
@@ -2326,6 +2572,12 @@ mod tests {
         let first = take_native_action();
         assert_eq!(first.kind, NativeActionKind::RunExecution);
         complete_native_action(first.job_id, result(NativeActionResultKind::NotQuiescent));
+        {
+            let scheduler = SCHEDULER.lock().unwrap();
+            let retry = scheduler.pending.front().expect("execution is deferred");
+            assert_eq!(retry.native_target, None);
+            assert_eq!(retry.history_evidence, None);
+        }
         assert_eq!(take_native_action().kind, NativeActionKind::None);
 
         process_due_timers(Instant::now() + BUSY_RETRY_MAX);
@@ -2657,9 +2909,28 @@ mod tests {
         }
     }
 
+    fn history_event(kind: HistoryEventKind, key: NativeDocumentKey) -> NativeHistoryEvent {
+        let context = HistoryContext {
+            document_token: key.document_token,
+            database_token: key.database_token,
+        };
+        NativeHistoryEvent {
+            kind,
+            event_context: context,
+            current_context: context,
+            active_context: context,
+            argument0: 0,
+            argument1: 0,
+            database_activity: 0,
+        }
+    }
+
     fn reset(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
         stop();
-        SCHEDULER.lock().unwrap().quarantined = false;
+        let mut scheduler = SCHEDULER.lock().unwrap();
+        scheduler.quarantined = false;
+        scheduler.history_observation_failure = None;
+        drop(scheduler);
         replace_documents(documents);
         start();
     }

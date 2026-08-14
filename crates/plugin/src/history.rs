@@ -3,6 +3,211 @@ use std::collections::{HashSet, VecDeque};
 use crate::documents::NativeDocumentKey;
 
 #[cfg(test)]
+pub(crate) const DATABASE_OBJECT_MODIFIED: u16 =
+    1 << crate::ffi::NativeDatabaseActivityKind::ObjectModified.repr;
+pub(crate) const KNOWN_DATABASE_ACTIVITY: u16 =
+    (1 << (crate::ffi::NativeDatabaseActivityKind::ProxyResurrectionCompleted.repr + 1)) - 1;
+
+const EVENT_SUBJECT_UNRESOLVED: u8 = 1 << 0;
+const EVENT_SUBJECT_FOREIGN: u8 = 1 << 1;
+const CURRENT_CONTEXT_MISSING_OR_PARTIAL: u8 = 1 << 2;
+const CURRENT_CONTEXT_FOREIGN: u8 = 1 << 3;
+const ACTIVE_CONTEXT_MISSING_OR_PARTIAL: u8 = 1 << 4;
+const ACTIVE_CONTEXT_FOREIGN: u8 = 1 << 5;
+const CURRENT_AND_ACTIVE_DIFFER: u8 = 1 << 6;
+const MALFORMED_EVENT: u8 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum HistoryEventKind {
+    Invalid,
+    CommandWillStart,
+    CommandEnded,
+    CommandCancelled,
+    CommandFailed,
+    LispWillStart,
+    LispEnded,
+    LispCancelled,
+    SystemVariableWillChange,
+    SystemVariableChanged,
+    UndoAuto,
+    UndoControl,
+    UndoBegin,
+    UndoEnd,
+    UndoMark,
+    UndoBack,
+    UndoNumber,
+    RedoNumber,
+    UndoWriteBoundary,
+    SubcommandsWillBeUndone,
+    DocumentCreated,
+    DocumentWillBeDestroyed,
+    DocumentBecameCurrent,
+    DocumentActivated,
+    DatabaseWillBeDestroyed,
+    DatabaseActivity,
+    DatabaseReactorAttachFailed,
+    DatabaseReactorDetachFailed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HistoryContext {
+    pub(crate) document_token: usize,
+    pub(crate) database_token: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeHistoryEvent {
+    pub(crate) kind: HistoryEventKind,
+    pub(crate) event_context: HistoryContext,
+    pub(crate) current_context: HistoryContext,
+    pub(crate) active_context: HistoryContext,
+    pub(crate) argument0: i32,
+    pub(crate) argument1: i32,
+    pub(crate) database_activity: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryObservationFailureKind {
+    MalformedEvent,
+    DatabaseReactorAttach,
+    DatabaseReactorDetach,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryObservationFailure {
+    pub(crate) kind: HistoryObservationFailureKind,
+    pub(crate) raw_subject: HistoryContext,
+    pub(crate) native_status: i32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ActiveHistoryEvidence {
+    event_kinds: u32,
+    database_activity: u16,
+    context_flags: u8,
+}
+
+impl NativeHistoryEvent {
+    pub(crate) fn malformed(self) -> bool {
+        let database_activity_is_malformed = if self.kind == HistoryEventKind::DatabaseActivity {
+            self.database_activity == 0
+                || self.database_activity & !u32::from(KNOWN_DATABASE_ACTIVITY) != 0
+        } else {
+            self.database_activity != 0
+        };
+        self.kind == HistoryEventKind::Invalid || database_activity_is_malformed
+    }
+
+    pub(crate) fn observation_failure(self) -> Option<HistoryObservationFailure> {
+        let kind = if self.malformed() {
+            HistoryObservationFailureKind::MalformedEvent
+        } else {
+            match self.kind {
+                HistoryEventKind::DatabaseReactorAttachFailed => {
+                    HistoryObservationFailureKind::DatabaseReactorAttach
+                }
+                HistoryEventKind::DatabaseReactorDetachFailed => {
+                    HistoryObservationFailureKind::DatabaseReactorDetach
+                }
+                _ => return None,
+            }
+        };
+        Some(HistoryObservationFailure {
+            kind,
+            raw_subject: self.event_context,
+            native_status: self.argument0,
+        })
+    }
+}
+
+impl ActiveHistoryEvidence {
+    pub(crate) fn record(
+        &mut self,
+        target: NativeDocumentKey,
+        event_subject: Option<NativeDocumentKey>,
+        event: NativeHistoryEvent,
+    ) {
+        self.event_kinds |= event.kind.bit();
+
+        self.database_activity |= (event.database_activity as u16) & KNOWN_DATABASE_ACTIVITY;
+        if event.malformed() {
+            self.context_flags |= MALFORMED_EVENT;
+        }
+
+        self.context_flags |= resolved_context_flags(
+            event_subject,
+            target,
+            EVENT_SUBJECT_UNRESOLVED,
+            EVENT_SUBJECT_FOREIGN,
+        );
+        self.context_flags |= context_flags(
+            event.current_context,
+            target,
+            CURRENT_CONTEXT_MISSING_OR_PARTIAL,
+            CURRENT_CONTEXT_FOREIGN,
+        );
+        self.context_flags |= context_flags(
+            event.active_context,
+            target,
+            ACTIVE_CONTEXT_MISSING_OR_PARTIAL,
+            ACTIVE_CONTEXT_FOREIGN,
+        );
+        if event.current_context != event.active_context {
+            self.context_flags |= CURRENT_AND_ACTIVE_DIFFER;
+        }
+    }
+}
+
+impl HistoryEventKind {
+    const fn bit(self) -> u32 {
+        1 << self as u8
+    }
+
+    pub(crate) const fn invalidates_provenance(self) -> bool {
+        !matches!(self, Self::DocumentBecameCurrent | Self::DocumentActivated)
+    }
+}
+
+impl HistoryContext {
+    pub(crate) const fn native_key(self) -> Option<NativeDocumentKey> {
+        if self.document_token == 0 || self.database_token == 0 {
+            return None;
+        }
+        Some(NativeDocumentKey {
+            document_token: self.document_token,
+            database_token: self.database_token,
+        })
+    }
+}
+
+fn context_flags(
+    context: HistoryContext,
+    target: NativeDocumentKey,
+    missing_flag: u8,
+    foreign_flag: u8,
+) -> u8 {
+    match context.native_key() {
+        Some(key) if key == target => 0,
+        Some(_) => foreign_flag,
+        None => missing_flag,
+    }
+}
+
+fn resolved_context_flags(
+    context: Option<NativeDocumentKey>,
+    target: NativeDocumentKey,
+    missing_flag: u8,
+    foreign_flag: u8,
+) -> u8 {
+    match context {
+        Some(key) if key == target => 0,
+        Some(_) => foreign_flag,
+        None => missing_flag,
+    }
+}
+
+#[cfg(test)]
 const MAX_TRACKED_DOCUMENT_GENERATIONS: usize = 32;
 #[cfg(test)]
 const MAX_OWNED_STEPS_PER_DOCUMENT_GENERATION: usize = 256;
@@ -246,6 +451,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_evidence_is_a_constant_size_idempotent_summary() {
+        let target = key(1, 101);
+        let mut evidence = ActiveHistoryEvidence::default();
+        let event = native_event(HistoryEventKind::CommandWillStart, target);
+
+        for _ in 0..100_000 {
+            evidence.record(target, Some(target), event);
+        }
+
+        assert_eq!(
+            evidence.event_kinds,
+            HistoryEventKind::CommandWillStart.bit()
+        );
+        assert_eq!(evidence.database_activity, 0);
+        assert_eq!(evidence.context_flags, 0);
+        assert!(std::mem::size_of::<ActiveHistoryEvidence>() <= 8);
+    }
+
+    #[test]
+    fn active_evidence_preserves_every_database_activity_class() {
+        let target = key(1, 101);
+        let mut evidence = ActiveHistoryEvidence::default();
+        let mut event = native_event(HistoryEventKind::DatabaseActivity, target);
+        event.database_activity = u32::from(KNOWN_DATABASE_ACTIVITY);
+
+        evidence.record(target, Some(target), event);
+
+        assert_eq!(evidence.database_activity, KNOWN_DATABASE_ACTIVITY);
+        assert_eq!(evidence.context_flags, 0);
+    }
+
+    #[test]
+    fn active_evidence_latches_context_and_malformed_event_flags() {
+        let target = key(1, 101);
+        let foreign = key(2, 102);
+        let mut evidence = ActiveHistoryEvidence::default();
+        let mut event = native_event(HistoryEventKind::DatabaseActivity, target);
+        event.event_context = HistoryContext {
+            document_token: foreign.document_token,
+            database_token: foreign.database_token,
+        };
+        event.current_context = HistoryContext {
+            document_token: target.document_token,
+            database_token: 0,
+        };
+        event.active_context = HistoryContext {
+            document_token: foreign.document_token,
+            database_token: foreign.database_token,
+        };
+        event.database_activity = 1 << 31;
+
+        evidence.record(target, Some(foreign), event);
+
+        assert_eq!(
+            evidence.context_flags,
+            EVENT_SUBJECT_FOREIGN
+                | CURRENT_CONTEXT_MISSING_OR_PARTIAL
+                | ACTIVE_CONTEXT_FOREIGN
+                | CURRENT_AND_ACTIVE_DIFFER
+                | MALFORMED_EVENT
+        );
+    }
+
+    #[test]
     fn starts_behind_an_unknown_barrier() {
         let provenance = HistoryProvenance::new();
 
@@ -459,6 +728,22 @@ mod tests {
         NativeDocumentKey {
             document_token,
             database_token,
+        }
+    }
+
+    fn native_event(kind: HistoryEventKind, key: NativeDocumentKey) -> NativeHistoryEvent {
+        let context = HistoryContext {
+            document_token: key.document_token,
+            database_token: key.database_token,
+        };
+        NativeHistoryEvent {
+            kind,
+            event_context: context,
+            current_context: context,
+            active_context: context,
+            argument0: 0,
+            argument1: 0,
+            database_activity: 0,
         }
     }
 
