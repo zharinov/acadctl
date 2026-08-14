@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 
 use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
 use crate::execution::output::OutputSink;
+use crate::execution::value_bridge::NativeValueWriter;
 use crate::execution::{Execution, NativeExecutionStep, Outcome as ExecutionOutcome, StepResult};
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
 
@@ -29,6 +30,7 @@ struct Scheduler {
 struct Job {
     request_id: u64,
     operation: Operation,
+    native_target: Option<NativeDocumentKey>,
     completion: oneshot::Sender<Result<OperationOutcome, Error>>,
 }
 
@@ -379,6 +381,7 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
         scheduler.pending.push_back(Job {
             request_id,
             operation,
+            native_target: None,
             completion,
         });
         let should_wake = scheduler.request_wake();
@@ -399,11 +402,16 @@ pub fn take() -> NativeAction {
         scheduler.wake_pending = false;
         if scheduler.stopping || scheduler.quarantined || scheduler.active.is_some() {
             TakeDecision::Empty
-        } else if let Some(job) = scheduler.pending.pop_front() {
+        } else if let Some(mut job) = scheduler.pending.pop_front() {
             match prepare(&job.operation, &scheduler.documents) {
                 Prepared::Immediate(outcome) => TakeDecision::Complete(job.completion, outcome),
                 Prepared::Native(mut action) => {
                     action.request_id = job.request_id;
+                    job.native_target = matches!(&job.operation, Operation::Execute { .. })
+                        .then_some(NativeDocumentKey {
+                            document_token: action.document_token,
+                            database_token: action.database_token,
+                        });
                     scheduler.active = Some(job);
                     TakeDecision::Action(action)
                 }
@@ -548,6 +556,31 @@ pub fn take_execution_step(execution_id: u64) -> NativeExecutionStep {
             NativeExecutionStep::invalid()
         }
     }
+}
+
+pub fn begin_println(document_token: usize, database_token: usize) -> NativeValueWriter {
+    let lease = {
+        let Ok(scheduler) = SCHEDULER.lock() else {
+            return NativeValueWriter::inactive();
+        };
+        let Some(job) = scheduler.active.as_ref() else {
+            return NativeValueWriter::inactive();
+        };
+        if job.native_target
+            != Some(NativeDocumentKey {
+                document_token,
+                database_token,
+            })
+        {
+            return NativeValueWriter::inactive();
+        }
+        match &job.operation {
+            Operation::Execute { execution, .. } => execution.acquire_form_output(),
+            Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => None,
+        }
+    };
+
+    lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::println)
 }
 
 pub fn complete_execution_step(execution_id: u64, result: StepResult) -> bool {
@@ -832,6 +865,7 @@ fn wake_native_actions() -> i32 {
 mod tests {
     use super::*;
     use crate::execution::ExecutionMode;
+    use crate::execution::value_bridge::{ValueEvent, WriteResult};
 
     #[test]
     fn preserves_native_guard_outcomes_as_types() {
@@ -980,6 +1014,170 @@ mod tests {
 
         complete(action.request_id, result(NativeActionResultKind::Success));
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn routes_println_only_to_the_exact_active_form() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert!(!begin_println(1, 101).active());
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+        assert!(!begin_println(2, 101).active());
+        assert!(!begin_println(1, 202).active());
+
+        let mut writer = begin_println(1, 101);
+        assert!(writer.active());
+        assert_eq!(writer.write(ValueEvent::BeginString), WriteResult::Continue);
+        assert_eq!(
+            writer.write(ValueEvent::StringChunk("created: ")),
+            WriteResult::Continue
+        );
+        assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
+        assert_eq!(writer.write(ValueEvent::Integer(3)), WriteResult::Continue);
+        assert_eq!(writer.finish(), WriteResult::Continue);
+
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(!begin_println(1, 101).active());
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Commit
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
+        let mut rendered = String::new();
+        while let Some(chunk) = output.next_chunk().await {
+            rendered.push_str(&chunk);
+        }
+        assert_eq!(rendered, "created: 3\n");
+        stop();
+    }
+
+    #[tokio::test]
+    async fn rolls_back_a_malformed_active_value_stream() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+
+        let mut writer = begin_println(1, 101);
+        assert_eq!(
+            writer.write(ValueEvent::EndList),
+            WriteResult::InvalidSequence
+        );
+        assert_eq!(writer.finish(), WriteResult::InvalidSequence);
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Rollback
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                message: "the AutoLISP output bridge emitted an invalid value sequence".into(),
+                form_index: Some(1),
+                location: Some(crate::execution::SourceLocation {
+                    source_name: "batch.lsp".into(),
+                    line: 1,
+                    column: 1,
+                }),
+                drawing_outcome: crate::execution::DrawingOutcome::RolledBack,
+            })
+        );
+        stop();
+    }
+
+    #[tokio::test]
+    async fn unfinished_writer_fails_its_own_form_checkpoint() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+
+        let mut writer = begin_println(1, 101);
+        assert!(writer.active());
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(!writer.active());
+        assert_eq!(writer.write(ValueEvent::Integer(9)), WriteResult::Inactive);
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Rollback
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+
+        let Some(ExecutionOutcome::Failure(failure)) = pending.await.unwrap().ok() else {
+            panic!("expected the unfinished writer to fail execution");
+        };
+        assert_eq!(
+            failure.message,
+            "the AutoLISP output bridge abandoned an unfinished value"
+        );
+        assert_eq!(failure.form_index, Some(1));
+        assert_eq!(
+            failure.drawing_outcome,
+            crate::execution::DrawingOutcome::RolledBack
+        );
         stop();
     }
 

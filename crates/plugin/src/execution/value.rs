@@ -32,6 +32,7 @@ pub struct ValuePrinter {
     lists: Vec<ListState>,
     atom: AtomState,
     skipped_lists: usize,
+    root_values: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,7 +97,12 @@ impl ValuePrinter {
             lists: Vec::new(),
             atom: AtomState::None,
             skipped_lists: 0,
+            root_values: 0,
         }
+    }
+
+    pub const fn root_values(&self) -> usize {
+        self.root_values
     }
 
     pub fn begin_list(&mut self) -> Result<(), PrintError> {
@@ -403,6 +409,10 @@ impl ValuePrinter {
 
     fn before_value(&mut self) -> Result<(), PrintError> {
         let Some(state) = self.lists.last_mut() else {
+            self.root_values = self
+                .root_values
+                .checked_add(1)
+                .ok_or(PrintError::LimitExceeded)?;
             return Ok(());
         };
         let write_space = match *state {

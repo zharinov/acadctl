@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
 use output::{OutputSink, OutputStream};
 
 pub mod output;
 pub mod value;
+pub mod value_bridge;
 
 #[allow(
     dead_code,
@@ -28,7 +29,34 @@ pub struct Execution {
     cancel_requested: bool,
     rollback: Option<RollbackCause>,
     outcome: Option<Outcome>,
+    io: Arc<ExecutionIo>,
+}
+
+pub(crate) struct ExecutionIo {
     output: OutputSink,
+    bridge: Mutex<ValueBridgeState>,
+}
+
+#[derive(Default)]
+struct ValueBridgeState {
+    generation: u64,
+    form_open: bool,
+    active_writers: usize,
+    failure: Option<ValueBridgeFailure>,
+}
+
+pub(crate) struct FormOutputLease {
+    io: Arc<ExecutionIo>,
+    generation: u64,
+    released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValueBridgeFailure {
+    InvalidSequence,
+    LimitExceeded,
+    OutputFinished,
+    Abandoned,
 }
 
 #[allow(
@@ -141,6 +169,130 @@ enum RollbackCause {
     Cancelled,
 }
 
+impl ExecutionIo {
+    pub(crate) fn output_sink(&self) -> OutputSink {
+        self.output.clone()
+    }
+
+    fn begin_form_output(&self) {
+        let mut state = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.form_open || state.active_writers != 0 {
+            state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
+        }
+        state.generation = state.generation.wrapping_add(1).max(1);
+        state.form_open = true;
+        state.active_writers = 0;
+    }
+
+    fn acquire_form_output(self: &Arc<Self>) -> Option<FormOutputLease> {
+        let mut state = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.form_open || state.failure.is_some() || state.active_writers != 0 {
+            return None;
+        }
+        let Some(active_writers) = state.active_writers.checked_add(1) else {
+            state
+                .failure
+                .get_or_insert(ValueBridgeFailure::LimitExceeded);
+            return None;
+        };
+        state.active_writers = active_writers;
+        Some(FormOutputLease {
+            io: Arc::clone(self),
+            generation: state.generation,
+            released: false,
+        })
+    }
+
+    fn close_form_output(&self) -> Option<ValueBridgeFailure> {
+        let mut state = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.form_open = false;
+        if state.active_writers != 0 {
+            state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
+        }
+        state.failure.take()
+    }
+
+    fn form_output_is_open(&self, generation: u64) -> bool {
+        let state = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.form_open
+            && state.generation == generation
+            && state.active_writers == 1
+            && state.failure.is_none()
+    }
+
+    fn release_form_output(&self, generation: u64, failure: Option<ValueBridgeFailure>) {
+        let mut state = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != generation {
+            return;
+        }
+        if state.form_open
+            && let Some(failure) = failure
+        {
+            state.failure.get_or_insert(failure);
+        }
+        state.active_writers = state.active_writers.saturating_sub(1);
+    }
+
+    #[cfg(test)]
+    fn record_bridge_failure(&self, failure: ValueBridgeFailure) {
+        let mut state = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.failure.get_or_insert(failure);
+    }
+}
+
+impl FormOutputLease {
+    pub(crate) fn output_sink(&self) -> OutputSink {
+        self.io.output_sink()
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.io.form_output_is_open(self.generation)
+    }
+
+    pub(crate) fn release(mut self, failure: Option<ValueBridgeFailure>) {
+        self.io.release_form_output(self.generation, failure);
+        self.released = true;
+    }
+}
+
+impl Drop for FormOutputLease {
+    fn drop(&mut self) {
+        if !self.released {
+            self.io
+                .release_form_output(self.generation, Some(ValueBridgeFailure::Abandoned));
+        }
+    }
+}
+
+impl ValueBridgeFailure {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidSequence => "the AutoLISP output bridge emitted an invalid value sequence",
+            Self::LimitExceeded => "the AutoLISP output bridge exceeded its structural limit",
+            Self::OutputFinished => "execution output ended while AutoLISP was still producing it",
+            Self::Abandoned => "the AutoLISP output bridge abandoned an unfinished value",
+        }
+    }
+}
+
 impl Execution {
     #[allow(
         dead_code,
@@ -168,8 +320,12 @@ impl Execution {
         let next_scan = acadctl_lisp::scan(&source).position();
         let empty = form_count == 0;
         let (output, stream) = output::channel();
+        let io = Arc::new(ExecutionIo {
+            output,
+            bridge: Mutex::new(ValueBridgeState::default()),
+        });
         if empty {
-            output.finish();
+            io.output.finish();
         }
         Ok((
             Self {
@@ -183,7 +339,7 @@ impl Execution {
                 cancel_requested: false,
                 rollback: None,
                 outcome: empty.then_some(Outcome::Success),
-                output,
+                io,
             },
             stream,
         ))
@@ -206,7 +362,13 @@ impl Execution {
     }
 
     pub fn output_sink(&self) -> OutputSink {
-        self.output.clone()
+        self.io.output.clone()
+    }
+
+    pub(crate) fn acquire_form_output(&self) -> Option<FormOutputLease> {
+        matches!(self.phase, Phase::AwaitingForm { .. })
+            .then(|| self.io.acquire_form_output())
+            .flatten()
     }
 
     pub fn request_cancel(&mut self) -> bool {
@@ -276,6 +438,7 @@ impl Execution {
                                 line: span.line,
                                 column: span.column,
                             };
+                            self.io.begin_form_output();
                             self.form_attempted = true;
                             return NativeExecutionStep::form(Arc::clone(&self.source), span);
                         }
@@ -345,14 +508,8 @@ impl Execution {
                 line,
                 column,
             } => {
-                if result.kind == StepResultKind::Success {
-                    if self.cancel_requested {
-                        self.rollback = Some(RollbackCause::Cancelled);
-                        self.phase = Phase::Rollback;
-                    } else {
-                        self.phase = Phase::BetweenForms;
-                    }
-                } else {
+                let bridge_failure = self.io.close_form_output();
+                if result.kind != StepResultKind::Success {
                     self.rollback = Some(RollbackCause::Failure(Failure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
@@ -364,6 +521,25 @@ impl Execution {
                         drawing_outcome: DrawingOutcome::Unknown,
                     }));
                     self.phase = Phase::Rollback;
+                } else if let Some(failure) = bridge_failure {
+                    self.rollback = Some(RollbackCause::Failure(Failure {
+                        message: failure.message().to_owned(),
+                        form_index: Some(index),
+                        location: Some(SourceLocation {
+                            source_name: self.source_name.clone(),
+                            line,
+                            column,
+                        }),
+                        drawing_outcome: DrawingOutcome::Unknown,
+                    }));
+                    self.phase = Phase::Rollback;
+                } else {
+                    if self.cancel_requested {
+                        self.rollback = Some(RollbackCause::Cancelled);
+                        self.phase = Phase::Rollback;
+                    } else {
+                        self.phase = Phase::BetweenForms;
+                    }
                 }
             }
             Phase::AwaitingCommit => {
@@ -467,6 +643,9 @@ impl Execution {
     pub fn abandon(&mut self, result: StepResult) -> bool {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
+        if matches!(phase, Phase::AwaitingForm { .. }) {
+            let _ = self.io.close_form_output();
+        }
         let existing = self.outcome.take().or_else(|| {
             self.rollback.take().map(|cause| match cause {
                 RollbackCause::Failure(failure) => Outcome::Failure(failure),
@@ -913,6 +1092,50 @@ mod tests {
         };
         assert_eq!(failure.message, "boom");
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
+    }
+
+    #[test]
+    fn evaluator_failure_wins_over_a_concurrent_output_bridge_failure() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        begin(&mut execution);
+
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        execution
+            .io
+            .record_bridge_failure(ValueBridgeFailure::InvalidSequence);
+        assert!(execution.complete_step(lisp_error("boom", 0)));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected the evaluator failure");
+        };
+        assert_eq!(failure.message, "boom");
+    }
+
+    #[test]
+    fn output_bridge_failure_wins_over_concurrent_cancellation() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        execution
+            .io
+            .record_bridge_failure(ValueBridgeFailure::InvalidSequence);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected the output bridge failure");
+        };
+        assert_eq!(
+            failure.message,
+            "the AutoLISP output bridge emitted an invalid value sequence"
+        );
     }
 
     #[test]
