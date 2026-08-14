@@ -2,15 +2,15 @@ syntax = "proto3";
 
 package acadctl;
 
-service Acadctl {
+service DocumentService {
   rpc List(ListRequest) returns (ListResponse);
   rpc Open(OpenRequest) returns (OpenResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Close(CloseRequest) returns (CloseResponse);
 }
 
-service Executor {
-  rpc Execute(stream ExecuteClientMessage) returns (stream ExecuteServerEvent);
+service ExecutionService {
+  rpc Execute(stream ExecutionClientMessage) returns (stream ExecutionServerEvent);
 }
 
 message ListRequest {}
@@ -42,10 +42,10 @@ message CloseRequest {
 
 message CloseResponse {}
 
-message ExecuteClientMessage {
+message ExecutionClientMessage {
   oneof message {
     ExecutionRequest request = 1;
-    ExecutionCancel cancel = 2;
+    ExecutionCancelRequest cancel = 2;
   }
 }
 
@@ -62,14 +62,14 @@ enum ExecutionMode {
   EXECUTION_MODE_EXEC = 2;
 }
 
-message ExecutionCancel {}
+message ExecutionCancelRequest {}
 
-message ExecuteServerEvent {
+message ExecutionServerEvent {
   oneof event {
     ExecutionAccepted accepted = 1;
     ExecutionOutput output = 2;
     ExecutionFinished finished = 3;
-    ExecutionCancellation cancellation = 4;
+    ExecutionCancelAcknowledgement cancel_acknowledgement = 4;
   }
 }
 
@@ -95,14 +95,14 @@ message ExecutionSuccess {}
 
 message ExecutionCancelled {}
 
-message ExecutionCancellation {
-  ExecutionCancellationResult result = 1;
+message ExecutionCancelAcknowledgement {
+  ExecutionCancelDisposition disposition = 1;
 }
 
-enum ExecutionCancellationResult {
-  EXECUTION_CANCELLATION_RESULT_UNSPECIFIED = 0;
-  EXECUTION_CANCELLATION_RESULT_ACCEPTED = 1;
-  EXECUTION_CANCELLATION_RESULT_TOO_LATE = 2;
+enum ExecutionCancelDisposition {
+  EXECUTION_CANCEL_DISPOSITION_UNSPECIFIED = 0;
+  EXECUTION_CANCEL_DISPOSITION_ACCEPTED = 1;
+  EXECUTION_CANCEL_DISPOSITION_TOO_LATE = 2;
 }
 
 message ExecutionFailure {
@@ -128,7 +128,8 @@ enum DrawingOutcome {
 
 message Document {
   string id = 1;
-  string path = 2;
-  bool modified = 3;
-  bool read_only = 4;
+  string display_name = 2;
+  optional string file_path = 3;
+  bool modified = 4;
+  bool read_only = 5;
 }

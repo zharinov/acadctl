@@ -4,7 +4,6 @@ pub mod open;
 pub mod save;
 mod target;
 
-use std::path::Path;
 use std::process::ExitCode;
 
 use acadctl_rpc::Document;
@@ -13,7 +12,7 @@ use tonic::{Code, Status};
 
 use crate::instances::QueryError;
 
-type Client = acadctl_rpc::AcadctlClient<Channel>;
+type DocumentClient = acadctl_rpc::DocumentServiceClient<Channel>;
 
 fn fail(message: String) -> ExitCode {
     eprintln!("acadctl: {message}");
@@ -24,12 +23,12 @@ fn document_line(document: &Document, long: bool) -> String {
     let modified = if document.modified { "*" } else { "-" };
     let mode = if document.read_only { "r" } else { "w" };
     let name = if long {
-        document.path.as_str()
+        document
+            .file_path
+            .as_deref()
+            .unwrap_or(&document.display_name)
     } else {
-        Path::new(&document.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&document.path)
+        &document.display_name
     };
     format!("{}  {modified}  {mode}  {name}", document.id)
 }
@@ -55,8 +54,8 @@ fn query_error_message(error: &QueryError) -> String {
     }
 }
 
-async fn connect(process_id: u32) -> Result<Client, String> {
-    crate::instances::connect(process_id)
+async fn connect_documents(process_id: u32) -> Result<DocumentClient, String> {
+    crate::instances::connect_documents(process_id)
         .await
         .map_err(|error| query_error_message(&error))
 }

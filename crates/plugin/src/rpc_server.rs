@@ -5,13 +5,15 @@ use std::thread::{self, JoinHandle as ThreadJoinHandle};
 use std::time::Duration;
 
 use acadctl_rpc::{
-    Acadctl, AcadctlServer, CloseRequest, CloseResponse, DrawingOutcome as RpcDrawingOutcome,
-    ExecuteClientMessage, ExecuteServerEvent, ExecutionAccepted, ExecutionCancellation,
-    ExecutionCancellationResult, ExecutionCancelled, ExecutionFailure, ExecutionFinished,
-    ExecutionMode as RpcExecutionMode, ExecutionOutcome as RpcExecutionOutcome, ExecutionOutput,
-    ExecutionRequest, ExecutionSuccess, Executor, ExecutorServer, ListRequest, ListResponse,
-    OpenRequest, OpenResponse, SaveRequest, SaveResponse, SourceLocation as RpcSourceLocation,
-    execute_client_message, execute_server_event, execution_outcome,
+    CloseRequest, CloseResponse, DocumentService, DocumentServiceServer,
+    DrawingOutcome as RpcDrawingOutcome, ExecutionAccepted, ExecutionCancelAcknowledgement,
+    ExecutionCancelDisposition, ExecutionCancelled, ExecutionClientMessage,
+    ExecutionFailure as RpcExecutionFailure, ExecutionFinished, ExecutionMode as RpcExecutionMode,
+    ExecutionOutcome as RpcExecutionOutcome, ExecutionOutput, ExecutionRequest,
+    ExecutionServerEvent, ExecutionService, ExecutionServiceServer, ExecutionSuccess, ListRequest,
+    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse,
+    SourceLocation as RpcSourceLocation, execution_client_message, execution_outcome,
+    execution_server_event,
 };
 use futures_util::{Stream, stream};
 use tokio::sync::{mpsc, oneshot};
@@ -19,7 +21,8 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 use tonic::{Request, Response, Status};
 
 use crate::execution::{
-    DrawingOutcome, Execution, ExecutionMode, Failure, Outcome, ValidationError, bounded_diagnostic,
+    DrawingOutcome, Execution, ExecutionFailure, ExecutionMode, ExecutionOutcome,
+    SourceValidationError, bounded_diagnostic,
 };
 use crate::scheduler::{CancelResult, Error as SchedulerError};
 
@@ -44,21 +47,21 @@ impl Server {
     }
 }
 
-struct Service;
+struct DocumentRpc;
 
-struct ExecutionService;
+struct ExecutionRpc;
 
 type ExecuteResponse =
-    Pin<Box<dyn Stream<Item = Result<ExecuteServerEvent, Status>> + Send + 'static>>;
+    Pin<Box<dyn Stream<Item = Result<ExecutionServerEvent, Status>> + Send + 'static>>;
 
 type CompletionFuture =
-    Pin<Box<dyn Future<Output = Result<Outcome, SchedulerError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<ExecutionOutcome, SchedulerError>> + Send + 'static>>;
 
 struct ExecuteResponseState {
     output: crate::execution::output::OutputStream,
     output_done: bool,
     completion: CompletionFuture,
-    control: mpsc::Receiver<Result<ExecutionCancellationResult, Status>>,
+    control: mpsc::Receiver<Result<ExecutionCancelDisposition, Status>>,
     control_open: bool,
     control_task: TokioJoinHandle<()>,
     accepted_sent: bool,
@@ -67,7 +70,7 @@ struct ExecuteResponseState {
 }
 
 #[tonic::async_trait]
-impl Acadctl for Service {
+impl DocumentService for DocumentRpc {
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
         let documents = crate::scheduler::list().map_err(scheduler_error)?;
         Ok(Response::new(ListResponse { documents }))
@@ -107,12 +110,12 @@ impl Acadctl for Service {
 }
 
 #[tonic::async_trait]
-impl Executor for ExecutionService {
+impl ExecutionService for ExecutionRpc {
     type ExecuteStream = ExecuteResponse;
 
     async fn execute(
         &self,
-        request: Request<tonic::Streaming<ExecuteClientMessage>>,
+        request: Request<tonic::Streaming<ExecutionClientMessage>>,
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         let reservation = crate::scheduler::try_reserve_execution()
             .ok_or_else(|| Status::resource_exhausted("Too many live execution streams"))?;
@@ -122,8 +125,8 @@ impl Executor for ExecutionService {
             .map_err(|_| Status::deadline_exceeded("The execution request was not received"))??
             .ok_or_else(|| Status::invalid_argument("The first execution message is required"))?;
         let request = match first.message {
-            Some(execute_client_message::Message::Request(request)) => request,
-            Some(execute_client_message::Message::Cancel(_)) | None => {
+            Some(execution_client_message::Message::Request(request)) => request,
+            Some(execution_client_message::Message::Cancel(_)) | None => {
                 return Err(Status::invalid_argument(
                     "The first execution message must be a request",
                 ));
@@ -182,8 +185,8 @@ impl Executor for ExecutionService {
                 )));
             }
         };
-        let (request_id, output, completion) = admission.into_parts();
-        let (control, control_task) = spawn_control_reader(inbound, request_id);
+        let (job_id, output, completion) = admission.into_parts();
+        let (control, control_task) = spawn_control_reader(inbound, job_id);
         let state = ExecuteResponseState {
             output,
             output_done: false,
@@ -209,13 +212,13 @@ fn execution_response(state: ExecuteResponseState) -> ExecuteResponse {
 }
 
 impl ExecuteResponseState {
-    async fn next_event(&mut self) -> Result<Option<ExecuteServerEvent>, Status> {
+    async fn next_event(&mut self) -> Result<Option<ExecutionServerEvent>, Status> {
         if self.finished {
             return Ok(None);
         }
         if !self.accepted_sent {
             self.accepted_sent = true;
-            return Ok(Some(server_event(execute_server_event::Event::Accepted(
+            return Ok(Some(server_event(execution_server_event::Event::Accepted(
                 ExecutionAccepted {},
             ))));
         }
@@ -232,7 +235,7 @@ impl ExecuteResponseState {
                     chunk = self.output.next_chunk() => {
                         match chunk {
                             Some(text) => return Ok(Some(server_event(
-                                execute_server_event::Event::Output(ExecutionOutput { text }),
+                                execution_server_event::Event::Output(ExecutionOutput { text }),
                             ))),
                             None => self.output_done = true,
                         }
@@ -241,7 +244,7 @@ impl ExecuteResponseState {
             } else {
                 match self.output.next_chunk().await {
                     Some(text) => {
-                        return Ok(Some(server_event(execute_server_event::Event::Output(
+                        return Ok(Some(server_event(execution_server_event::Event::Output(
                             ExecutionOutput { text },
                         ))));
                     }
@@ -269,20 +272,22 @@ impl ExecuteResponseState {
             self.finished = true;
             return Ok(Some(finished_event(match outcome {
                 Ok(outcome) => outcome,
-                Err(error) => Outcome::Failure(scheduler_failure(error)),
+                Err(error) => ExecutionOutcome::Failure(scheduler_failure(error)),
             })));
         }
     }
 
     fn handle_control(
         &mut self,
-        control: Option<Result<ExecutionCancellationResult, Status>>,
-    ) -> Result<Option<ExecuteServerEvent>, Status> {
+        control: Option<Result<ExecutionCancelDisposition, Status>>,
+    ) -> Result<Option<ExecutionServerEvent>, Status> {
         match control {
             Some(Ok(result)) => Ok(Some(server_event(
-                execute_server_event::Event::Cancellation(ExecutionCancellation {
-                    result: result as i32,
-                }),
+                execution_server_event::Event::CancelAcknowledgement(
+                    ExecutionCancelAcknowledgement {
+                        disposition: result as i32,
+                    },
+                ),
             ))),
             Some(Err(status)) => Err(status),
             None => {
@@ -300,15 +305,15 @@ impl Drop for ExecuteResponseState {
 }
 
 fn spawn_control_reader(
-    mut inbound: tonic::Streaming<ExecuteClientMessage>,
-    request_id: u64,
+    mut inbound: tonic::Streaming<ExecutionClientMessage>,
+    job_id: crate::scheduler::MutationJobId,
 ) -> (
-    mpsc::Receiver<Result<ExecutionCancellationResult, Status>>,
+    mpsc::Receiver<Result<ExecutionCancelDisposition, Status>>,
     TokioJoinHandle<()>,
 ) {
     let (sender, receiver) = mpsc::channel(1);
     let task = tokio::spawn(async move {
-        let mut cancellation_result = None;
+        let mut cancel_disposition = None;
         loop {
             let message = match inbound.message().await {
                 Ok(Some(message)) => message,
@@ -320,7 +325,7 @@ fn spawn_control_reader(
             };
             if !matches!(
                 message.message,
-                Some(execute_client_message::Message::Cancel(_))
+                Some(execution_client_message::Message::Cancel(_))
             ) {
                 let _ = sender
                     .send(Err(Status::invalid_argument(
@@ -330,13 +335,13 @@ fn spawn_control_reader(
                 return;
             }
 
-            if cancellation_result.is_some() {
+            if cancel_disposition.is_some() {
                 continue;
             }
-            let result = match crate::scheduler::cancel_execution(request_id) {
-                CancelResult::Accepted => ExecutionCancellationResult::Accepted,
+            let result = match crate::scheduler::cancel_execution(job_id) {
+                CancelResult::Accepted => ExecutionCancelDisposition::Accepted,
                 CancelResult::TooLate | CancelResult::NotFound => {
-                    ExecutionCancellationResult::TooLate
+                    ExecutionCancelDisposition::TooLate
                 }
                 CancelResult::Unavailable => {
                     let _ = sender
@@ -347,7 +352,7 @@ fn spawn_control_reader(
                     return;
                 }
             };
-            cancellation_result = Some(result);
+            cancel_disposition = Some(result);
             if sender.send(Ok(result)).await.is_err() {
                 return;
             }
@@ -358,16 +363,18 @@ fn spawn_control_reader(
 
 fn terminal_response(
     reservation: crate::scheduler::ExecutionReservation,
-    failure: Failure,
+    failure: ExecutionFailure,
 ) -> ExecuteResponse {
-    let event = finished_event(Outcome::Failure(failure));
+    let event = finished_event(ExecutionOutcome::Failure(failure));
     Box::pin(stream::unfold(
         (reservation, Some(event)),
         |(reservation, event)| async move { event.map(|event| (Ok(event), (reservation, None))) },
     ))
 }
 
-fn validate_execution_request(request: ExecutionRequest) -> Result<ExecutionRequest, Failure> {
+fn validate_execution_request(
+    request: ExecutionRequest,
+) -> Result<ExecutionRequest, ExecutionFailure> {
     if !crate::documents::valid_document_id(&request.document_id) {
         return Err(failure("The document ID is invalid"));
     }
@@ -380,17 +387,17 @@ fn validate_execution_request(request: ExecutionRequest) -> Result<ExecutionRequ
     Ok(request)
 }
 
-fn validation_failure(error: ValidationError, source_name: String) -> Failure {
+fn validation_failure(error: SourceValidationError, source_name: String) -> ExecutionFailure {
     match error {
-        ValidationError::SourceTooLarge => failure("The source exceeds the 4 MiB limit"),
-        ValidationError::InvalidUtf8 => failure("The source is not valid UTF-8"),
-        ValidationError::NullCharacter => {
+        SourceValidationError::SourceTooLarge => failure("The source exceeds the 4 MiB limit"),
+        SourceValidationError::InvalidUtf8 => failure("The source is not valid UTF-8"),
+        SourceValidationError::NullCharacter => {
             failure("The source contains U+0000, which AutoLISP cannot represent")
         }
-        ValidationError::ExpectedOneForm { actual } => failure(format!(
+        SourceValidationError::ExpectedOneForm { actual } => failure(format!(
             "eval requires exactly one top-level form; found {actual}"
         )),
-        ValidationError::Scan(error) => Failure {
+        SourceValidationError::Scan(error) => ExecutionFailure {
             message: error.kind.message().to_owned(),
             form_index: None,
             location: Some(crate::execution::SourceLocation {
@@ -403,8 +410,8 @@ fn validation_failure(error: ValidationError, source_name: String) -> Failure {
     }
 }
 
-fn failure(message: impl Into<String>) -> Failure {
-    Failure {
+fn failure(message: impl Into<String>) -> ExecutionFailure {
+    ExecutionFailure {
         message: bounded_diagnostic(message.into()),
         form_index: None,
         location: None,
@@ -412,11 +419,11 @@ fn failure(message: impl Into<String>) -> Failure {
     }
 }
 
-fn scheduler_failure(error: SchedulerError) -> Failure {
+fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
     let drawing_outcome = match &error {
         SchedulerError::ContextCleanupFailed(_)
-        | SchedulerError::ExecutionLeaseFailed(_)
-        | SchedulerError::ExecutionStateCleanupFailed(_)
+        | SchedulerError::ExecutionCleanupFailed(_)
+        | SchedulerError::EvaluatorStateCleanupFailed(_)
         | SchedulerError::ExecutionBridgeFailed(_)
         | SchedulerError::ExecutionNotFinished
         | SchedulerError::NativeStateUnknown
@@ -427,7 +434,7 @@ fn scheduler_failure(error: SchedulerError) -> Failure {
         | SchedulerError::PluginStopping
         | SchedulerError::DocumentNotFound(_)
         | SchedulerError::DocumentGone
-        | SchedulerError::DocumentChanged
+        | SchedulerError::DocumentGenerationChanged
         | SchedulerError::Unnamed(_)
         | SchedulerError::ReadOnly(_)
         | SchedulerError::Dirty(_)
@@ -445,7 +452,7 @@ fn scheduler_failure(error: SchedulerError) -> Failure {
         | SchedulerError::MutationCapacity
         | SchedulerError::ExecutionCapacity => DrawingOutcome::NotStarted,
     };
-    Failure {
+    ExecutionFailure {
         message: bounded_diagnostic(error.to_string()),
         form_index: None,
         location: None,
@@ -453,27 +460,29 @@ fn scheduler_failure(error: SchedulerError) -> Failure {
     }
 }
 
-fn finished_event(outcome: Outcome) -> ExecuteServerEvent {
+fn finished_event(outcome: ExecutionOutcome) -> ExecutionServerEvent {
     let outcome = match outcome {
-        Outcome::Success => execution_outcome::Outcome::Success(ExecutionSuccess {}),
-        Outcome::Cancelled => execution_outcome::Outcome::Cancelled(ExecutionCancelled {}),
-        Outcome::Failure(failure) => execution_outcome::Outcome::Failure(rpc_failure(failure)),
+        ExecutionOutcome::Success => execution_outcome::Outcome::Success(ExecutionSuccess {}),
+        ExecutionOutcome::Cancelled => execution_outcome::Outcome::Cancelled(ExecutionCancelled {}),
+        ExecutionOutcome::Failure(failure) => {
+            execution_outcome::Outcome::Failure(rpc_failure(failure))
+        }
     };
-    server_event(execute_server_event::Event::Finished(ExecutionFinished {
+    server_event(execution_server_event::Event::Finished(ExecutionFinished {
         outcome: Some(RpcExecutionOutcome {
             outcome: Some(outcome),
         }),
     }))
 }
 
-fn rpc_failure(failure: Failure) -> ExecutionFailure {
+fn rpc_failure(failure: ExecutionFailure) -> RpcExecutionFailure {
     let drawing_outcome = match failure.drawing_outcome {
         DrawingOutcome::NotStarted => RpcDrawingOutcome::NotStarted,
         DrawingOutcome::RolledBack => RpcDrawingOutcome::RolledBack,
         DrawingOutcome::Committed => RpcDrawingOutcome::Committed,
         DrawingOutcome::Unknown => RpcDrawingOutcome::Unknown,
     };
-    ExecutionFailure {
+    RpcExecutionFailure {
         message: bounded_diagnostic(failure.message),
         form_index: failure.form_index.map(|index| index as u64),
         location: failure.location.map(|location| RpcSourceLocation {
@@ -485,12 +494,12 @@ fn rpc_failure(failure: Failure) -> ExecutionFailure {
     }
 }
 
-fn server_event(event: execute_server_event::Event) -> ExecuteServerEvent {
-    ExecuteServerEvent { event: Some(event) }
+fn server_event(event: execution_server_event::Event) -> ExecutionServerEvent {
+    ExecutionServerEvent { event: Some(event) }
 }
 
 fn validate_open_path(path: &str) -> Result<(), Status> {
-    if path.len() > acadctl_rpc::MAX_PATH_BYTES {
+    if path.len() > acadctl_rpc::MAX_DRAWING_PATH_BYTES {
         return Err(Status::invalid_argument(
             "The drawing path exceeds the 32 KiB limit",
         ));
@@ -572,7 +581,7 @@ pub fn stop() {
     }
 }
 
-pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentState>) {
+pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
     crate::scheduler::replace_documents(documents);
 }
 
@@ -633,14 +642,14 @@ async fn serve_until_stopped(
         let serving = tonic::transport::Server::builder()
             .max_concurrent_streams(acadctl_rpc::MAX_STREAMS_PER_CONNECTION)
             .add_service(
-                AcadctlServer::new(Service)
-                    .max_decoding_message_size(acadctl_rpc::MAX_CONTROL_MESSAGE_BYTES)
-                    .max_encoding_message_size(acadctl_rpc::MAX_CONTROL_RESPONSE_BYTES),
+                DocumentServiceServer::new(DocumentRpc)
+                    .max_decoding_message_size(acadctl_rpc::MAX_DOCUMENT_REQUEST_BYTES)
+                    .max_encoding_message_size(acadctl_rpc::MAX_DOCUMENT_RESPONSE_BYTES),
             )
             .add_service(
-                ExecutorServer::new(ExecutionService)
-                    .max_decoding_message_size(acadctl_rpc::MAX_EXECUTE_MESSAGE_BYTES)
-                    .max_encoding_message_size(acadctl_rpc::MAX_EXECUTE_RESPONSE_BYTES),
+                ExecutionServiceServer::new(ExecutionRpc)
+                    .max_decoding_message_size(acadctl_rpc::MAX_EXECUTION_REQUEST_BYTES)
+                    .max_encoding_message_size(acadctl_rpc::MAX_EXECUTION_RESPONSE_BYTES),
             )
             .serve_with_incoming(connections);
         tokio::pin!(serving);
@@ -672,16 +681,16 @@ mod tests {
     fn reports_documents_and_stops_promptly() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
         replace_documents(vec![
-            crate::ffi::NativeDocumentState {
-                token: 1,
+            crate::ffi::NativeDocumentSnapshot {
+                document_token: 1,
                 database_token: 101,
                 name: "/tmp/house.dwg".into(),
                 named: true,
                 modified: false,
                 read_only: false,
             },
-            crate::ffi::NativeDocumentState {
-                token: 2,
+            crate::ffi::NativeDocumentSnapshot {
+                document_token: 2,
                 database_token: 102,
                 name: "/tmp/site.dwg".into(),
                 named: true,
@@ -696,16 +705,26 @@ mod tests {
             .unwrap();
 
         let client = runtime.block_on(async {
-            let mut client = acadctl_rpc::connect(std::process::id()).await.unwrap();
+            let mut client = acadctl_rpc::connect_documents(std::process::id())
+                .await
+                .unwrap();
             let listed = client.list(ListRequest {}).await.unwrap().into_inner();
             assert_eq!(listed.documents.len(), 2);
             assert_eq!(listed.documents[0].id.len(), 6);
-            assert_eq!(listed.documents[0].path, "/tmp/house.dwg");
+            assert_eq!(listed.documents[0].display_name, "house.dwg");
+            assert_eq!(
+                listed.documents[0].file_path.as_deref(),
+                Some("/tmp/house.dwg")
+            );
             assert!(!listed.documents[0].modified);
             assert!(!listed.documents[0].read_only);
             assert_eq!(listed.documents[1].id.len(), 6);
             assert_ne!(listed.documents[0].id, listed.documents[1].id);
-            assert_eq!(listed.documents[1].path, "/tmp/site.dwg");
+            assert_eq!(listed.documents[1].display_name, "site.dwg");
+            assert_eq!(
+                listed.documents[1].file_path.as_deref(),
+                Some("/tmp/site.dwg")
+            );
             assert!(listed.documents[1].modified);
             assert!(listed.documents[1].read_only);
 
@@ -753,8 +772,8 @@ mod tests {
     #[test]
     fn execute_transport_preserves_the_four_mib_source_boundary() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-        replace_documents(vec![crate::ffi::NativeDocumentState {
-            token: 1,
+        replace_documents(vec![crate::ffi::NativeDocumentSnapshot {
+            document_token: 1,
             database_token: 101,
             name: "/tmp/house.dwg".into(),
             named: true,
@@ -769,7 +788,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut client = acadctl_rpc::connect_executor(std::process::id())
+            let mut client = acadctl_rpc::connect_execution(std::process::id())
                 .await
                 .unwrap();
             execute_and_cancel(
@@ -794,7 +813,7 @@ mod tests {
                 .unwrap()
                 .into_inner();
             let event = response.message().await.unwrap().unwrap();
-            let Some(execute_server_event::Event::Finished(finished)) = event.event else {
+            let Some(execution_server_event::Event::Finished(finished)) = event.event else {
                 panic!("oversized source must fail before acceptance");
             };
             let Some(execution_outcome::Outcome::Failure(failure)) =
@@ -825,8 +844,8 @@ mod tests {
     #[test]
     fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-        replace_documents(vec![crate::ffi::NativeDocumentState {
-            token: 1,
+        replace_documents(vec![crate::ffi::NativeDocumentSnapshot {
+            document_token: 1,
             database_token: 101,
             name: "/tmp/house.dwg".into(),
             named: true,
@@ -841,7 +860,7 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut client = acadctl_rpc::connect_executor(std::process::id())
+            let mut client = acadctl_rpc::connect_execution(std::process::id())
                 .await
                 .unwrap();
             let (sender, receiver) = mpsc::channel(1);
@@ -855,25 +874,25 @@ mod tests {
             let mut response = client.execute(outbound).await.unwrap().into_inner();
             assert!(matches!(
                 response.message().await.unwrap().unwrap().event,
-                Some(execute_server_event::Event::Accepted(_))
+                Some(execution_server_event::Event::Accepted(_))
             ));
             drop(response);
             drop(sender);
             tokio::time::sleep(Duration::from_millis(20)).await;
 
-            let action = crate::scheduler::take();
+            let action = crate::scheduler::take_native_action();
             assert_eq!(action.kind, crate::ffi::NativeActionKind::RunExecution);
             assert_eq!(
-                crate::scheduler::take_execution_step(action.request_id).kind(),
-                crate::execution::StepKind::Begin
+                crate::scheduler::take_execution_step(action.job_id).kind(),
+                crate::execution::ExecutionStepKind::BeginUndoGroup
             );
             assert!(crate::scheduler::complete_execution_step(
-                action.request_id,
+                action.job_id,
                 successful_step()
             ));
             assert_eq!(
-                crate::scheduler::take_execution_step(action.request_id).kind(),
-                crate::execution::StepKind::Form
+                crate::scheduler::take_execution_step(action.job_id).kind(),
+                crate::execution::ExecutionStepKind::EvaluateForm
             );
             let mut writer = crate::scheduler::begin_println(1, 101);
             assert_eq!(
@@ -885,27 +904,27 @@ mod tests {
                 crate::execution::value_bridge::WriteResult::Disconnected
             );
             assert_eq!(
-                crate::scheduler::cancel_execution(action.request_id),
+                crate::scheduler::cancel_execution(action.job_id),
                 CancelResult::Accepted
             );
             assert!(crate::scheduler::complete_execution_step(
-                action.request_id,
+                action.job_id,
                 successful_step()
             ));
             assert_eq!(
-                crate::scheduler::take_execution_step(action.request_id).kind(),
-                crate::execution::StepKind::Rollback
+                crate::scheduler::take_execution_step(action.job_id).kind(),
+                crate::execution::ExecutionStepKind::RollbackUndoGroup
             );
             assert!(crate::scheduler::complete_execution_step(
-                action.request_id,
+                action.job_id,
                 successful_step()
             ));
             assert_eq!(
-                crate::scheduler::take_execution_step(action.request_id).kind(),
-                crate::execution::StepKind::Done
+                crate::scheduler::take_execution_step(action.job_id).kind(),
+                crate::execution::ExecutionStepKind::Done
             );
-            crate::scheduler::complete(
-                action.request_id,
+            crate::scheduler::complete_native_action(
+                action.job_id,
                 crate::ffi::NativeActionResult {
                     kind: crate::ffi::NativeActionResultKind::Success,
                     native_status: 0,
@@ -918,7 +937,7 @@ mod tests {
     }
 
     async fn execute_and_cancel(
-        client: &mut acadctl_rpc::ExecutorClient<tonic::transport::Channel>,
+        client: &mut acadctl_rpc::ExecutionServiceClient<tonic::transport::Channel>,
         document_id: &str,
         source: Bytes,
     ) {
@@ -934,64 +953,66 @@ mod tests {
         let accepted = response.message().await.unwrap().unwrap();
         assert!(matches!(
             accepted.event,
-            Some(execute_server_event::Event::Accepted(_))
+            Some(execution_server_event::Event::Accepted(_))
         ));
 
         for _ in 0..2 {
             sender
-                .send(ExecuteClientMessage {
-                    message: Some(execute_client_message::Message::Cancel(
-                        acadctl_rpc::ExecutionCancel {},
+                .send(ExecutionClientMessage {
+                    message: Some(execution_client_message::Message::Cancel(
+                        acadctl_rpc::ExecutionCancelRequest {},
                     )),
                 })
                 .await
                 .unwrap();
         }
-        let mut cancellation_count = 0;
+        let mut cancel_acknowledgement_count = 0;
         let mut finished_seen = false;
         while let Some(event) = response.message().await.unwrap() {
             match event.event {
-                Some(execute_server_event::Event::Cancellation(cancellation)) => {
+                Some(execution_server_event::Event::CancelAcknowledgement(acknowledgement)) => {
                     assert_eq!(
-                        cancellation.result,
-                        ExecutionCancellationResult::Accepted as i32
+                        acknowledgement.disposition,
+                        ExecutionCancelDisposition::Accepted as i32
                     );
-                    cancellation_count += 1;
+                    cancel_acknowledgement_count += 1;
                 }
-                Some(execute_server_event::Event::Finished(finished)) => {
+                Some(execution_server_event::Event::Finished(finished)) => {
                     assert!(matches!(
                         finished.outcome.unwrap().outcome,
                         Some(execution_outcome::Outcome::Cancelled(_))
                     ));
                     finished_seen = true;
                 }
-                Some(execute_server_event::Event::Accepted(_))
-                | Some(execute_server_event::Event::Output(_))
+                Some(execution_server_event::Event::Accepted(_))
+                | Some(execution_server_event::Event::Output(_))
                 | None => panic!("unexpected execution event"),
             }
         }
-        assert_eq!(cancellation_count, 1);
+        assert_eq!(cancel_acknowledgement_count, 1);
         assert!(finished_seen);
     }
 
-    fn execution_request(document_id: &str, source: Bytes) -> ExecuteClientMessage {
-        ExecuteClientMessage {
-            message: Some(execute_client_message::Message::Request(ExecutionRequest {
-                document_id: document_id.into(),
-                mode: RpcExecutionMode::Exec as i32,
-                source_name: "<stdin>".into(),
-                source,
-            })),
+    fn execution_request(document_id: &str, source: Bytes) -> ExecutionClientMessage {
+        ExecutionClientMessage {
+            message: Some(execution_client_message::Message::Request(
+                ExecutionRequest {
+                    document_id: document_id.into(),
+                    mode: RpcExecutionMode::Exec as i32,
+                    source_name: "<stdin>".into(),
+                    source,
+                },
+            )),
         }
     }
 
-    fn successful_step() -> crate::execution::StepResult {
-        crate::execution::StepResult {
-            kind: crate::execution::StepResultKind::Success,
+    fn successful_step() -> crate::execution::ExecutionStepResult {
+        crate::execution::ExecutionStepResult {
+            kind: crate::execution::ExecutionStepResultKind::Success,
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            cleanup_status: 0,
+            evaluator_state_cleanup_status: 0,
         }
     }
 }

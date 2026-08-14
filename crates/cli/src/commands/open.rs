@@ -30,7 +30,7 @@ pub async fn run(path: PathBuf, process_id: Option<u32>) -> ExitCode {
             }
         }
     };
-    let mut client = match super::connect(process_id).await {
+    let mut client = match super::connect_documents(process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };

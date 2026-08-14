@@ -173,9 +173,17 @@ mod tests {
     }
 
     fn document(id: &str, path: &str, modified: bool, read_only: bool) -> Document {
+        let file_path = path.contains('/').then(|| path.to_owned());
+        let display_name = file_path
+            .as_deref()
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or(path)
+            .to_owned();
         Document {
             id: id.into(),
-            path: path.into(),
+            display_name,
+            file_path,
             modified,
             read_only,
         }

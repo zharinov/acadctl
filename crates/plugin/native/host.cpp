@@ -39,7 +39,7 @@ public:
 
   void stop();
 
-  void processPendingActions();
+  void processNextAction();
 
   void setLispFunctionsDefined(AcApDocument *document, bool defined);
 
@@ -56,13 +56,13 @@ private:
 
   acadctl::NativeActionResult runExecution(AcApDocument *document,
                                             std::size_t databaseToken,
-                                            std::uint64_t executionId);
+                                            std::uint64_t jobId);
 
-  void publishDocuments();
+  void publishDocumentSnapshot();
 
-  void syncDocuments();
+  void refreshDocumentSnapshot();
 
-  void syncDirtyDocuments();
+  void refreshDocumentSnapshotIfStale();
 
   void refreshSubscription(DocumentSubscription &subscription);
 
@@ -73,28 +73,28 @@ private:
   class DatabaseReactor final : public AcDbDatabaseReactor {
   public:
     void objectAppended(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_documents_dirty();
+      acadctl::mark_document_snapshot_stale();
     }
 
     void objectUnAppended(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_documents_dirty();
+      acadctl::mark_document_snapshot_stale();
     }
 
     void objectReAppended(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_documents_dirty();
+      acadctl::mark_document_snapshot_stale();
     }
 
     void objectModified(const AcDbDatabase *, const AcDbObject *) override {
-      acadctl::mark_documents_dirty();
+      acadctl::mark_document_snapshot_stale();
     }
 
     void objectErased(const AcDbDatabase *, const AcDbObject *, bool) override {
-      acadctl::mark_documents_dirty();
+      acadctl::mark_document_snapshot_stale();
     }
 
     void headerSysVarChanged(const AcDbDatabase *, const ACHAR *,
                              bool) override {
-      acadctl::mark_documents_dirty();
+      acadctl::mark_document_snapshot_stale();
     }
   };
 
@@ -104,22 +104,22 @@ private:
 
     void documentCreated(AcApDocument *document) override {
       bridge_.subscribe(document);
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
       acadctl::native_state_may_be_ready();
     }
 
     void documentToBeDestroyed(AcApDocument *document) override {
       bridge_.unsubscribe(document);
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
       acadctl::native_state_may_be_ready();
     }
 
     void documentTitleUpdated(AcApDocument *) override {
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
     }
 
     void documentActivated(AcApDocument *) override {
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
       acadctl::native_state_may_be_ready();
     }
 
@@ -132,42 +132,42 @@ private:
     explicit EditorReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
 
     void commandEnded(const ACHAR *) override {
-      bridge_.syncDirtyDocuments();
+      bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void commandCancelled(const ACHAR *) override {
-      bridge_.syncDirtyDocuments();
+      bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void commandFailed(const ACHAR *) override {
-      bridge_.syncDirtyDocuments();
+      bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void lispEnded() override {
-      bridge_.syncDirtyDocuments();
+      bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void lispCancelled() override {
-      bridge_.syncDirtyDocuments();
+      bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void saveComplete(AcDbDatabase *, const ACHAR *) override {
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
     }
 
-    void abortSave(AcDbDatabase *) override { bridge_.syncDocuments(); }
+    void abortSave(AcDbDatabase *) override { bridge_.refreshDocumentSnapshot(); }
 
     void curDocOpenUpgraded(AcDbDatabase *, const CAdUiPathname &) override {
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
     }
 
     void curDocOpenDowngraded(AcDbDatabase *, const CAdUiPathname &) override {
-      bridge_.syncDocuments();
+      bridge_.refreshDocumentSnapshot();
     }
 
   private:
@@ -720,7 +720,7 @@ ReservedStateStepResult finishEvaluation(
   }
   const bool reservedStateStillRetained =
       clearEvaluationSymbols() != RTNORM;
-  result.cleanup_status = cleanupStatus;
+  result.evaluator_state_cleanup_status = cleanupStatus;
   return {std::move(result), reservedStateStillRetained};
 }
 
@@ -866,17 +866,17 @@ ReservedStateStepResult finishEvalValueEmission(
   }
   const bool reservedStateStillRetained =
       clearEvaluationSymbols() != RTNORM;
-  result.cleanup_status = cleanupStatus;
+  result.evaluator_state_cleanup_status = cleanupStatus;
   return {std::move(result), reservedStateStillRetained};
 }
 
 ReservedStateStepResult emitEvalValue(
-    std::uint64_t executionId, AcApDocument *document,
+    std::uint64_t jobId, AcApDocument *document,
     std::size_t databaseToken, AcApDocument *expectedActive,
     const AcString &visitorText) {
   rust::Box<acadctl::NativeValueWriter> writer =
       acadctl::begin_eval_value(
-          executionId,
+          jobId,
           static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
           databaseToken);
 
@@ -1026,9 +1026,9 @@ int clearReservedStateIfSafe(AcApDocument *document,
 }
 
 acadctl::NativeActionResult abandonLostExecutionContext(
-    std::uint64_t executionId, AcApDocument *document,
+    std::uint64_t jobId, AcApDocument *document,
     std::size_t databaseToken, AcApDocument *expectedActive,
-    bool leaseMayBeOpen,
+    bool undoGroupMayBeOpen,
     bool &reservedStateMayBeRetained) {
   const int cleanupStatus = clearReservedStateIfSafe(
       document, databaseToken, expectedActive, reservedStateMayBeRetained);
@@ -1039,33 +1039,33 @@ acadctl::NativeActionResult abandonLostExecutionContext(
                 ? "the target document context changed and its retained AutoLISP value could not be cleared safely"
                 : "the target document context changed and retained-value cleanup failed";
   const bool quarantine =
-      leaseMayBeOpen || reservedStateMayBeRetained;
+      undoGroupMayBeOpen || reservedStateMayBeRetained;
   if (!acadctl::abandon_execution(
-          executionId,
+          jobId,
           stepNativeFailure(cleanupStatus == RTNORM ? RTERROR : cleanupStatus,
                             detail))) {
     return bridgeFailure(
         quarantine
-            ? acadctl::NativeActionResultKind::ExecutionLeaseFailed
+            ? acadctl::NativeActionResultKind::ExecutionCleanupFailed
             : acadctl::NativeActionResultKind::ExecutionBridgeFailed,
         RTERROR,
         "Rust could not terminalize an execution after context loss");
   }
   return quarantine
              ? bridgeFailure(
-                   acadctl::NativeActionResultKind::ExecutionLeaseFailed,
+                   acadctl::NativeActionResultKind::ExecutionCleanupFailed,
                    RTERROR,
                    "context loss left native execution state unproved")
              : result(acadctl::NativeActionResultKind::Success);
 }
 
-acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
+acadctl::NativeActionResult runExecutionSteps(std::uint64_t jobId,
                                               AcApDocument *document,
                                               std::size_t databaseToken,
                                               AcApDocument *expectedActive) {
   UndoGroupState undoGroup = UndoGroupState::Inactive;
   bool ownedGroupStarted = false;
-  bool ownedLeaseOpen = false;
+  bool undoGroupMayBeOpen = false;
   bool formAttempted = false;
   bool reservedStateMayBeRetained = false;
   const rust::Str evaluator = acadctl::execution_evaluator_source();
@@ -1079,12 +1079,12 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
   while (true) {
     if (!matchesExecutionContext(document, databaseToken, expectedActive)) {
       return abandonLostExecutionContext(
-          executionId, document, databaseToken, expectedActive,
-          ownedLeaseOpen,
+          jobId, document, databaseToken, expectedActive,
+          undoGroupMayBeOpen,
           reservedStateMayBeRetained);
     }
     rust::Box<acadctl::NativeExecutionStep> step =
-        acadctl::take_execution_step(executionId);
+        acadctl::take_execution_step(jobId);
     const acadctl::NativeExecutionStepKind kind =
         acadctl::execution_step_kind(*step);
     if (kind == acadctl::NativeExecutionStepKind::Done) {
@@ -1096,11 +1096,11 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
       }
       if (undoGroup == UndoGroupState::Unknown) {
         acadctl::abandon_execution(
-            executionId,
+            jobId,
             stepNativeFailure(
                 RTERROR, "the execution ended with unknown undo-group state"));
         return bridgeFailure(
-            acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+            acadctl::NativeActionResultKind::ExecutionCleanupFailed, RTERROR,
             "the execution ended with unknown undo-group state");
       }
       if (undoGroup == UndoGroupState::Active) {
@@ -1110,7 +1110,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
                 : runUndoCommand(ACRX_T("_End"),
                                  UndoGroupState::Inactive);
         undoGroup = cleanup.state;
-        ownedLeaseOpen = undoGroup != UndoGroupState::Inactive;
+        undoGroupMayBeOpen = undoGroup != UndoGroupState::Inactive;
         if (formAttempted ||
             cleanup.result.kind !=
                 acadctl::NativeExecutionStepResultKind::Success) {
@@ -1121,25 +1121,25 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
                         RTERROR,
                         "an unexpected open undo group was rolled back")
                   : std::move(cleanup.result);
-          if (!acadctl::abandon_execution(executionId,
+          if (!acadctl::abandon_execution(jobId,
                                            std::move(terminalFailure))) {
             return bridgeFailure(
-                ownedLeaseOpen
-                    ? acadctl::NativeActionResultKind::ExecutionLeaseFailed
+                undoGroupMayBeOpen
+                    ? acadctl::NativeActionResultKind::ExecutionCleanupFailed
                     : acadctl::NativeActionResultKind::ExecutionBridgeFailed,
                 RTERROR,
                 "Rust could not record emergency undo-group cleanup");
           }
         }
-        if (ownedLeaseOpen) {
+        if (undoGroupMayBeOpen) {
           return bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+              acadctl::NativeActionResultKind::ExecutionCleanupFailed, RTERROR,
               "the owned undo group could not be closed");
         }
       }
       if (reservedStateMayBeRetained) {
         return bridgeFailure(
-            acadctl::NativeActionResultKind::ExecutionStateCleanupFailed,
+            acadctl::NativeActionResultKind::EvaluatorStateCleanupFailed,
             reservedStateCleanupStatus == RTNORM ? RTERROR
                                                   : reservedStateCleanupStatus,
             "reserved AutoLISP evaluator state could not be cleared");
@@ -1153,7 +1153,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
             reservedStateMayBeRetained);
         if (cleanupStatus != RTNORM) {
           acadctl::abandon_execution(
-              executionId,
+              jobId,
               stepNativeFailure(
                   cleanupStatus,
                   "an invalid execution step left a retained AutoLISP value"));
@@ -1161,7 +1161,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
       }
       if (undoGroup == UndoGroupState::Unknown) {
         return bridgeFailure(
-            acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+            acadctl::NativeActionResultKind::ExecutionCleanupFailed, RTERROR,
             "Rust returned an invalid step while undo-group state was unknown");
       }
       if (undoGroup == UndoGroupState::Active) {
@@ -1172,13 +1172,13 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
                                  UndoGroupState::Inactive);
         if (cleanup.state != UndoGroupState::Inactive) {
           return bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+              acadctl::NativeActionResultKind::ExecutionCleanupFailed, RTERROR,
               "an invalid execution step left the undo group open");
         }
       }
       return bridgeFailure(
           reservedStateMayBeRetained
-              ? acadctl::NativeActionResultKind::ExecutionLeaseFailed
+              ? acadctl::NativeActionResultKind::ExecutionCleanupFailed
               : acadctl::NativeActionResultKind::ExecutionBridgeFailed,
           RTERROR,
           "Rust returned an invalid execution step");
@@ -1187,12 +1187,12 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
     acadctl::NativeExecutionStepResult stepResult = stepSuccess();
     UndoCommandResult undoTransition{stepSuccess(), undoGroup};
     switch (kind) {
-    case acadctl::NativeExecutionStepKind::Begin:
+    case acadctl::NativeExecutionStepKind::BeginUndoGroup:
       undoTransition =
           runUndoCommand(ACRX_T("_Begin"), UndoGroupState::Active);
       stepResult = std::move(undoTransition.result);
       break;
-    case acadctl::NativeExecutionStepKind::Form:
+    case acadctl::NativeExecutionStepKind::EvaluateForm:
       formAttempted = true;
       {
         ReservedStateStepResult evaluation = evaluateForm(
@@ -1203,20 +1203,20 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
         reservedStateMayBeRetained = evaluation.reservedStateRetained;
       }
       break;
-    case acadctl::NativeExecutionStepKind::Commit:
+    case acadctl::NativeExecutionStepKind::CommitUndoGroup:
       undoTransition =
           runUndoCommand(ACRX_T("_End"), UndoGroupState::Inactive);
       stepResult = std::move(undoTransition.result);
       break;
-    case acadctl::NativeExecutionStepKind::EmitValue: {
+    case acadctl::NativeExecutionStepKind::EmitEvalValue: {
       ReservedStateStepResult emission = emitEvalValue(
-          executionId, document, databaseToken, expectedActive,
+          jobId, document, databaseToken, expectedActive,
           valueVisitorText);
       stepResult = std::move(emission.result);
       reservedStateMayBeRetained = emission.reservedStateRetained;
       break;
     }
-    case acadctl::NativeExecutionStepKind::ClearValue: {
+    case acadctl::NativeExecutionStepKind::ClearRetainedEvalValue: {
       const int cleanupStatus = clearEvaluationSymbols();
       stepResult = cleanupStatus == RTNORM
                        ? stepSuccess()
@@ -1228,7 +1228,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
       }
       break;
     }
-    case acadctl::NativeExecutionStepKind::Abort:
+    case acadctl::NativeExecutionStepKind::CloseEmptyUndoGroup:
       if (formAttempted) {
         stepResult = stepNativeFailure(
             RTERROR,
@@ -1239,7 +1239,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
         stepResult = std::move(undoTransition.result);
       }
       break;
-    case acadctl::NativeExecutionStepKind::Rollback:
+    case acadctl::NativeExecutionStepKind::RollbackUndoGroup:
       undoTransition = rollbackUndoGroup(undoGroup, ownedGroupStarted);
       stepResult = std::move(undoTransition.result);
       break;
@@ -1249,15 +1249,15 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
     }
     if (!matchesExecutionContext(document, databaseToken, expectedActive)) {
       return abandonLostExecutionContext(
-          executionId, document, databaseToken, expectedActive,
-          ownedLeaseOpen ||
-              kind == acadctl::NativeExecutionStepKind::Begin,
+          jobId, document, databaseToken, expectedActive,
+          undoGroupMayBeOpen ||
+              kind == acadctl::NativeExecutionStepKind::BeginUndoGroup,
           reservedStateMayBeRetained);
     }
-    if (kind == acadctl::NativeExecutionStepKind::Form) {
+    if (kind == acadctl::NativeExecutionStepKind::EvaluateForm) {
       int observationStatus = RTERROR;
       undoGroup = observeUndoGroup(observationStatus);
-      ownedLeaseOpen = undoGroup != UndoGroupState::Inactive;
+      undoGroupMayBeOpen = undoGroup != UndoGroupState::Inactive;
       if (stepResult.kind ==
               acadctl::NativeExecutionStepResultKind::Success &&
           undoGroup != UndoGroupState::Active) {
@@ -1265,17 +1265,17 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
             undoGroup == UndoGroupState::Unknown ? observationStatus
                                                  : RTERROR,
             "the owned undo group changed during AutoLISP evaluation");
-        observationFailure.cleanup_status = stepResult.cleanup_status;
+        observationFailure.evaluator_state_cleanup_status = stepResult.evaluator_state_cleanup_status;
         stepResult = std::move(observationFailure);
       }
     } else {
       undoGroup = undoTransition.state;
-      if (kind == acadctl::NativeExecutionStepKind::Begin) {
+      if (kind == acadctl::NativeExecutionStepKind::BeginUndoGroup) {
         ownedGroupStarted = undoGroup != UndoGroupState::Inactive;
       }
-      ownedLeaseOpen = undoGroup != UndoGroupState::Inactive;
+      undoGroupMayBeOpen = undoGroup != UndoGroupState::Inactive;
     }
-    if (!acadctl::complete_execution_step(executionId,
+    if (!acadctl::complete_execution_step(jobId,
                                            std::move(stepResult))) {
       if (reservedStateMayBeRetained) {
         const int cleanupStatus = clearReservedStateIfSafe(
@@ -1283,7 +1283,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
             reservedStateMayBeRetained);
         if (cleanupStatus != RTNORM) {
           acadctl::abandon_execution(
-              executionId,
+              jobId,
               stepNativeFailure(
                   cleanupStatus,
                   "a rejected execution result left a retained AutoLISP value"));
@@ -1291,7 +1291,7 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
       }
       if (undoGroup == UndoGroupState::Unknown) {
         return bridgeFailure(
-            acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+            acadctl::NativeActionResultKind::ExecutionCleanupFailed, RTERROR,
             "Rust rejected a result while undo-group state was unknown");
       }
       if (undoGroup == UndoGroupState::Active) {
@@ -1302,13 +1302,13 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
                                  UndoGroupState::Inactive);
         if (cleanup.state != UndoGroupState::Inactive) {
           return bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+              acadctl::NativeActionResultKind::ExecutionCleanupFailed, RTERROR,
               "Rust rejected a result and the undo group stayed open");
         }
       }
       return bridgeFailure(
           reservedStateMayBeRetained
-              ? acadctl::NativeActionResultKind::ExecutionLeaseFailed
+              ? acadctl::NativeActionResultKind::ExecutionCleanupFailed
               : acadctl::NativeActionResultKind::ExecutionBridgeFailed,
           RTERROR,
           "Rust rejected an execution step result");
@@ -1340,7 +1340,7 @@ void ObjectArxBridge::start() {
     }
     iterator->step();
   }
-  syncDocuments();
+  refreshDocumentSnapshot();
 }
 
 void ObjectArxBridge::stop() {
@@ -1355,7 +1355,7 @@ void ObjectArxBridge::stop() {
   subscriptions_.clear();
 }
 
-void ObjectArxBridge::processPendingActions() {
+void ObjectArxBridge::processNextAction() {
   acadctl::NativeAction action = acadctl::take_native_action();
   if (action.kind == acadctl::NativeActionKind::None) {
     scheduleNextNativeAction();
@@ -1373,7 +1373,7 @@ void ObjectArxBridge::processPendingActions() {
       actionResult =
           matchesDatabase(target, action.database_token)
               ? save(target)
-              : result(acadctl::NativeActionResultKind::DocumentChanged);
+              : result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
     } else {
       actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
     }
@@ -1383,7 +1383,7 @@ void ObjectArxBridge::processPendingActions() {
       actionResult =
           matchesDatabase(target, action.database_token)
               ? close(target, action.discard)
-              : result(acadctl::NativeActionResultKind::DocumentChanged);
+              : result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
     } else {
       actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
     }
@@ -1392,8 +1392,8 @@ void ObjectArxBridge::processPendingActions() {
     if (AcApDocument *target = document(action.document_token)) {
       actionResult =
           matchesDatabase(target, action.database_token)
-              ? runExecution(target, action.database_token, action.request_id)
-              : result(acadctl::NativeActionResultKind::DocumentChanged);
+              ? runExecution(target, action.database_token, action.job_id)
+              : result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
     } else {
       actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
     }
@@ -1402,8 +1402,8 @@ void ObjectArxBridge::processPendingActions() {
     return;
   }
 
-  syncDocuments();
-  acadctl::complete_native_action(action.request_id, std::move(actionResult));
+  refreshDocumentSnapshot();
+  acadctl::complete_native_action(action.job_id, std::move(actionResult));
   scheduleNextNativeAction();
 }
 
@@ -1544,7 +1544,7 @@ acadctl::NativeActionResult ObjectArxBridge::close(AcApDocument *document,
 acadctl::NativeActionResult
 ObjectArxBridge::runExecution(AcApDocument *document,
                               std::size_t databaseToken,
-                              std::uint64_t executionId) {
+                              std::uint64_t jobId) {
   if (!lispFunctionsDefined(document)) {
     return bridgeFailure(
         acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
@@ -1592,7 +1592,7 @@ ObjectArxBridge::runExecution(AcApDocument *document,
         Acad::eInvalidContext);
   } else if (!matchesDatabase(document, databaseToken)) {
     executionResult =
-        result(acadctl::NativeActionResultKind::DocumentChanged);
+        result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
   } else if (!document->isQuiescent()) {
     executionResult = result(acadctl::NativeActionResultKind::NotQuiescent);
   } else {
@@ -1614,7 +1614,7 @@ ObjectArxBridge::runExecution(AcApDocument *document,
             acadctl::NativeActionResultKind::ExecutionBridgeFailed,
             undoStatus, "could not read AutoCAD's undo state");
       } else {
-        executionResult = runExecutionSteps(executionId, document,
+        executionResult = runExecutionSteps(jobId, document,
                                             databaseToken, previousActive);
       }
     }
@@ -1652,8 +1652,8 @@ ObjectArxBridge::runExecution(AcApDocument *document,
   return executionResult;
 }
 
-void ObjectArxBridge::publishDocuments() {
-  rust::Vec<acadctl::NativeDocumentState> states;
+void ObjectArxBridge::publishDocumentSnapshot() {
+  rust::Vec<acadctl::NativeDocumentSnapshot> states;
   for (DocumentSubscription &subscription : subscriptions_) {
     refreshSubscription(subscription);
     if (!subscription.database) {
@@ -1663,7 +1663,7 @@ void ObjectArxBridge::publishDocuments() {
     AcApDocument *document = subscription.document;
     const bool named = document->isNamedDrawing();
     const AcString name(named ? document->fileName() : document->docTitle());
-    states.push_back(acadctl::NativeDocumentState{
+    states.push_back(acadctl::NativeDocumentSnapshot{
         static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
         static_cast<std::size_t>(
             reinterpret_cast<std::uintptr_t>(subscription.database)),
@@ -1676,17 +1676,17 @@ void ObjectArxBridge::publishDocuments() {
   acadctl::replace_documents(std::move(states));
 }
 
-void ObjectArxBridge::syncDocuments() {
-  acadctl::take_documents_dirty();
-  publishDocuments();
+void ObjectArxBridge::refreshDocumentSnapshot() {
+  acadctl::take_document_snapshot_stale();
+  publishDocumentSnapshot();
 }
 
-void ObjectArxBridge::syncDirtyDocuments() {
-  if (!acadctl::take_documents_dirty()) {
+void ObjectArxBridge::refreshDocumentSnapshotIfStale() {
+  if (!acadctl::take_document_snapshot_stale()) {
     return;
   }
 
-  publishDocuments();
+  publishDocumentSnapshot();
 }
 
 void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
@@ -1737,9 +1737,9 @@ void ObjectArxBridge::unsubscribe(AcApDocument *document) {
 
 std::unique_ptr<ObjectArxBridge> objectArxBridge;
 
-void processPendingActions(void *) {
+void processNextAction(void *) {
   if (objectArxBridge) {
-    objectArxBridge->processPendingActions();
+    objectArxBridge->processNextAction();
   }
 }
 
@@ -1747,7 +1747,7 @@ void processPendingActions(void *) {
 
 extern "C" int acadctl_wake_native_actions() {
   return static_cast<int>(acDocManager->beginExecuteInApplicationContext(
-      processPendingActions, nullptr));
+      processNextAction, nullptr));
 }
 
 extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,

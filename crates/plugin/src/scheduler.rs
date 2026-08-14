@@ -11,17 +11,20 @@ use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
 use crate::execution::output::{OutputSink, OutputStream};
 use crate::execution::value_bridge::NativeValueWriter;
 use crate::execution::{
-    Execution, NativeExecutionStep, Outcome as ExecutionOutcome, StepResult, bound_diagnostic,
+    Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep, bound_diagnostic,
 };
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
 
-static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
-static SCHEDULER: LazyLock<Mutex<Scheduler>> = LazyLock::new(|| Mutex::new(Scheduler::new()));
+static SCHEDULER: LazyLock<Mutex<MutationScheduler>> =
+    LazyLock::new(|| Mutex::new(MutationScheduler::new()));
 static TIMERS_CHANGED: Notify = Notify::const_new();
 
-pub const EXECUTION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
-pub const MAX_DURABLE_MUTATIONS: usize = 32;
+pub(crate) type MutationJobId = u64;
+
+pub const EXECUTION_START_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_MUTATION_JOBS: usize = 32;
 pub const MAX_ADMITTED_EXECUTIONS: usize = 8;
 pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(50);
@@ -30,20 +33,20 @@ const BUSY_RETRY_MAX: Duration = Duration::from_millis(500);
 #[cfg(test)]
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-struct Scheduler {
+struct MutationScheduler {
     documents: DocumentRegistry,
-    pending: VecDeque<Job>,
-    active: Option<Job>,
+    pending: VecDeque<MutationJob>,
+    active: Option<MutationJob>,
     wake_pending: bool,
     stopping: bool,
     quarantined: bool,
 }
 
-struct Job {
-    request_id: u64,
+struct MutationJob {
+    job_id: MutationJobId,
     operation: Operation,
     native_target: Option<NativeDocumentKey>,
-    admission_deadline: Option<Instant>,
+    start_deadline: Option<Instant>,
     waiting_for_readiness: bool,
     retry_at: Option<Instant>,
     retry_delay: Duration,
@@ -104,7 +107,7 @@ enum TakeDecision {
 }
 
 pub struct ExecutionAdmission {
-    request_id: u64,
+    job_id: MutationJobId,
     output: OutputStream,
     completion: ExecutionCompletion,
 }
@@ -129,7 +132,7 @@ pub enum Error {
     PluginStopping,
     DocumentNotFound(String),
     DocumentGone,
-    DocumentChanged,
+    DocumentGenerationChanged,
     Unnamed(String),
     ReadOnly(String),
     Dirty(String),
@@ -145,8 +148,8 @@ pub enum Error {
     UndoDisabled,
     ContextFailed(NativeFailure),
     ContextCleanupFailed(NativeFailure),
-    ExecutionLeaseFailed(NativeFailure),
-    ExecutionStateCleanupFailed(NativeFailure),
+    ExecutionCleanupFailed(NativeFailure),
+    EvaluatorStateCleanupFailed(NativeFailure),
     ExecutionBridgeFailed(NativeFailure),
     ExecutionNotFinished,
     MutationCapacity,
@@ -175,8 +178,8 @@ impl fmt::Display for Error {
             Self::PluginStopping => formatter.write_str("the acadctl plugin is stopping"),
             Self::DocumentNotFound(id) => write!(formatter, "Document '{id}' is not open."),
             Self::DocumentGone => formatter.write_str("The document is no longer open"),
-            Self::DocumentChanged => formatter
-                .write_str("The document changed before AutoCAD could perform the operation"),
+            Self::DocumentGenerationChanged => formatter
+                .write_str("The document was replaced before AutoCAD could perform the operation"),
             Self::Unnamed(id) => write!(
                 formatter,
                 "Document '{id}' has no file name. Save As is not supported yet."
@@ -218,13 +221,13 @@ impl fmt::Display for Error {
                 formatter,
                 "Could not release the AutoCAD document context safely",
             ),
-            Self::ExecutionLeaseFailed(failure) => failure.fmt_with_context(
+            Self::ExecutionCleanupFailed(failure) => failure.fmt_with_context(
                 formatter,
-                "Could not close the AutoCAD execution lease safely",
+                "Could not release native execution state safely",
             ),
-            Self::ExecutionStateCleanupFailed(failure) => failure.fmt_with_context(
+            Self::EvaluatorStateCleanupFailed(failure) => failure.fmt_with_context(
                 formatter,
-                "Could not clear the reserved AutoLISP execution state",
+                "Could not clear the reserved AutoLISP evaluator state",
             ),
             Self::ExecutionBridgeFailed(failure) => {
                 failure.fmt_with_context(formatter, "The AutoLISP execution bridge failed")
@@ -274,8 +277,8 @@ impl Error {
                 | Self::CloseNotPublished
                 | Self::ContextFailed(_)
                 | Self::ContextCleanupFailed(_)
-                | Self::ExecutionLeaseFailed(_)
-                | Self::ExecutionStateCleanupFailed(_)
+                | Self::ExecutionCleanupFailed(_)
+                | Self::EvaluatorStateCleanupFailed(_)
                 | Self::ExecutionBridgeFailed(_)
                 | Self::ExecutionNotFinished
                 | Self::NativeStateUnknown
@@ -283,7 +286,7 @@ impl Error {
     }
 }
 
-impl Scheduler {
+impl MutationScheduler {
     const fn new() -> Self {
         Self {
             documents: DocumentRegistry::new(),
@@ -312,7 +315,7 @@ impl Scheduler {
             })
     }
 
-    fn durable_mutation_count(&self) -> usize {
+    fn mutation_job_count(&self) -> usize {
         self.pending.len() + usize::from(self.active.is_some())
     }
 
@@ -363,8 +366,8 @@ pub fn admit_execution(
     output: OutputStream,
     reservation: ExecutionReservation,
 ) -> Result<ExecutionAdmission, Error> {
-    let deadline = Instant::now() + EXECUTION_ADMISSION_TIMEOUT;
-    let (request_id, receiver, should_wake, immediate) = {
+    let deadline = Instant::now() + EXECUTION_START_TIMEOUT;
+    let (job_id, receiver, should_wake, immediate) = {
         let mut scheduler = SCHEDULER.lock().map_err(|_| Error::StateUnavailable)?;
         if scheduler.stopping {
             return Err(Error::PluginStopping);
@@ -372,7 +375,7 @@ pub fn admit_execution(
         if scheduler.quarantined {
             return Err(Error::NativeStateUnknown);
         }
-        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
         let (completion, receiver) = oneshot::channel();
         if execution.outcome().is_some() {
             let operation = Operation::Execute {
@@ -384,14 +387,9 @@ pub fn admit_execution(
                 Prepared::Native(_) => Err(Error::ExecutionNotFinished),
             };
             let output = operation.output_sink();
-            (
-                request_id,
-                receiver,
-                false,
-                Some((completion, outcome, output)),
-            )
+            (job_id, receiver, false, Some((completion, outcome, output)))
         } else {
-            if scheduler.durable_mutation_count() >= MAX_DURABLE_MUTATIONS {
+            if scheduler.mutation_job_count() >= MAX_MUTATION_JOBS {
                 return Err(Error::MutationCapacity);
             }
 
@@ -402,14 +400,14 @@ pub fn admit_execution(
                 return Err(Error::ExecutionCapacity);
             }
 
-            scheduler.pending.push_back(Job {
-                request_id,
+            scheduler.pending.push_back(MutationJob {
+                job_id,
                 operation: Operation::Execute {
                     id,
                     execution: Box::new(execution),
                 },
                 native_target: None,
-                admission_deadline: Some(deadline),
+                start_deadline: Some(deadline),
                 waiting_for_readiness: false,
                 retry_at: None,
                 retry_delay: BUSY_RETRY_INITIAL,
@@ -417,7 +415,7 @@ pub fn admit_execution(
                 completion,
             });
             let should_wake = scheduler.request_wake();
-            (request_id, receiver, should_wake, None)
+            (job_id, receiver, should_wake, None)
         }
     };
 
@@ -433,7 +431,7 @@ pub fn admit_execution(
     TIMERS_CHANGED.notify_one();
 
     Ok(ExecutionAdmission {
-        request_id,
+        job_id,
         output,
         completion: ExecutionCompletion { receiver },
     })
@@ -451,8 +449,8 @@ pub fn try_reserve_execution() -> Option<ExecutionReservation> {
 }
 
 impl ExecutionAdmission {
-    pub fn into_parts(self) -> (u64, OutputStream, ExecutionCompletion) {
-        (self.request_id, self.output, self.completion)
+    pub fn into_parts(self) -> (MutationJobId, OutputStream, ExecutionCompletion) {
+        (self.job_id, self.output, self.completion)
     }
 }
 
@@ -489,7 +487,7 @@ pub fn list() -> Result<Vec<Document>, Error> {
         .map(|scheduler| scheduler.documents.list())
 }
 
-pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentState>) {
+pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
         scheduler.documents.replace(documents);
     }
@@ -543,7 +541,7 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
         if scheduler.quarantined {
             return Err(Error::NativeStateUnknown);
         }
-        if scheduler.durable_mutation_count() >= MAX_DURABLE_MUTATIONS {
+        if scheduler.mutation_job_count() >= MAX_MUTATION_JOBS {
             return Err(Error::MutationCapacity);
         }
         if scheduler.idle()
@@ -552,13 +550,13 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
             return outcome;
         }
 
-        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
         let (completion, completed) = oneshot::channel();
-        scheduler.pending.push_back(Job {
-            request_id,
+        scheduler.pending.push_back(MutationJob {
+            job_id,
             operation,
             native_target: None,
-            admission_deadline: None,
+            start_deadline: None,
             waiting_for_readiness: false,
             retry_at: None,
             retry_delay: BUSY_RETRY_INITIAL,
@@ -575,7 +573,7 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
     completed.await.map_err(|_| Error::Stopped)?
 }
 
-pub fn take() -> NativeAction {
+pub fn take_native_action() -> NativeAction {
     let decision = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
             return empty_action();
@@ -594,7 +592,7 @@ pub fn take() -> NativeAction {
                         TakeDecision::Complete(job.completion, outcome, job.operation.output_sink())
                     }
                     Prepared::Native(mut action) => {
-                        action.request_id = job.request_id;
+                        action.job_id = job.job_id;
                         job.native_target = matches!(&job.operation, Operation::Execute { .. })
                             .then_some(NativeDocumentKey {
                                 document_token: action.document_token,
@@ -623,13 +621,13 @@ pub fn take() -> NativeAction {
     }
 }
 
-pub fn complete(request_id: u64, mut result: NativeActionResult) {
+pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionResult) {
     bound_diagnostic(&mut result.native_detail);
     let quarantine = matches!(
         result.kind,
         NativeActionResultKind::ContextCleanupFailed
-            | NativeActionResultKind::ExecutionLeaseFailed
-            | NativeActionResultKind::ExecutionStateCleanupFailed
+            | NativeActionResultKind::ExecutionCleanupFailed
+            | NativeActionResultKind::EvaluatorStateCleanupFailed
     );
     let (completion, pending) = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
@@ -638,7 +636,7 @@ pub fn complete(request_id: u64, mut result: NativeActionResult) {
         let Some(mut job) = scheduler.active.take() else {
             return;
         };
-        if job.request_id != request_id {
+        if job.job_id != job_id {
             scheduler.active = Some(job);
             return;
         }
@@ -692,7 +690,7 @@ pub fn complete(request_id: u64, mut result: NativeActionResult) {
     }
 }
 
-pub fn cancel_execution(request_id: u64) -> CancelResult {
+pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
     enum Action {
         Active(OutputSink),
         Pending {
@@ -708,7 +706,7 @@ pub fn cancel_execution(request_id: u64) -> CancelResult {
             return CancelResult::Unavailable;
         };
         if let Some(job) = scheduler.active.as_mut()
-            && job.request_id == request_id
+            && job.job_id == job_id
         {
             match &mut job.operation {
                 Operation::Execute { execution, .. } => {
@@ -723,7 +721,7 @@ pub fn cancel_execution(request_id: u64) -> CancelResult {
                 }
             }
         } else if let Some(index) = scheduler.pending.iter().position(|job| {
-            job.request_id == request_id && matches!(job.operation, Operation::Execute { .. })
+            job.job_id == job_id && matches!(job.operation, Operation::Execute { .. })
         }) {
             let output = match &mut scheduler.pending[index].operation {
                 Operation::Execute { execution, .. } => execution
@@ -790,19 +788,19 @@ pub async fn drive_timers() {
 
 fn next_timer_deadline() -> Option<Instant> {
     let scheduler = SCHEDULER.lock().ok()?;
-    let admission = scheduler
+    let execution_start = scheduler
         .pending
         .iter()
         .chain(scheduler.active.iter())
-        .filter(|job| job.execution_admission_pending())
-        .filter_map(|job| job.admission_deadline)
+        .filter(|job| job.execution_start_pending())
+        .filter_map(|job| job.start_deadline)
         .min();
     let retry = scheduler
         .pending
         .front()
         .filter(|job| job.waiting_for_readiness)
         .and_then(|job| job.retry_at);
-    admission.into_iter().chain(retry).min()
+    execution_start.into_iter().chain(retry).min()
 }
 
 fn process_due_timers(now: Instant) {
@@ -871,14 +869,14 @@ pub fn native_state_may_be_ready() {
     TIMERS_CHANGED.notify_one();
 }
 
-pub fn take_execution_step(execution_id: u64) -> NativeExecutionStep {
+pub fn take_execution_step(job_id: MutationJobId) -> NativeExecutionStep {
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return NativeExecutionStep::invalid();
     };
     let Some(job) = scheduler.active.as_mut() else {
         return NativeExecutionStep::invalid();
     };
-    if job.request_id != execution_id {
+    if job.job_id != job_id {
         return NativeExecutionStep::invalid();
     }
     job.expire_if_due(Instant::now());
@@ -916,7 +914,7 @@ pub fn begin_println(document_token: usize, database_token: usize) -> NativeValu
 }
 
 pub fn begin_eval_value(
-    execution_id: u64,
+    job_id: MutationJobId,
     document_token: usize,
     database_token: usize,
 ) -> NativeValueWriter {
@@ -927,7 +925,7 @@ pub fn begin_eval_value(
         let Some(job) = scheduler.active.as_ref() else {
             return NativeValueWriter::inactive();
         };
-        if job.request_id != execution_id
+        if job.job_id != job_id
             || job.native_target
                 != Some(NativeDocumentKey {
                     document_token,
@@ -945,7 +943,7 @@ pub fn begin_eval_value(
     lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::eval_value)
 }
 
-pub fn complete_execution_step(execution_id: u64, mut result: StepResult) -> bool {
+pub fn complete_execution_step(job_id: MutationJobId, mut result: ExecutionStepResult) -> bool {
     bound_diagnostic(&mut result.detail);
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return false;
@@ -953,7 +951,7 @@ pub fn complete_execution_step(execution_id: u64, mut result: StepResult) -> boo
     let Some(job) = scheduler.active.as_mut() else {
         return false;
     };
-    if job.request_id != execution_id {
+    if job.job_id != job_id {
         return false;
     }
     match &mut job.operation {
@@ -962,7 +960,7 @@ pub fn complete_execution_step(execution_id: u64, mut result: StepResult) -> boo
     }
 }
 
-pub fn abandon_execution(execution_id: u64, mut result: StepResult) -> bool {
+pub fn abandon_execution(job_id: MutationJobId, mut result: ExecutionStepResult) -> bool {
     bound_diagnostic(&mut result.detail);
     let Ok(mut scheduler) = SCHEDULER.lock() else {
         return false;
@@ -970,7 +968,7 @@ pub fn abandon_execution(execution_id: u64, mut result: StepResult) -> bool {
     let Some(job) = scheduler.active.as_mut() else {
         return false;
     };
-    if job.request_id != execution_id {
+    if job.job_id != job_id {
         return false;
     }
     match &mut job.operation {
@@ -1053,13 +1051,13 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
 }
 
 fn prepare_save(id: &str, target: DocumentTarget) -> Prepared {
-    if !target.named {
-        return Prepared::Immediate(Err(Error::Unnamed(id.to_owned())));
-    }
     if target.document.read_only {
         return Prepared::Immediate(Err(Error::ReadOnly(id.to_owned())));
     }
-    if !is_dwg(std::path::Path::new(&target.document.path)) {
+    let Some(file_path) = target.document.file_path.as_deref() else {
+        return Prepared::Immediate(Err(Error::Unnamed(id.to_owned())));
+    };
+    if !is_dwg(std::path::Path::new(file_path)) {
         return Prepared::Immediate(Err(Error::NotDwg));
     }
     if !target.document.modified {
@@ -1117,14 +1115,14 @@ fn complete_operation(
     ) && !matches!(
         result.kind,
         NativeActionResultKind::ContextCleanupFailed
-            | NativeActionResultKind::ExecutionLeaseFailed
-            | NativeActionResultKind::ExecutionStateCleanupFailed
+            | NativeActionResultKind::ExecutionCleanupFailed
+            | NativeActionResultKind::EvaluatorStateCleanupFailed
             | NativeActionResultKind::ExecutionBridgeFailed
     ) {
         return finalize(operation, documents);
     }
 
-    if result.kind == NativeActionResultKind::ExecutionStateCleanupFailed
+    if result.kind == NativeActionResultKind::EvaluatorStateCleanupFailed
         && let Operation::Execute { execution, .. } = operation
         && matches!(execution.outcome(), Some(ExecutionOutcome::Failure(_)))
     {
@@ -1133,16 +1131,17 @@ fn complete_operation(
 
     if matches!(
         result.kind,
-        NativeActionResultKind::ContextCleanupFailed | NativeActionResultKind::ExecutionLeaseFailed
+        NativeActionResultKind::ContextCleanupFailed
+            | NativeActionResultKind::ExecutionCleanupFailed
     ) && let Operation::Execute { execution, .. } = operation
         && execution.outcome().is_some()
     {
-        let recorded = execution.record_terminal_failure(StepResult {
-            kind: crate::execution::StepResultKind::NativeError,
+        let recorded = execution.record_terminal_failure(ExecutionStepResult {
+            kind: crate::execution::ExecutionStepResultKind::NativeError,
             native_status: result.native_status,
             lisp_errno: 0,
             detail: std::mem::take(&mut result.native_detail),
-            cleanup_status: 0,
+            evaluator_state_cleanup_status: 0,
         });
         debug_assert!(recorded);
         return finalize(operation, documents);
@@ -1163,7 +1162,7 @@ fn native_action(
         database_token: 0,
     });
     NativeAction {
-        request_id: 0,
+        job_id: 0,
         kind,
         document_token: target.document_token,
         database_token: target.database_token,
@@ -1180,7 +1179,7 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
     match result.kind {
         NativeActionResultKind::Success => Ok(()),
         NativeActionResultKind::DocumentGone => Err(Error::DocumentGone),
-        NativeActionResultKind::DocumentChanged => Err(Error::DocumentChanged),
+        NativeActionResultKind::DocumentGenerationChanged => Err(Error::DocumentGenerationChanged),
         NativeActionResultKind::Unnamed => Err(Error::Unnamed(operation.document_id().to_owned())),
         NativeActionResultKind::ReadOnly => {
             Err(Error::ReadOnly(operation.document_id().to_owned()))
@@ -1194,20 +1193,21 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         NativeActionResultKind::UndoDisabled => Err(Error::UndoDisabled),
         NativeActionResultKind::ContextFailed => Err(Error::ContextFailed(failure)),
         NativeActionResultKind::ContextCleanupFailed => Err(Error::ContextCleanupFailed(failure)),
-        NativeActionResultKind::ExecutionLeaseFailed => Err(Error::ExecutionLeaseFailed(failure)),
-        NativeActionResultKind::ExecutionStateCleanupFailed => {
-            Err(Error::ExecutionStateCleanupFailed(failure))
+        NativeActionResultKind::ExecutionCleanupFailed => {
+            Err(Error::ExecutionCleanupFailed(failure))
+        }
+        NativeActionResultKind::EvaluatorStateCleanupFailed => {
+            Err(Error::EvaluatorStateCleanupFailed(failure))
         }
         NativeActionResultKind::ExecutionBridgeFailed => Err(Error::ExecutionBridgeFailed(failure)),
         kind => Err(Error::UnknownResult(kind.repr)),
     }
 }
 
-impl Job {
+impl MutationJob {
     fn deadline_is_due(&self, now: Instant) -> bool {
-        self.admission_deadline
-            .is_some_and(|deadline| now >= deadline)
-            && self.execution_admission_pending()
+        self.start_deadline.is_some_and(|deadline| now >= deadline)
+            && self.execution_start_pending()
     }
 
     fn expire_if_due(&mut self, now: Instant) -> bool {
@@ -1217,7 +1217,7 @@ impl Job {
         match &mut self.operation {
             Operation::Execute { execution, .. } => execution.expire_before_start(format!(
                 "execution did not start within {} seconds",
-                EXECUTION_ADMISSION_TIMEOUT.as_secs()
+                EXECUTION_START_TIMEOUT.as_secs()
             )),
             Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
         }
@@ -1230,10 +1230,10 @@ impl Job {
         )
     }
 
-    fn execution_admission_pending(&self) -> bool {
+    fn execution_start_pending(&self) -> bool {
         matches!(
             &self.operation,
-            Operation::Execute { execution, .. } if execution.admission_deadline_pending()
+            Operation::Execute { execution, .. } if execution.start_deadline_pending()
         )
     }
 
@@ -1328,10 +1328,10 @@ mod tests {
         );
         assert_eq!(
             interpret(
-                result(NativeActionResultKind::DocumentChanged),
+                result(NativeActionResultKind::DocumentGenerationChanged),
                 &Operation::Save { id: "doc".into() },
             ),
-            Err(Error::DocumentChanged)
+            Err(Error::DocumentGenerationChanged)
         );
         assert_eq!(
             interpret(
@@ -1350,7 +1350,7 @@ mod tests {
 
         let first = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        let save_action = take();
+        let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
         first.abort();
@@ -1358,22 +1358,16 @@ mod tests {
 
         let second = tokio::spawn(close(id.clone(), true));
         tokio::task::yield_now().await;
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
 
         replace_documents(vec![document(1, 101, false)]);
-        complete(
-            save_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(native_actions_need_wake());
 
-        let close_action = take();
+        let close_action = take_native_action();
         assert_eq!(close_action.kind, NativeActionKind::Close);
         replace_documents(Vec::new());
-        complete(
-            close_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(close_action.job_id, result(NativeActionResultKind::Success));
         assert!(second.await.unwrap().is_ok());
         stop();
     }
@@ -1393,7 +1387,7 @@ mod tests {
         for job in [first, second, third] {
             assert_eq!(job.await.unwrap(), Err(Error::ScheduleFailed(42)));
         }
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 
@@ -1405,7 +1399,7 @@ mod tests {
 
         let active = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        let save_action = take();
+        let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
         let pending = tokio::spawn(close(id, true));
@@ -1413,13 +1407,10 @@ mod tests {
         stop();
 
         assert_eq!(pending.await.unwrap(), Err(Error::PluginStopping));
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
 
         replace_documents(vec![document(1, 101, false)]);
-        complete(
-            save_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(active.await.unwrap().is_ok());
     }
 
@@ -1438,31 +1429,37 @@ mod tests {
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
         assert_eq!(action.document_token, 1);
         assert_eq!(action.database_token, 101);
 
-        let begin = take_execution_step(action.request_id);
-        assert_eq!(begin.kind(), crate::execution::StepKind::Begin);
-        assert!(complete_execution_step(action.request_id, step_success()));
-
-        let first = take_execution_step(action.request_id);
-        assert_eq!(first.source(), "first");
-        assert!(complete_execution_step(action.request_id, step_success()));
-        let second = take_execution_step(action.request_id);
-        assert_eq!(second.source(), "second");
-        assert!(complete_execution_step(action.request_id, step_success()));
-
-        let commit = take_execution_step(action.request_id);
-        assert_eq!(commit.kind(), crate::execution::StepKind::Commit);
-        assert!(complete_execution_step(action.request_id, step_success()));
+        let begin = take_execution_step(action.job_id);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            begin.kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
+        );
+        assert!(complete_execution_step(action.job_id, step_success()));
+
+        let first = take_execution_step(action.job_id);
+        assert_eq!(first.source(), "first");
+        assert!(complete_execution_step(action.job_id, step_success()));
+        let second = take_execution_step(action.job_id);
+        assert_eq!(second.source(), "second");
+        assert!(complete_execution_step(action.job_id, step_success()));
+
+        let commit = take_execution_step(action.job_id);
+        assert_eq!(
+            commit.kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
+        );
+        assert!(complete_execution_step(action.job_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
 
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
         stop();
     }
@@ -1477,16 +1474,16 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert!(!begin_println(1, 101).active());
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
         assert!(!begin_println(2, 101).active());
         assert!(!begin_println(1, 202).active());
@@ -1502,18 +1499,18 @@ mod tests {
         assert_eq!(writer.write(ValueEvent::Integer(3)), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
 
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert!(!begin_println(1, 101).active());
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Commit
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
 
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
         let mut rendered = String::new();
@@ -1534,43 +1531,46 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
-        let form = take_execution_step(action.request_id);
-        assert_eq!(form.kind(), crate::execution::StepKind::Form);
+        assert!(complete_execution_step(action.job_id, step_success()));
+        let form = take_execution_step(action.job_id);
+        assert_eq!(
+            form.kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
+        );
         assert!(form.retain_value());
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Commit
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::EmitValue
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EmitEvalValue
         );
 
         assert!(!begin_println(1, 101).active());
-        assert!(!begin_eval_value(action.request_id + 1, 1, 101).active());
-        assert!(!begin_eval_value(action.request_id, 2, 101).active());
-        assert!(!begin_eval_value(action.request_id, 1, 202).active());
-        let mut writer = begin_eval_value(action.request_id, 1, 101);
+        assert!(!begin_eval_value(action.job_id + 1, 1, 101).active());
+        assert!(!begin_eval_value(action.job_id, 2, 101).active());
+        assert!(!begin_eval_value(action.job_id, 1, 202).active());
+        let mut writer = begin_eval_value(action.job_id, 1, 101);
         assert!(writer.active());
-        assert!(!begin_eval_value(action.request_id, 1, 101).active());
+        assert!(!begin_eval_value(action.job_id, 1, 101).active());
         assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
-        assert!(!begin_eval_value(action.request_id, 1, 101).active());
+        assert!(!begin_eval_value(action.job_id, 1, 101).active());
 
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
 
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
         let mut rendered = String::new();
@@ -1591,15 +1591,15 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
 
         let mut writer = begin_println(1, 101);
@@ -1608,21 +1608,21 @@ mod tests {
             WriteResult::InvalidSequence
         );
         assert_eq!(writer.finish(), WriteResult::InvalidSequence);
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Rollback
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::RollbackUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
 
         assert_eq!(
             pending.await.unwrap().unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 message: "the AutoLISP output bridge emitted an invalid value sequence".into(),
                 form_index: Some(1),
                 location: Some(crate::execution::SourceLocation {
@@ -1646,32 +1646,32 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
 
         let mut writer = begin_println(1, 101);
         assert!(writer.active());
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert!(!writer.active());
         assert_eq!(writer.write(ValueEvent::Integer(9)), WriteResult::Inactive);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Rollback
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::RollbackUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
 
         let Some(ExecutionOutcome::Failure(failure)) = pending.await.unwrap().ok() else {
             panic!("expected the unfinished writer to fail execution");
@@ -1696,30 +1696,27 @@ mod tests {
 
         let active = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        let save_action = take();
+        let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
         let (execution, mut output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
-        let execution_id = SCHEDULER
+        let job_id = SCHEDULER
             .lock()
             .unwrap()
             .pending
             .front()
             .expect("execution is queued behind save")
-            .request_id;
+            .job_id;
 
-        assert_eq!(cancel_execution(execution_id), CancelResult::Accepted);
+        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
         assert_eq!(output.next_chunk().await, None);
 
         replace_documents(vec![document(1, 101, false)]);
-        complete(
-            save_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(active.await.unwrap().is_ok());
         assert!(!native_actions_need_wake());
         stop();
@@ -1733,20 +1730,20 @@ mod tests {
 
         let active = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        let save_action = take();
+        let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
         let (execution, mut output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let queued = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
-        let execution_id = SCHEDULER
+        let job_id = SCHEDULER
             .lock()
             .unwrap()
             .pending
             .front()
             .expect("execution is queued behind save")
-            .request_id;
+            .job_id;
 
         queued.abort();
         assert!(queued.await.unwrap_err().is_cancelled());
@@ -1755,14 +1752,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(cancel_execution(execution_id), CancelResult::Accepted);
+        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
         assert_eq!(output.next_chunk().await, None);
 
         replace_documents(vec![document(1, 101, false)]);
-        complete(
-            save_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(active.await.unwrap().is_ok());
         assert!(!native_actions_need_wake());
         stop();
@@ -1782,7 +1776,7 @@ mod tests {
 
         assert_eq!(pending.await.unwrap(), Err(Error::ScheduleFailed(42)));
         assert_eq!(output.next_chunk().await, None);
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 
@@ -1796,39 +1790,39 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
 
-        assert_eq!(cancel_execution(action.request_id), CancelResult::Accepted);
-        assert_eq!(cancel_execution(action.request_id), CancelResult::Accepted);
+        assert_eq!(cancel_execution(action.job_id), CancelResult::Accepted);
+        assert_eq!(cancel_execution(action.job_id), CancelResult::Accepted);
         assert_eq!(output.next_chunk().await, None);
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Rollback
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::RollbackUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
 
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
         stop();
     }
 
     #[tokio::test]
-    async fn active_cancellation_before_the_first_form_uses_abort_not_rollback() {
+    async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
@@ -1837,25 +1831,25 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
-        assert_eq!(cancel_execution(action.request_id), CancelResult::Accepted);
+        assert!(complete_execution_step(action.job_id, step_success()));
+        assert_eq!(cancel_execution(action.job_id), CancelResult::Accepted);
         assert_eq!(output.next_chunk().await, None);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Abort
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CloseEmptyUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
 
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
         stop();
     }
@@ -1870,29 +1864,29 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Commit
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
         );
 
-        assert_eq!(cancel_execution(action.request_id), CancelResult::TooLate);
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(cancel_execution(action.job_id), CancelResult::TooLate);
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
 
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
         assert_eq!(output.next_chunk().await, None);
@@ -1909,30 +1903,30 @@ mod tests {
         let pending = tokio::spawn(execute(id, execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
 
         stop();
         assert_eq!(output.next_chunk().await, None);
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Rollback
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::RollbackUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
         assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
     }
 
@@ -1962,14 +1956,14 @@ mod tests {
         let executing = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
-        let form = take_execution_step(action.request_id);
+        assert!(complete_execution_step(action.job_id, step_success()));
+        let form = take_execution_step(action.job_id);
         assert_eq!(form.source(), "form");
 
         executing.abort();
@@ -1981,29 +1975,26 @@ mod tests {
         );
         let later = tokio::spawn(close(id, true));
         tokio::task::yield_now().await;
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
 
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Commit
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(action.request_id, result(NativeActionResultKind::Success));
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
         assert_eq!(output.next_chunk().await, None);
 
         assert!(native_actions_need_wake());
-        let close_action = take();
+        let close_action = take_native_action();
         assert_eq!(close_action.kind, NativeActionKind::Close);
         replace_documents(Vec::new());
-        complete(
-            close_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(close_action.job_id, result(NativeActionResultKind::Success));
         assert!(later.await.unwrap().is_ok());
         stop();
     }
@@ -2019,33 +2010,33 @@ mod tests {
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Commit
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
 
         let blocked = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
 
-        complete(
-            action.request_id,
+        complete_native_action(
+            action.job_id,
             NativeActionResult {
                 kind: NativeActionResultKind::ContextCleanupFailed,
                 native_status: 42,
@@ -2055,7 +2046,7 @@ mod tests {
 
         assert_eq!(
             pending.await.unwrap().unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 message: "unlock failed".into(),
                 form_index: None,
                 location: None,
@@ -2064,7 +2055,7 @@ mod tests {
         );
         assert_eq!(blocked.await.unwrap(), Err(Error::NativeStateUnknown));
         assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 
@@ -2078,52 +2069,52 @@ mod tests {
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Form
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EvaluateForm
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Commit
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::CommitUndoGroup
         );
-        assert!(complete_execution_step(action.request_id, step_success()));
+        assert!(complete_execution_step(action.job_id, step_success()));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::EmitValue
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::EmitEvalValue
         );
 
-        let mut writer = begin_eval_value(action.request_id, 1, 101);
+        let mut writer = begin_eval_value(action.job_id, 1, 101);
         assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
         assert!(complete_execution_step(
-            action.request_id,
-            StepResult {
-                kind: crate::execution::StepResultKind::NativeError,
+            action.job_id,
+            ExecutionStepResult {
+                kind: crate::execution::ExecutionStepResultKind::NativeError,
                 native_status: 42,
                 lisp_errno: 0,
                 detail: "could not clear the retained AutoLISP value".into(),
-                cleanup_status: 0,
+                evaluator_state_cleanup_status: 0,
             }
         ));
         assert_eq!(
-            take_execution_step(action.request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(action.job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
 
         let blocked = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        complete(
-            action.request_id,
+        complete_native_action(
+            action.job_id,
             NativeActionResult {
-                kind: NativeActionResultKind::ExecutionStateCleanupFailed,
+                kind: NativeActionResultKind::EvaluatorStateCleanupFailed,
                 native_status: 42,
                 native_detail: "reserved evaluator state remains".into(),
             },
@@ -2131,7 +2122,7 @@ mod tests {
 
         assert_eq!(
             pending.await.unwrap().unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 message: "could not clear the retained AutoLISP value".into(),
                 form_index: Some(1),
                 location: Some(crate::execution::SourceLocation {
@@ -2144,7 +2135,7 @@ mod tests {
         );
         assert_eq!(blocked.await.unwrap(), Err(Error::NativeStateUnknown));
         assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 
@@ -2155,41 +2146,38 @@ mod tests {
         let id = list().unwrap()[0].id.clone();
         let saving = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        let save_action = take();
+        let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, mut output, completion) = admission.into_parts();
+        let (job_id, mut output, completion) = admission.into_parts();
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
             let job = scheduler
                 .pending
                 .iter_mut()
-                .find(|job| job.request_id == request_id)
+                .find(|job| job.job_id == job_id)
                 .unwrap();
-            job.admission_deadline = Some(Instant::now() - Duration::from_millis(1));
+            job.start_deadline = Some(Instant::now() - Duration::from_millis(1));
         }
         process_due_timers(Instant::now());
 
         assert_eq!(output.next_chunk().await, None);
         assert_eq!(
             completion.wait().await.unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 message: "execution did not start within 5 seconds".into(),
                 form_index: None,
                 location: None,
                 drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
             })
         );
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
 
         replace_documents(vec![document(1, 101, false)]);
-        complete(
-            save_action.request_id,
-            result(NativeActionResultKind::Success),
-        );
+        complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(saving.await.unwrap().is_ok());
         stop();
     }
@@ -2202,26 +2190,23 @@ mod tests {
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, _output, completion) = admission.into_parts();
+        let (job_id, _output, completion) = admission.into_parts();
 
-        let first = take();
+        let first = take_native_action();
         assert_eq!(first.kind, NativeActionKind::RunExecution);
-        complete(
-            first.request_id,
-            result(NativeActionResultKind::NotQuiescent),
-        );
-        assert_eq!(take().kind, NativeActionKind::None);
+        complete_native_action(first.job_id, result(NativeActionResultKind::NotQuiescent));
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
 
         process_due_timers(Instant::now() + BUSY_RETRY_MAX);
-        let retried = take();
+        let retried = take_native_action();
         assert_eq!(retried.kind, NativeActionKind::RunExecution);
-        assert_eq!(retried.request_id, request_id);
-        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        assert_eq!(retried.job_id, job_id);
+        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
         assert_eq!(
-            take_execution_step(request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(request_id, result(NativeActionResultKind::Success));
+        complete_native_action(job_id, result(NativeActionResultKind::Success));
         assert_eq!(
             completion.wait().await.unwrap(),
             ExecutionOutcome::Cancelled
@@ -2237,25 +2222,25 @@ mod tests {
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, _output, completion) = admission.into_parts();
-        let action = take();
+        let (job_id, _output, completion) = admission.into_parts();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.active.as_mut().unwrap().admission_deadline =
+            scheduler.active.as_mut().unwrap().start_deadline =
                 Some(Instant::now() - Duration::from_millis(1));
         }
         process_due_timers(Instant::now());
-        complete(request_id, result(NativeActionResultKind::NotQuiescent));
+        complete_native_action(job_id, result(NativeActionResultKind::NotQuiescent));
 
         assert!(matches!(
             completion.wait().await.unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
                 ..
             })
         ));
-        assert_eq!(take().kind, NativeActionKind::None);
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 
@@ -2267,19 +2252,19 @@ mod tests {
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, _output, completion) = admission.into_parts();
-        assert_eq!(take().kind, NativeActionKind::RunExecution);
+        let (job_id, _output, completion) = admission.into_parts();
+        assert_eq!(take_native_action().kind, NativeActionKind::RunExecution);
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.active.as_mut().unwrap().admission_deadline =
+            scheduler.active.as_mut().unwrap().start_deadline =
                 Some(Instant::now() - Duration::from_millis(1));
         }
         process_due_timers(Instant::now());
-        complete(request_id, result(NativeActionResultKind::UndoDisabled));
+        complete_native_action(job_id, result(NativeActionResultKind::UndoDisabled));
 
         assert_eq!(
             completion.wait().await.unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 message: "execution did not start within 5 seconds".into(),
                 form_index: None,
                 location: None,
@@ -2297,36 +2282,36 @@ mod tests {
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, _output, completion) = admission.into_parts();
-        assert_eq!(take().kind, NativeActionKind::RunExecution);
+        let (job_id, _output, completion) = admission.into_parts();
+        assert_eq!(take_native_action().kind, NativeActionKind::RunExecution);
         assert_eq!(
-            take_execution_step(request_id).kind(),
-            crate::execution::StepKind::Begin
+            take_execution_step(job_id).kind(),
+            crate::execution::ExecutionStepKind::BeginUndoGroup
         );
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.active.as_mut().unwrap().admission_deadline =
+            scheduler.active.as_mut().unwrap().start_deadline =
                 Some(Instant::now() - Duration::from_millis(1));
         }
         process_due_timers(Instant::now());
         assert!(complete_execution_step(
-            request_id,
-            StepResult {
-                kind: crate::execution::StepResultKind::NativeError,
+            job_id,
+            ExecutionStepResult {
+                kind: crate::execution::ExecutionStepResultKind::NativeError,
                 native_status: 42,
                 lisp_errno: 0,
                 detail: "undo begin failed".into(),
-                cleanup_status: 0,
+                evaluator_state_cleanup_status: 0,
             }
         ));
         assert_eq!(
-            take_execution_step(request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(request_id, result(NativeActionResultKind::Success));
+        complete_native_action(job_id, result(NativeActionResultKind::Success));
 
         let ExecutionOutcome::Failure(failure) = completion.wait().await.unwrap() else {
-            panic!("the admission deadline must remain the terminal cause");
+            panic!("the execution start deadline must remain the terminal cause");
         };
         assert!(
             failure
@@ -2349,20 +2334,20 @@ mod tests {
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, output, completion) = admission.into_parts();
+        let (job_id, output, completion) = admission.into_parts();
         drop(output);
         drop(completion);
 
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::RunExecution);
-        assert_eq!(action.request_id, request_id);
-        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        assert_eq!(action.job_id, job_id);
+        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
         assert_eq!(
-            take_execution_step(request_id).kind(),
-            crate::execution::StepKind::Done
+            take_execution_step(job_id).kind(),
+            crate::execution::ExecutionStepKind::Done
         );
-        complete(request_id, result(NativeActionResultKind::Success));
-        assert_eq!(take().kind, NativeActionKind::None);
+        complete_native_action(job_id, result(NativeActionResultKind::Success));
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 
@@ -2385,8 +2370,8 @@ mod tests {
         ));
 
         for admission in admissions {
-            let (request_id, _output, completion) = admission.into_parts();
-            assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+            let (job_id, _output, completion) = admission.into_parts();
+            assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
             assert_eq!(
                 completion.wait().await.unwrap(),
                 ExecutionOutcome::Cancelled
@@ -2396,8 +2381,8 @@ mod tests {
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let replacement = admit_test_execution(id, execution, output).unwrap();
-        let (request_id, _output, completion) = replacement.into_parts();
-        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        let (job_id, _output, completion) = replacement.into_parts();
+        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
         assert_eq!(
             completion.wait().await.unwrap(),
             ExecutionOutcome::Cancelled
@@ -2415,7 +2400,7 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission =
             admit_execution(id, execution, output, response_reservation.clone()).unwrap();
-        let (request_id, output, completion) = admission.into_parts();
+        let (job_id, output, completion) = admission.into_parts();
         drop(output);
         drop(completion);
         drop(response_reservation);
@@ -2425,7 +2410,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(try_reserve_execution().is_none());
 
-        assert_eq!(cancel_execution(request_id), CancelResult::Accepted);
+        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
         let replacement = try_reserve_execution().unwrap();
         drop(replacement);
         drop(other_reservations);
@@ -2447,15 +2432,15 @@ mod tests {
             scheduler
                 .pending
                 .iter_mut()
-                .find(|job| job.request_id == expired_id)
+                .find(|job| job.job_id == expired_id)
                 .unwrap()
-                .admission_deadline = Some(Instant::now() - Duration::from_millis(1));
+                .start_deadline = Some(Instant::now() - Duration::from_millis(1));
         }
         process_due_timers(Instant::now());
         assert_eq!(cancel_execution(expired_id), CancelResult::NotFound);
         assert!(matches!(
             expired_completion.wait().await.unwrap(),
-            ExecutionOutcome::Failure(crate::execution::Failure {
+            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
                 drawing_outcome: crate::execution::DrawingOutcome::NotStarted,
                 ..
             })
@@ -2466,7 +2451,7 @@ mod tests {
         let admission = admit_test_execution(id, execution, output).unwrap();
         let (cancelled_id, _output, cancelled_completion) = admission.into_parts();
         assert_eq!(cancel_execution(cancelled_id), CancelResult::Accepted);
-        process_due_timers(Instant::now() + EXECUTION_ADMISSION_TIMEOUT);
+        process_due_timers(Instant::now() + EXECUTION_START_TIMEOUT);
         assert_eq!(
             cancelled_completion.wait().await.unwrap(),
             ExecutionOutcome::Cancelled
@@ -2475,27 +2460,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_mutation_capacity_bounds_disconnected_waiters() {
+    async fn mutation_job_capacity_bounds_disconnected_waiters() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
         let id = list().unwrap()[0].id.clone();
         let active = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        let action = take();
+        let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::Save);
 
         let mut queued = Vec::new();
-        for _ in 1..MAX_DURABLE_MUTATIONS {
+        for _ in 1..MAX_MUTATION_JOBS {
             queued.push(tokio::spawn(save(id.clone())));
             tokio::task::yield_now().await;
         }
         assert_eq!(save(id).await, Err(Error::MutationCapacity));
 
         stop();
-        complete(
-            action.request_id,
-            result(NativeActionResultKind::SaveFailed),
-        );
+        complete_native_action(action.job_id, result(NativeActionResultKind::SaveFailed));
         assert!(matches!(active.await.unwrap(), Err(Error::SaveFailed(_))));
         for waiter in queued {
             assert_eq!(waiter.await.unwrap(), Err(Error::PluginStopping));
@@ -2519,23 +2501,23 @@ mod tests {
         }
     }
 
-    fn step_success() -> StepResult {
-        StepResult {
-            kind: crate::execution::StepResultKind::Success,
+    fn step_success() -> ExecutionStepResult {
+        ExecutionStepResult {
+            kind: crate::execution::ExecutionStepResultKind::Success,
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            cleanup_status: 0,
+            evaluator_state_cleanup_status: 0,
         }
     }
 
     fn document(
-        token: usize,
+        document_token: usize,
         database_token: usize,
         modified: bool,
-    ) -> crate::ffi::NativeDocumentState {
-        crate::ffi::NativeDocumentState {
-            token,
+    ) -> crate::ffi::NativeDocumentSnapshot {
+        crate::ffi::NativeDocumentSnapshot {
+            document_token,
             database_token,
             name: "/tmp/house.dwg".into(),
             named: true,
@@ -2544,7 +2526,7 @@ mod tests {
         }
     }
 
-    fn reset(documents: Vec<crate::ffi::NativeDocumentState>) {
+    fn reset(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
         stop();
         replace_documents(documents);
         start();

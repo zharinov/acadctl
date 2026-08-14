@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::time::Duration;
 
-use acadctl_rpc::{AcadctlClient, Document, ListRequest};
+use acadctl_rpc::{Document, DocumentServiceClient, ListRequest};
 use sysinfo::System;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -59,7 +59,7 @@ async fn query(process_id: u32) -> Instance {
 }
 
 async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
-    let mut client = connect(process_id).await?;
+    let mut client = connect_documents(process_id).await?;
     let listed = client
         .list(ListRequest {})
         .await
@@ -74,8 +74,10 @@ async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
     Ok(listed.documents)
 }
 
-pub async fn connect(process_id: u32) -> Result<AcadctlClient<Channel>, QueryError> {
-    acadctl_rpc::connect(process_id)
+pub async fn connect_documents(
+    process_id: u32,
+) -> Result<DocumentServiceClient<Channel>, QueryError> {
+    acadctl_rpc::connect_documents(process_id)
         .await
         .map_err(|_| QueryError::CannotConnect)
 }

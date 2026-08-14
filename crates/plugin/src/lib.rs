@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cxx::bridge(namespace = "acadctl")]
 mod ffi {
-    struct NativeDocumentState {
-        token: usize,
+    struct NativeDocumentSnapshot {
+        document_token: usize,
         database_token: usize,
         name: String,
         named: bool,
@@ -26,7 +26,7 @@ mod ffi {
     enum NativeActionResultKind {
         Success,
         DocumentGone,
-        DocumentChanged,
+        DocumentGenerationChanged,
         Unnamed,
         ReadOnly,
         Dirty,
@@ -38,8 +38,8 @@ mod ffi {
         UndoDisabled,
         ContextFailed,
         ContextCleanupFailed,
-        ExecutionLeaseFailed,
-        ExecutionStateCleanupFailed,
+        ExecutionCleanupFailed,
+        EvaluatorStateCleanupFailed,
         ExecutionBridgeFailed,
     }
 
@@ -47,13 +47,13 @@ mod ffi {
     #[repr(u8)]
     enum NativeExecutionStepKind {
         Invalid,
-        Begin,
-        Form,
-        Commit,
-        EmitValue,
-        ClearValue,
-        Abort,
-        Rollback,
+        BeginUndoGroup,
+        EvaluateForm,
+        CommitUndoGroup,
+        EmitEvalValue,
+        ClearRetainedEvalValue,
+        CloseEmptyUndoGroup,
+        RollbackUndoGroup,
         Done,
     }
 
@@ -120,7 +120,7 @@ mod ffi {
     }
 
     struct NativeAction {
-        request_id: u64,
+        job_id: u64,
         kind: NativeActionKind,
         document_token: usize,
         database_token: usize,
@@ -139,7 +139,7 @@ mod ffi {
         native_status: i32,
         lisp_errno: i32,
         detail: String,
-        cleanup_status: i32,
+        evaluator_state_cleanup_status: i32,
     }
 
     struct NativeValueEvent {
@@ -168,15 +168,15 @@ mod ffi {
 
         fn start_rpc_server() -> String;
 
-        fn mark_documents_dirty();
+        fn mark_document_snapshot_stale();
 
-        fn take_documents_dirty() -> bool;
+        fn take_document_snapshot_stale() -> bool;
 
-        fn replace_documents(documents: Vec<NativeDocumentState>);
+        fn replace_documents(documents: Vec<NativeDocumentSnapshot>);
 
         fn take_native_action() -> NativeAction;
 
-        fn complete_native_action(request_id: u64, result: NativeActionResult);
+        fn complete_native_action(job_id: u64, result: NativeActionResult);
 
         fn native_actions_need_wake() -> bool;
 
@@ -184,7 +184,7 @@ mod ffi {
 
         fn native_action_wake_failed(status: i32);
 
-        fn take_execution_step(execution_id: u64) -> Box<NativeExecutionStep>;
+        fn take_execution_step(job_id: u64) -> Box<NativeExecutionStep>;
 
         fn execution_step_kind(step: &NativeExecutionStep) -> NativeExecutionStepKind;
 
@@ -198,14 +198,14 @@ mod ffi {
 
         fn native_diagnostic_capture_units() -> usize;
 
-        fn complete_execution_step(execution_id: u64, result: NativeExecutionStepResult) -> bool;
+        fn complete_execution_step(job_id: u64, result: NativeExecutionStepResult) -> bool;
 
-        fn abandon_execution(execution_id: u64, result: NativeExecutionStepResult) -> bool;
+        fn abandon_execution(job_id: u64, result: NativeExecutionStepResult) -> bool;
 
         fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter>;
 
         fn begin_eval_value(
-            execution_id: u64,
+            job_id: u64,
             document_token: usize,
             database_token: usize,
         ) -> Box<NativeValueWriter>;
@@ -238,30 +238,30 @@ mod scheduler;
 use execution::NativeExecutionStep;
 use execution::value_bridge::{NativeValueWriter, ValueEvent, WriteResult};
 
-static DOCUMENTS_DIRTY: AtomicBool = AtomicBool::new(false);
+static DOCUMENT_SNAPSHOT_STALE: AtomicBool = AtomicBool::new(false);
 
 fn start_rpc_server() -> String {
     rpc_server::start().err().unwrap_or_default()
 }
 
-fn mark_documents_dirty() {
-    DOCUMENTS_DIRTY.store(true, Ordering::Relaxed);
+fn mark_document_snapshot_stale() {
+    DOCUMENT_SNAPSHOT_STALE.store(true, Ordering::Relaxed);
 }
 
-fn take_documents_dirty() -> bool {
-    DOCUMENTS_DIRTY.swap(false, Ordering::Relaxed)
+fn take_document_snapshot_stale() -> bool {
+    DOCUMENT_SNAPSHOT_STALE.swap(false, Ordering::Relaxed)
 }
 
-fn replace_documents(documents: Vec<ffi::NativeDocumentState>) {
+fn replace_documents(documents: Vec<ffi::NativeDocumentSnapshot>) {
     rpc_server::replace_documents(documents);
 }
 
 fn take_native_action() -> ffi::NativeAction {
-    scheduler::take()
+    scheduler::take_native_action()
 }
 
-fn complete_native_action(request_id: u64, result: ffi::NativeActionResult) {
-    scheduler::complete(request_id, result);
+fn complete_native_action(job_id: u64, result: ffi::NativeActionResult) {
+    scheduler::complete_native_action(job_id, result);
 }
 
 fn native_actions_need_wake() -> bool {
@@ -276,21 +276,31 @@ fn native_action_wake_failed(status: i32) {
     scheduler::wake_failed(status);
 }
 
-fn take_execution_step(execution_id: u64) -> Box<NativeExecutionStep> {
-    Box::new(scheduler::take_execution_step(execution_id))
+fn take_execution_step(job_id: u64) -> Box<NativeExecutionStep> {
+    Box::new(scheduler::take_execution_step(job_id))
 }
 
 fn execution_step_kind(step: &NativeExecutionStep) -> ffi::NativeExecutionStepKind {
     match step.kind() {
-        execution::StepKind::Invalid => ffi::NativeExecutionStepKind::Invalid,
-        execution::StepKind::Begin => ffi::NativeExecutionStepKind::Begin,
-        execution::StepKind::Form => ffi::NativeExecutionStepKind::Form,
-        execution::StepKind::Commit => ffi::NativeExecutionStepKind::Commit,
-        execution::StepKind::EmitValue => ffi::NativeExecutionStepKind::EmitValue,
-        execution::StepKind::ClearValue => ffi::NativeExecutionStepKind::ClearValue,
-        execution::StepKind::Abort => ffi::NativeExecutionStepKind::Abort,
-        execution::StepKind::Rollback => ffi::NativeExecutionStepKind::Rollback,
-        execution::StepKind::Done => ffi::NativeExecutionStepKind::Done,
+        execution::ExecutionStepKind::Invalid => ffi::NativeExecutionStepKind::Invalid,
+        execution::ExecutionStepKind::BeginUndoGroup => {
+            ffi::NativeExecutionStepKind::BeginUndoGroup
+        }
+        execution::ExecutionStepKind::EvaluateForm => ffi::NativeExecutionStepKind::EvaluateForm,
+        execution::ExecutionStepKind::CommitUndoGroup => {
+            ffi::NativeExecutionStepKind::CommitUndoGroup
+        }
+        execution::ExecutionStepKind::EmitEvalValue => ffi::NativeExecutionStepKind::EmitEvalValue,
+        execution::ExecutionStepKind::ClearRetainedEvalValue => {
+            ffi::NativeExecutionStepKind::ClearRetainedEvalValue
+        }
+        execution::ExecutionStepKind::CloseEmptyUndoGroup => {
+            ffi::NativeExecutionStepKind::CloseEmptyUndoGroup
+        }
+        execution::ExecutionStepKind::RollbackUndoGroup => {
+            ffi::NativeExecutionStepKind::RollbackUndoGroup
+        }
+        execution::ExecutionStepKind::Done => ffi::NativeExecutionStepKind::Done,
     }
 }
 
@@ -314,12 +324,12 @@ fn native_diagnostic_capture_units() -> usize {
     acadctl_rpc::MAX_DIAGNOSTIC_BYTES + 1
 }
 
-fn complete_execution_step(execution_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
-    scheduler::complete_execution_step(execution_id, execution_step_result(result))
+fn complete_execution_step(job_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
+    scheduler::complete_execution_step(job_id, execution_step_result(result))
 }
 
-fn abandon_execution(execution_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
-    scheduler::abandon_execution(execution_id, execution_step_result(result))
+fn abandon_execution(job_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
+    scheduler::abandon_execution(job_id, execution_step_result(result))
 }
 
 fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter> {
@@ -327,12 +337,12 @@ fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValu
 }
 
 fn begin_eval_value(
-    execution_id: u64,
+    job_id: u64,
     document_token: usize,
     database_token: usize,
 ) -> Box<NativeValueWriter> {
     Box::new(scheduler::begin_eval_value(
-        execution_id,
+        job_id,
         document_token,
         database_token,
     ))
@@ -426,19 +436,23 @@ fn native_value_write_result(result: WriteResult) -> ffi::NativeValueWriteResult
     }
 }
 
-fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::StepResult {
+fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::ExecutionStepResult {
     let kind = match result.kind {
-        ffi::NativeExecutionStepResultKind::Success => execution::StepResultKind::Success,
-        ffi::NativeExecutionStepResultKind::LispError => execution::StepResultKind::LispError,
-        ffi::NativeExecutionStepResultKind::NativeError => execution::StepResultKind::NativeError,
-        _ => execution::StepResultKind::NativeError,
+        ffi::NativeExecutionStepResultKind::Success => execution::ExecutionStepResultKind::Success,
+        ffi::NativeExecutionStepResultKind::LispError => {
+            execution::ExecutionStepResultKind::LispError
+        }
+        ffi::NativeExecutionStepResultKind::NativeError => {
+            execution::ExecutionStepResultKind::NativeError
+        }
+        _ => execution::ExecutionStepResultKind::NativeError,
     };
-    execution::StepResult {
+    execution::ExecutionStepResult {
         kind,
         native_status: result.native_status,
         lisp_errno: result.lisp_errno,
         detail: result.detail,
-        cleanup_status: result.cleanup_status,
+        evaluator_state_cleanup_status: result.evaluator_state_cleanup_status,
     }
 }
 

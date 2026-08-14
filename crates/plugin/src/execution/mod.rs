@@ -47,8 +47,8 @@ pub struct Execution {
     value_retained: bool,
     eval_location: Option<SourceLocation>,
     cancel_requested: bool,
-    rollback: Option<RollbackCause>,
-    outcome: Option<Outcome>,
+    unwind: Option<UnwindCause>,
+    outcome: Option<ExecutionOutcome>,
     io: Arc<ExecutionIo>,
 }
 
@@ -96,7 +96,7 @@ pub enum ExecutionMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ValidationError {
+pub enum SourceValidationError {
     SourceTooLarge,
     InvalidUtf8,
     NullCharacter,
@@ -105,14 +105,14 @@ pub enum ValidationError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Outcome {
+pub enum ExecutionOutcome {
     Success,
-    Failure(Failure),
+    Failure(ExecutionFailure),
     Cancelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Failure {
+pub struct ExecutionFailure {
     pub message: String,
     pub form_index: Option<usize>,
     pub location: Option<SourceLocation>,
@@ -135,65 +135,65 @@ pub enum DrawingOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepKind {
+pub enum ExecutionStepKind {
     Invalid,
-    Begin,
-    Form,
-    Commit,
-    EmitValue,
-    ClearValue,
-    Abort,
-    Rollback,
+    BeginUndoGroup,
+    EvaluateForm,
+    CommitUndoGroup,
+    EmitEvalValue,
+    ClearRetainedEvalValue,
+    CloseEmptyUndoGroup,
+    RollbackUndoGroup,
     Done,
 }
 
 pub struct NativeExecutionStep {
-    kind: StepKind,
+    kind: ExecutionStepKind,
     source: Option<Bytes>,
     span: Option<FormSpan>,
     retain_value: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepResultKind {
+pub enum ExecutionStepResultKind {
     Success,
     LispError,
     NativeError,
 }
 
-pub struct StepResult {
-    pub kind: StepResultKind,
+pub struct ExecutionStepResult {
+    pub kind: ExecutionStepResultKind,
     pub native_status: i32,
     pub lisp_errno: i32,
     pub detail: String,
-    pub cleanup_status: i32,
+    pub evaluator_state_cleanup_status: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
-    Begin,
-    AwaitingBegin,
+    BeginUndoGroup,
+    AwaitingBeginUndoGroup,
     BetweenForms,
-    AwaitingForm {
+    AwaitingEvaluateForm {
         index: usize,
         line: usize,
         column: usize,
     },
-    AwaitingCommit,
-    EmitValue,
-    AwaitingEmitValue,
-    ClearValue,
-    AwaitingClearValue,
-    Abort,
-    AwaitingAbort,
-    Rollback,
-    AwaitingRollback,
+    AwaitingCommitUndoGroup,
+    EmitEvalValue,
+    AwaitingEmitEvalValue,
+    ClearRetainedEvalValue,
+    AwaitingClearRetainedEvalValue,
+    CloseEmptyUndoGroup,
+    AwaitingCloseEmptyUndoGroup,
+    RollbackUndoGroup,
+    AwaitingRollbackUndoGroup,
     Terminal,
     Done,
 }
 
-enum RollbackCause {
-    Failure(Failure),
+enum UnwindCause {
+    Failure(ExecutionFailure),
     Cancelled,
 }
 
@@ -347,22 +347,24 @@ impl Execution {
         mode: ExecutionMode,
         source_name: String,
         source: Bytes,
-    ) -> Result<(Self, OutputStream), ValidationError> {
+    ) -> Result<(Self, OutputStream), SourceValidationError> {
         let mut source = source;
         if source.starts_with(&[0xef, 0xbb, 0xbf]) {
             source = source.slice(3..);
         }
         if source.len() > MAX_SOURCE_BYTES {
-            return Err(ValidationError::SourceTooLarge);
+            return Err(SourceValidationError::SourceTooLarge);
         }
-        let source_text = std::str::from_utf8(&source).map_err(|_| ValidationError::InvalidUtf8)?;
+        let source_text =
+            std::str::from_utf8(&source).map_err(|_| SourceValidationError::InvalidUtf8)?;
         if source_text.contains('\0') {
-            return Err(ValidationError::NullCharacter);
+            return Err(SourceValidationError::NullCharacter);
         }
 
-        let form_count = acadctl_lisp::validate(source_text).map_err(ValidationError::Scan)?;
+        let form_count =
+            acadctl_lisp::validate(source_text).map_err(SourceValidationError::Scan)?;
         if mode == ExecutionMode::Eval && form_count != 1 {
-            return Err(ValidationError::ExpectedOneForm { actual: form_count });
+            return Err(SourceValidationError::ExpectedOneForm { actual: form_count });
         }
         let next_scan = acadctl_lisp::scan(source_text).position();
         let empty = form_count == 0;
@@ -381,13 +383,17 @@ impl Execution {
                 source,
                 next_scan,
                 next_form_index: 1,
-                phase: if empty { Phase::Terminal } else { Phase::Begin },
+                phase: if empty {
+                    Phase::Terminal
+                } else {
+                    Phase::BeginUndoGroup
+                },
                 form_attempted: false,
                 value_retained: false,
                 eval_location: None,
                 cancel_requested: false,
-                rollback: None,
-                outcome: empty.then_some(Outcome::Success),
+                unwind: None,
+                outcome: empty.then_some(ExecutionOutcome::Success),
                 io,
             },
             stream,
@@ -399,11 +405,11 @@ impl Execution {
         self.mode
     }
 
-    pub fn outcome(&self) -> Option<&Outcome> {
+    pub fn outcome(&self) -> Option<&ExecutionOutcome> {
         self.outcome.as_ref()
     }
 
-    pub fn take_outcome(&mut self) -> Option<Outcome> {
+    pub fn take_outcome(&mut self) -> Option<ExecutionOutcome> {
         self.outcome.take()
     }
 
@@ -423,21 +429,21 @@ impl Execution {
         self.cancel_requested
     }
 
-    pub fn admission_deadline_pending(&self) -> bool {
+    pub fn start_deadline_pending(&self) -> bool {
         !self.form_attempted
             && self.outcome.is_none()
             && !self.cancel_requested
-            && self.rollback.is_none()
+            && self.unwind.is_none()
     }
 
     pub(crate) fn acquire_form_output(&self) -> Option<ValueOutputLease> {
-        matches!(self.phase, Phase::AwaitingForm { .. })
+        matches!(self.phase, Phase::AwaitingEvaluateForm { .. })
             .then(|| self.io.acquire_value_output(ValueOutputKind::Form))
             .flatten()
     }
 
     pub(crate) fn acquire_eval_value_output(&self) -> Option<ValueOutputLease> {
-        matches!(self.phase, Phase::AwaitingEmitValue)
+        matches!(self.phase, Phase::AwaitingEmitEvalValue)
             .then(|| self.io.acquire_value_output(ValueOutputKind::EvalValue))
             .flatten()
     }
@@ -446,20 +452,20 @@ impl Execution {
         if self.cancel_requested {
             return true;
         }
-        if self.rollback.is_some() {
+        if self.unwind.is_some() {
             return false;
         }
         if matches!(
             self.phase,
-            Phase::AwaitingCommit
-                | Phase::EmitValue
-                | Phase::AwaitingEmitValue
-                | Phase::ClearValue
-                | Phase::AwaitingClearValue
-                | Phase::Abort
-                | Phase::AwaitingAbort
-                | Phase::Rollback
-                | Phase::AwaitingRollback
+            Phase::AwaitingCommitUndoGroup
+                | Phase::EmitEvalValue
+                | Phase::AwaitingEmitEvalValue
+                | Phase::ClearRetainedEvalValue
+                | Phase::AwaitingClearRetainedEvalValue
+                | Phase::CloseEmptyUndoGroup
+                | Phase::AwaitingCloseEmptyUndoGroup
+                | Phase::RollbackUndoGroup
+                | Phase::AwaitingRollbackUndoGroup
                 | Phase::Terminal
                 | Phase::Done
         ) {
@@ -474,34 +480,34 @@ impl Execution {
             return false;
         }
 
-        let failure = Failure {
+        let failure = ExecutionFailure {
             message,
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::NotStarted,
         };
         match self.phase {
-            Phase::Begin => {
-                self.outcome = Some(Outcome::Failure(failure));
+            Phase::BeginUndoGroup => {
+                self.outcome = Some(ExecutionOutcome::Failure(failure));
                 self.phase = Phase::Terminal;
             }
-            Phase::AwaitingBegin => {
-                self.rollback = Some(RollbackCause::Failure(failure));
+            Phase::AwaitingBeginUndoGroup => {
+                self.unwind = Some(UnwindCause::Failure(failure));
             }
             Phase::BetweenForms => {
-                self.rollback = Some(RollbackCause::Failure(failure));
-                self.phase = Phase::Abort;
+                self.unwind = Some(UnwindCause::Failure(failure));
+                self.phase = Phase::CloseEmptyUndoGroup;
             }
-            Phase::AwaitingForm { .. }
-            | Phase::AwaitingCommit
-            | Phase::EmitValue
-            | Phase::AwaitingEmitValue
-            | Phase::ClearValue
-            | Phase::AwaitingClearValue
-            | Phase::Abort
-            | Phase::AwaitingAbort
-            | Phase::Rollback
-            | Phase::AwaitingRollback
+            Phase::AwaitingEvaluateForm { .. }
+            | Phase::AwaitingCommitUndoGroup
+            | Phase::EmitEvalValue
+            | Phase::AwaitingEmitEvalValue
+            | Phase::ClearRetainedEvalValue
+            | Phase::AwaitingClearRetainedEvalValue
+            | Phase::CloseEmptyUndoGroup
+            | Phase::AwaitingCloseEmptyUndoGroup
+            | Phase::RollbackUndoGroup
+            | Phase::AwaitingRollbackUndoGroup
             | Phase::Terminal
             | Phase::Done => return false,
         }
@@ -509,11 +515,11 @@ impl Execution {
     }
 
     pub fn cancel_before_start(&mut self) -> bool {
-        if self.outcome.is_some() || !matches!(self.phase, Phase::Begin) {
+        if self.outcome.is_some() || !matches!(self.phase, Phase::BeginUndoGroup) {
             return false;
         }
         self.cancel_requested = true;
-        self.outcome = Some(Outcome::Cancelled);
+        self.outcome = Some(ExecutionOutcome::Cancelled);
         self.phase = Phase::Terminal;
         true
     }
@@ -521,22 +527,22 @@ impl Execution {
     pub fn take_step(&mut self) -> NativeExecutionStep {
         loop {
             match self.phase {
-                Phase::Begin => {
+                Phase::BeginUndoGroup => {
                     if self.cancel_requested {
-                        self.outcome = Some(Outcome::Cancelled);
+                        self.outcome = Some(ExecutionOutcome::Cancelled);
                         self.phase = Phase::Terminal;
                         continue;
                     }
-                    self.phase = Phase::AwaitingBegin;
-                    return NativeExecutionStep::new(StepKind::Begin);
+                    self.phase = Phase::AwaitingBeginUndoGroup;
+                    return NativeExecutionStep::new(ExecutionStepKind::BeginUndoGroup);
                 }
                 Phase::BetweenForms => {
                     if self.cancel_requested {
                         if self.form_attempted {
-                            self.queue_rollback(RollbackCause::Cancelled);
+                            self.begin_unwind(UnwindCause::Cancelled);
                         } else {
-                            self.rollback = Some(RollbackCause::Cancelled);
-                            self.phase = Phase::Abort;
+                            self.unwind = Some(UnwindCause::Cancelled);
+                            self.phase = Phase::CloseEmptyUndoGroup;
                         }
                         continue;
                     }
@@ -548,7 +554,7 @@ impl Execution {
                             self.next_scan = scanner.position();
                             let index = self.next_form_index;
                             self.next_form_index += 1;
-                            self.phase = Phase::AwaitingForm {
+                            self.phase = Phase::AwaitingEvaluateForm {
                                 index,
                                 line: span.line,
                                 column: span.column,
@@ -569,7 +575,7 @@ impl Execution {
                             );
                         }
                         Some(Err(error)) => {
-                            self.queue_rollback(RollbackCause::Failure(Failure {
+                            self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                                 message: error.kind.message().to_owned(),
                                 form_index: None,
                                 location: Some(SourceLocation {
@@ -581,67 +587,67 @@ impl Execution {
                             }));
                         }
                         None => {
-                            self.phase = Phase::AwaitingCommit;
-                            return NativeExecutionStep::new(StepKind::Commit);
+                            self.phase = Phase::AwaitingCommitUndoGroup;
+                            return NativeExecutionStep::new(ExecutionStepKind::CommitUndoGroup);
                         }
                     }
                 }
-                Phase::EmitValue => {
+                Phase::EmitEvalValue => {
                     self.io.begin_value_output(ValueOutputKind::EvalValue);
-                    self.phase = Phase::AwaitingEmitValue;
-                    return NativeExecutionStep::new(StepKind::EmitValue);
+                    self.phase = Phase::AwaitingEmitEvalValue;
+                    return NativeExecutionStep::new(ExecutionStepKind::EmitEvalValue);
                 }
-                Phase::ClearValue => {
-                    self.phase = Phase::AwaitingClearValue;
-                    return NativeExecutionStep::new(StepKind::ClearValue);
+                Phase::ClearRetainedEvalValue => {
+                    self.phase = Phase::AwaitingClearRetainedEvalValue;
+                    return NativeExecutionStep::new(ExecutionStepKind::ClearRetainedEvalValue);
                 }
-                Phase::Abort => {
-                    self.phase = Phase::AwaitingAbort;
-                    return NativeExecutionStep::new(StepKind::Abort);
+                Phase::CloseEmptyUndoGroup => {
+                    self.phase = Phase::AwaitingCloseEmptyUndoGroup;
+                    return NativeExecutionStep::new(ExecutionStepKind::CloseEmptyUndoGroup);
                 }
-                Phase::Rollback => {
-                    self.phase = Phase::AwaitingRollback;
-                    return NativeExecutionStep::new(StepKind::Rollback);
+                Phase::RollbackUndoGroup => {
+                    self.phase = Phase::AwaitingRollbackUndoGroup;
+                    return NativeExecutionStep::new(ExecutionStepKind::RollbackUndoGroup);
                 }
                 Phase::Terminal => {
                     self.phase = Phase::Done;
-                    return NativeExecutionStep::new(StepKind::Done);
+                    return NativeExecutionStep::new(ExecutionStepKind::Done);
                 }
-                Phase::AwaitingBegin
-                | Phase::AwaitingForm { .. }
-                | Phase::AwaitingCommit
-                | Phase::AwaitingEmitValue
-                | Phase::AwaitingClearValue
-                | Phase::AwaitingAbort
-                | Phase::AwaitingRollback
-                | Phase::Done => return NativeExecutionStep::new(StepKind::Invalid),
+                Phase::AwaitingBeginUndoGroup
+                | Phase::AwaitingEvaluateForm { .. }
+                | Phase::AwaitingCommitUndoGroup
+                | Phase::AwaitingEmitEvalValue
+                | Phase::AwaitingClearRetainedEvalValue
+                | Phase::AwaitingCloseEmptyUndoGroup
+                | Phase::AwaitingRollbackUndoGroup
+                | Phase::Done => return NativeExecutionStep::new(ExecutionStepKind::Invalid),
             }
         }
     }
 
-    pub fn complete_step(&mut self, result: StepResult) -> bool {
+    pub fn complete_step(&mut self, result: ExecutionStepResult) -> bool {
         match self.phase {
-            Phase::AwaitingBegin => {
+            Phase::AwaitingBeginUndoGroup => {
                 if result.succeeded() {
-                    if self.rollback.is_some() {
-                        self.phase = Phase::Abort;
+                    if self.unwind.is_some() {
+                        self.phase = Phase::CloseEmptyUndoGroup;
                     } else if self.cancel_requested {
-                        self.rollback = Some(RollbackCause::Cancelled);
-                        self.phase = Phase::Abort;
+                        self.unwind = Some(UnwindCause::Cancelled);
+                        self.phase = Phase::CloseEmptyUndoGroup;
                     } else {
                         self.phase = Phase::BetweenForms;
                     }
-                } else if matches!(self.rollback, Some(RollbackCause::Failure(_))) {
-                    let Some(RollbackCause::Failure(mut failure)) = self.rollback.take() else {
-                        unreachable!("the rollback cause was just matched")
+                } else if matches!(self.unwind, Some(UnwindCause::Failure(_))) {
+                    let Some(UnwindCause::Failure(mut failure)) = self.unwind.take() else {
+                        unreachable!("the unwind cause was just matched")
                     };
                     let begin = result.into_message("could not begin the undo group");
                     append_diagnostic(&mut failure.message, &begin);
-                    self.outcome = Some(Outcome::Failure(failure));
+                    self.outcome = Some(ExecutionOutcome::Failure(failure));
                     self.phase = Phase::Terminal;
                 } else {
-                    self.rollback = None;
-                    self.outcome = Some(Outcome::Failure(Failure {
+                    self.unwind = None;
+                    self.outcome = Some(ExecutionOutcome::Failure(ExecutionFailure {
                         message: result.into_message("could not begin the undo group"),
                         form_index: None,
                         location: None,
@@ -650,7 +656,7 @@ impl Execution {
                     self.phase = Phase::Terminal;
                 }
             }
-            Phase::AwaitingForm {
+            Phase::AwaitingEvaluateForm {
                 index,
                 line,
                 column,
@@ -660,7 +666,7 @@ impl Execution {
                     self.value_retained = true;
                 }
                 if result.primary_failed() {
-                    self.queue_rollback(RollbackCause::Failure(Failure {
+                    self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
                         location: Some(SourceLocation {
@@ -672,10 +678,10 @@ impl Execution {
                     }));
                 } else if let Some(failure) = bridge_failure {
                     let mut message = failure.message().to_owned();
-                    if let Some(cleanup) = result.cleanup_message() {
+                    if let Some(cleanup) = result.evaluator_state_cleanup_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
-                    self.queue_rollback(RollbackCause::Failure(Failure {
+                    self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                         message,
                         form_index: Some(index),
                         location: Some(SourceLocation {
@@ -686,7 +692,7 @@ impl Execution {
                         drawing_outcome: DrawingOutcome::Unknown,
                     }));
                 } else if !result.succeeded() {
-                    self.queue_rollback(RollbackCause::Failure(Failure {
+                    self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
                         location: Some(SourceLocation {
@@ -698,28 +704,28 @@ impl Execution {
                     }));
                 } else {
                     if self.cancel_requested {
-                        self.queue_rollback(RollbackCause::Cancelled);
+                        self.begin_unwind(UnwindCause::Cancelled);
                     } else {
                         self.phase = Phase::BetweenForms;
                     }
                 }
             }
-            Phase::AwaitingCommit => {
+            Phase::AwaitingCommitUndoGroup => {
                 if result.succeeded() {
                     if self.mode == ExecutionMode::Eval && self.value_retained {
-                        self.phase = Phase::EmitValue;
+                        self.phase = Phase::EmitEvalValue;
                     } else if self.mode == ExecutionMode::Eval {
-                        self.outcome = Some(Outcome::Failure(self.eval_failure(
+                        self.outcome = Some(ExecutionOutcome::Failure(self.eval_failure(
                             "the AutoLISP evaluator did not retain its result value".to_owned(),
                             DrawingOutcome::Committed,
                         )));
                         self.phase = Phase::Terminal;
                     } else {
-                        self.outcome = Some(Outcome::Success);
+                        self.outcome = Some(ExecutionOutcome::Success);
                         self.phase = Phase::Terminal;
                     }
                 } else {
-                    self.queue_rollback(RollbackCause::Failure(Failure {
+                    self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                         message: result.into_message("could not finish the undo group"),
                         form_index: None,
                         location: None,
@@ -727,13 +733,13 @@ impl Execution {
                     }));
                 }
             }
-            Phase::AwaitingEmitValue => {
+            Phase::AwaitingEmitEvalValue => {
                 let bridge_failure = self.io.close_value_output(ValueOutputKind::EvalValue);
                 let failure = if result.primary_failed() {
                     Some(result.into_message("could not emit the eval result"))
                 } else if let Some(bridge_failure) = bridge_failure {
                     let mut message = bridge_failure.message().to_owned();
-                    if let Some(cleanup) = result.cleanup_message() {
+                    if let Some(cleanup) = result.evaluator_state_cleanup_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
                     Some(message)
@@ -743,16 +749,16 @@ impl Execution {
                     None
                 };
                 if let Some(message) = failure {
-                    self.outcome = Some(Outcome::Failure(
+                    self.outcome = Some(ExecutionOutcome::Failure(
                         self.eval_failure(message, DrawingOutcome::Committed),
                     ));
                 } else {
                     self.value_retained = false;
-                    self.outcome = Some(Outcome::Success);
+                    self.outcome = Some(ExecutionOutcome::Success);
                 }
                 self.phase = Phase::Terminal;
             }
-            Phase::AwaitingClearValue => {
+            Phase::AwaitingClearRetainedEvalValue => {
                 if result.succeeded() {
                     self.value_retained = false;
                 } else {
@@ -760,53 +766,53 @@ impl Execution {
                         .into_message("could not clear the retained AutoLISP evaluator value");
                     self.record_value_cleanup_failure(cleanup);
                 }
-                self.phase = Phase::Rollback;
+                self.phase = Phase::RollbackUndoGroup;
             }
-            Phase::AwaitingAbort => {
-                let Some(cause) = self.rollback.take() else {
+            Phase::AwaitingCloseEmptyUndoGroup => {
+                let Some(cause) = self.unwind.take() else {
                     return false;
                 };
                 self.outcome = Some(match cause {
-                    RollbackCause::Cancelled if result.succeeded() => Outcome::Cancelled,
-                    RollbackCause::Cancelled => Outcome::Failure(Failure {
+                    UnwindCause::Cancelled if result.succeeded() => ExecutionOutcome::Cancelled,
+                    UnwindCause::Cancelled => ExecutionOutcome::Failure(ExecutionFailure {
                         message: result.into_message("could not close the cancelled undo group"),
                         form_index: None,
                         location: None,
                         drawing_outcome: DrawingOutcome::Unknown,
                     }),
-                    RollbackCause::Failure(failure) if result.succeeded() => {
-                        Outcome::Failure(failure)
+                    UnwindCause::Failure(failure) if result.succeeded() => {
+                        ExecutionOutcome::Failure(failure)
                     }
-                    RollbackCause::Failure(mut failure) => {
+                    UnwindCause::Failure(mut failure) => {
                         let cleanup = result.into_message("could not close the expired undo group");
                         append_diagnostic(&mut failure.message, &cleanup);
                         failure.drawing_outcome = DrawingOutcome::Unknown;
-                        Outcome::Failure(failure)
+                        ExecutionOutcome::Failure(failure)
                     }
                 });
                 self.phase = Phase::Terminal;
             }
-            Phase::AwaitingRollback => {
-                let Some(cause) = self.rollback.take() else {
+            Phase::AwaitingRollbackUndoGroup => {
+                let Some(cause) = self.unwind.take() else {
                     return false;
                 };
                 self.outcome = Some(match cause {
-                    RollbackCause::Failure(mut failure) => {
+                    UnwindCause::Failure(mut failure) => {
                         if result.succeeded() {
                             failure.drawing_outcome = DrawingOutcome::RolledBack;
                         } else {
-                            let rollback = result.into_message("drawing rollback failed");
-                            append_diagnostic(&mut failure.message, &rollback);
+                            let unwind = result.into_message("drawing unwind failed");
+                            append_diagnostic(&mut failure.message, &unwind);
                             failure.drawing_outcome = DrawingOutcome::Unknown;
                         }
-                        Outcome::Failure(failure)
+                        ExecutionOutcome::Failure(failure)
                     }
-                    RollbackCause::Cancelled => {
+                    UnwindCause::Cancelled => {
                         if result.succeeded() {
-                            Outcome::Cancelled
+                            ExecutionOutcome::Cancelled
                         } else {
-                            Outcome::Failure(Failure {
-                                message: result.into_message("drawing rollback failed"),
+                            ExecutionOutcome::Failure(ExecutionFailure {
+                                message: result.into_message("drawing unwind failed"),
                                 form_index: None,
                                 location: None,
                                 drawing_outcome: DrawingOutcome::Unknown,
@@ -816,42 +822,42 @@ impl Execution {
                 });
                 self.phase = Phase::Terminal;
             }
-            Phase::Begin
+            Phase::BeginUndoGroup
             | Phase::BetweenForms
-            | Phase::EmitValue
-            | Phase::ClearValue
-            | Phase::Abort
-            | Phase::Rollback
+            | Phase::EmitEvalValue
+            | Phase::ClearRetainedEvalValue
+            | Phase::CloseEmptyUndoGroup
+            | Phase::RollbackUndoGroup
             | Phase::Terminal
             | Phase::Done => return false,
         }
         true
     }
 
-    fn queue_rollback(&mut self, cause: RollbackCause) {
-        self.rollback = Some(cause);
+    fn begin_unwind(&mut self, cause: UnwindCause) {
+        self.unwind = Some(cause);
         self.phase = if self.mode == ExecutionMode::Eval && self.form_attempted {
-            Phase::ClearValue
+            Phase::ClearRetainedEvalValue
         } else {
-            Phase::Rollback
+            Phase::RollbackUndoGroup
         };
     }
 
     fn record_value_cleanup_failure(&mut self, cleanup: String) {
-        let cause = match self.rollback.take() {
-            Some(RollbackCause::Failure(mut failure)) => {
+        let cause = match self.unwind.take() {
+            Some(UnwindCause::Failure(mut failure)) => {
                 append_diagnostic(&mut failure.message, &cleanup);
-                RollbackCause::Failure(failure)
+                UnwindCause::Failure(failure)
             }
-            Some(RollbackCause::Cancelled) | None => {
-                RollbackCause::Failure(self.eval_failure(cleanup, DrawingOutcome::Unknown))
+            Some(UnwindCause::Cancelled) | None => {
+                UnwindCause::Failure(self.eval_failure(cleanup, DrawingOutcome::Unknown))
             }
         };
-        self.rollback = Some(cause);
+        self.unwind = Some(cause);
     }
 
-    fn eval_failure(&self, message: String, drawing_outcome: DrawingOutcome) -> Failure {
-        Failure {
+    fn eval_failure(&self, message: String, drawing_outcome: DrawingOutcome) -> ExecutionFailure {
+        ExecutionFailure {
             message: bounded_diagnostic(message),
             form_index: Some(1),
             location: self.eval_location.clone(),
@@ -859,61 +865,61 @@ impl Execution {
         }
     }
 
-    pub fn record_terminal_failure(&mut self, result: StepResult) -> bool {
+    pub fn record_terminal_failure(&mut self, result: ExecutionStepResult) -> bool {
         let cleanup = result.into_message("the native execution lease could not be released");
         let Some(outcome) = self.outcome.take() else {
             return false;
         };
         let failure = match outcome {
-            Outcome::Success => Failure {
+            ExecutionOutcome::Success => ExecutionFailure {
                 message: cleanup,
                 form_index: None,
                 location: None,
                 drawing_outcome: DrawingOutcome::Unknown,
             },
-            Outcome::Failure(mut failure) => {
+            ExecutionOutcome::Failure(mut failure) => {
                 append_diagnostic(&mut failure.message, &cleanup);
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
-            Outcome::Cancelled => Failure {
+            ExecutionOutcome::Cancelled => ExecutionFailure {
                 message: cleanup,
                 form_index: None,
                 location: None,
                 drawing_outcome: DrawingOutcome::Unknown,
             },
         };
-        self.outcome = Some(Outcome::Failure(failure));
+        self.outcome = Some(ExecutionOutcome::Failure(failure));
         true
     }
 
-    pub fn abandon(&mut self, result: StepResult) -> bool {
+    pub fn abandon(&mut self, result: ExecutionStepResult) -> bool {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
-        if matches!(phase, Phase::AwaitingForm { .. }) {
+        if matches!(phase, Phase::AwaitingEvaluateForm { .. }) {
             let _ = self.io.close_value_output(ValueOutputKind::Form);
-        } else if phase == Phase::AwaitingEmitValue {
+        } else if phase == Phase::AwaitingEmitEvalValue {
             let _ = self.io.close_value_output(ValueOutputKind::EvalValue);
         }
         let existing = self.outcome.take().or_else(|| {
-            self.rollback.take().map(|cause| match cause {
-                RollbackCause::Failure(failure) => Outcome::Failure(failure),
-                RollbackCause::Cancelled => Outcome::Cancelled,
+            self.unwind.take().map(|cause| match cause {
+                UnwindCause::Failure(failure) => ExecutionOutcome::Failure(failure),
+                UnwindCause::Cancelled => ExecutionOutcome::Cancelled,
             })
         });
         let failure = match existing {
-            Some(Outcome::Success) => Failure {
+            Some(ExecutionOutcome::Success) => ExecutionFailure {
                 message,
                 form_index: None,
                 location: None,
                 drawing_outcome: DrawingOutcome::Unknown,
             },
-            Some(Outcome::Failure(mut failure)) => {
+            Some(ExecutionOutcome::Failure(mut failure)) => {
                 append_diagnostic(&mut failure.message, &message);
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
-            Some(Outcome::Cancelled) => Failure {
+            Some(ExecutionOutcome::Cancelled) => ExecutionFailure {
                 message,
                 form_index: None,
                 location: None,
@@ -921,7 +927,7 @@ impl Execution {
             },
             None => {
                 let (form_index, location) = match phase {
-                    Phase::AwaitingForm {
+                    Phase::AwaitingEvaluateForm {
                         index,
                         line,
                         column,
@@ -933,10 +939,10 @@ impl Execution {
                             column,
                         }),
                     ),
-                    Phase::AwaitingEmitValue => (Some(1), self.eval_location.clone()),
+                    Phase::AwaitingEmitEvalValue => (Some(1), self.eval_location.clone()),
                     _ => (None, None),
                 };
-                Failure {
+                ExecutionFailure {
                     message,
                     form_index,
                     location,
@@ -944,7 +950,7 @@ impl Execution {
                 }
             }
         };
-        self.outcome = Some(Outcome::Failure(failure));
+        self.outcome = Some(ExecutionOutcome::Failure(failure));
         self.phase = if phase == Phase::Done {
             Phase::Done
         } else {
@@ -956,10 +962,10 @@ impl Execution {
 
 impl NativeExecutionStep {
     pub fn invalid() -> Self {
-        Self::new(StepKind::Invalid)
+        Self::new(ExecutionStepKind::Invalid)
     }
 
-    fn new(kind: StepKind) -> Self {
+    fn new(kind: ExecutionStepKind) -> Self {
         Self {
             kind,
             source: None,
@@ -970,14 +976,14 @@ impl NativeExecutionStep {
 
     fn form(source: Bytes, span: FormSpan, retain_value: bool) -> Self {
         Self {
-            kind: StepKind::Form,
+            kind: ExecutionStepKind::EvaluateForm,
             source: Some(source),
             span: Some(span),
             retain_value,
         }
     }
 
-    pub const fn kind(&self) -> StepKind {
+    pub const fn kind(&self) -> ExecutionStepKind {
         self.kind
     }
 
@@ -997,31 +1003,31 @@ impl NativeExecutionStep {
     }
 }
 
-impl StepResult {
+impl ExecutionStepResult {
     fn succeeded(&self) -> bool {
-        self.kind == StepResultKind::Success && self.cleanup_status == 0
+        self.kind == ExecutionStepResultKind::Success && self.evaluator_state_cleanup_status == 0
     }
 
     fn primary_failed(&self) -> bool {
-        self.kind != StepResultKind::Success
+        self.kind != ExecutionStepResultKind::Success
     }
 
-    fn cleanup_message(&self) -> Option<String> {
-        (self.cleanup_status != 0).then(|| {
+    fn evaluator_state_cleanup_message(&self) -> Option<String> {
+        (self.evaluator_state_cleanup_status != 0).then(|| {
             format!(
-                "could not clear the reserved AutoLISP execution state (native status {})",
-                self.cleanup_status
+                "could not clear the reserved AutoLISP evaluator state (native status {})",
+                self.evaluator_state_cleanup_status
             )
         })
     }
 
     fn into_message(self, fallback: &str) -> String {
-        let cleanup = self.cleanup_message();
-        let primary = if self.kind == StepResultKind::Success {
+        let cleanup = self.evaluator_state_cleanup_message();
+        let primary = if self.kind == ExecutionStepResultKind::Success {
             None
         } else if !self.detail.is_empty() {
             Some(self.detail)
-        } else if self.kind == StepResultKind::LispError && self.lisp_errno != 0 {
+        } else if self.kind == ExecutionStepResultKind::LispError && self.lisp_errno != 0 {
             Some(format!("{fallback} (ERRNO {})", self.lisp_errno))
         } else if self.native_status != 0 {
             Some(format!("{fallback} (native status {})", self.native_status))
@@ -1077,13 +1083,13 @@ mod tests {
             )
             .err()
             .unwrap(),
-            ValidationError::SourceTooLarge
+            SourceValidationError::SourceTooLarge
         );
         assert_eq!(
             Execution::new(ExecutionMode::Exec, "<stdin>".into(), "x\0y".into())
                 .err()
                 .unwrap(),
-            ValidationError::NullCharacter
+            SourceValidationError::NullCharacter
         );
         assert_eq!(
             Execution::new(
@@ -1093,11 +1099,11 @@ mod tests {
             )
             .err()
             .unwrap(),
-            ValidationError::InvalidUtf8
+            SourceValidationError::InvalidUtf8
         );
         assert!(matches!(
             Execution::new(ExecutionMode::Exec, "<stdin>".into(), "(unfinished".into(),),
-            Err(ValidationError::Scan(_))
+            Err(SourceValidationError::Scan(_))
         ));
     }
 
@@ -1108,10 +1114,13 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Exec, "<stdin>".into(), source).unwrap();
         assert_eq!(execution.source.as_ptr(), expected);
-        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::BeginUndoGroup
+        );
         assert!(execution.complete_step(success()));
         let form = execution.take_step();
-        assert_eq!(form.kind(), StepKind::Form);
+        assert_eq!(form.kind(), ExecutionStepKind::EvaluateForm);
         assert_eq!(form.source.as_ref().unwrap().as_ptr(), expected);
         assert_eq!(form.source(), "form");
     }
@@ -1122,13 +1131,13 @@ mod tests {
             Execution::new(ExecutionMode::Eval, "<stdin>".into(), "".into())
                 .err()
                 .unwrap(),
-            ValidationError::ExpectedOneForm { actual: 0 }
+            SourceValidationError::ExpectedOneForm { actual: 0 }
         );
         assert_eq!(
             Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a b".into())
                 .err()
                 .unwrap(),
-            ValidationError::ExpectedOneForm { actual: 2 }
+            SourceValidationError::ExpectedOneForm { actual: 2 }
         );
         let eval = Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a".into())
             .unwrap()
@@ -1156,23 +1165,29 @@ mod tests {
         .unwrap()
         .0;
 
-        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::BeginUndoGroup
+        );
         assert!(execution.complete_step(success()));
 
         let first = execution.take_step();
-        assert_eq!(first.kind(), StepKind::Form);
+        assert_eq!(first.kind(), ExecutionStepKind::EvaluateForm);
         assert_eq!(first.source(), "(setq x 1)");
         assert!(execution.complete_step(success()));
 
         let second = execution.take_step();
-        assert_eq!(second.kind(), StepKind::Form);
+        assert_eq!(second.kind(), ExecutionStepKind::EvaluateForm);
         assert_eq!(second.source(), "(+ x 2)");
         assert!(execution.complete_step(success()));
 
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Success));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Success));
     }
 
     #[test]
@@ -1182,14 +1197,20 @@ mod tests {
         begin(&mut execution);
 
         let form = execution.take_step();
-        assert_eq!(form.kind(), StepKind::Form);
+        assert_eq!(form.kind(), ExecutionStepKind::EvaluateForm);
         assert!(form.retain_value());
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(!execution.request_cancel());
         assert!(execution.complete_step(success()));
 
-        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EmitEvalValue
+        );
         let lease = execution
             .acquire_eval_value_output()
             .expect("the post-commit value epoch is open");
@@ -1198,8 +1219,8 @@ mod tests {
         assert_eq!(writer.finish(), WriteResult::Continue);
         assert!(execution.complete_step(success()));
 
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Success));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Success));
     }
 
     #[test]
@@ -1211,20 +1232,23 @@ mod tests {
         begin(&mut execution);
 
         let form = execution.take_step();
-        assert_eq!(form.kind(), StepKind::Form);
+        assert_eq!(form.kind(), ExecutionStepKind::EvaluateForm);
         assert!(!form.retain_value());
     }
 
     #[test]
     fn a_missing_post_commit_writer_is_a_committed_failure() {
         let mut execution = eval_through_commit();
-        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EmitEvalValue
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "the AutoLISP evaluator did not emit its result value".into(),
                 form_index: Some(1),
                 location: Some(SourceLocation {
@@ -1240,11 +1264,14 @@ mod tests {
     #[test]
     fn a_post_commit_native_failure_never_requests_rollback() {
         let mut execution = eval_through_commit();
-        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EmitEvalValue
+        );
         assert!(execution.complete_step(native_error("value visitor failed", -5001)));
 
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected committed serialization failure");
         };
         assert_eq!(failure.message, "value visitor failed");
@@ -1255,18 +1282,21 @@ mod tests {
     #[test]
     fn post_commit_failure_keeps_visitor_and_cleanup_evidence() {
         let mut execution = eval_through_commit();
-        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EmitEvalValue
+        );
         assert!(
             execution.complete_step(with_cleanup(lisp_error("value visitor failed", 7), -5001,))
         );
 
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected committed serialization failure");
         };
         assert_eq!(
             failure.message,
-            "value visitor failed; could not clear the reserved AutoLISP execution state (native status -5001)"
+            "value visitor failed; could not clear the reserved AutoLISP evaluator state (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
     }
@@ -1274,16 +1304,19 @@ mod tests {
     #[test]
     fn post_commit_bridge_failure_keeps_cleanup_evidence() {
         let mut execution = eval_through_commit();
-        assert_eq!(execution.take_step().kind(), StepKind::EmitValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EmitEvalValue
+        );
         assert!(execution.complete_step(with_cleanup(success(), -5001)));
 
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected committed serialization failure");
         };
         assert_eq!(
             failure.message,
-            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP execution state (native status -5001)"
+            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP evaluator state (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
     }
@@ -1293,16 +1326,25 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.request_cancel());
         assert!(execution.complete_step(success()));
 
-        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::ClearRetainedEvalValue
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Cancelled));
     }
 
     #[test]
@@ -1310,17 +1352,26 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.request_cancel());
         assert!(execution.complete_step(success()));
 
-        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::ClearRetainedEvalValue
+        );
         assert!(execution.complete_step(native_error("value cleanup failed", -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected cleanup failure");
         };
         assert_eq!(failure.message, "value cleanup failed");
@@ -1333,21 +1384,30 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(with_cleanup(lisp_error("bad argument type", 7), -5001,)));
 
-        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::ClearRetainedEvalValue
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected evaluation failure");
         };
         assert_eq!(
             failure.message,
-            "bad argument type; could not clear the reserved AutoLISP execution state (native status -5001)"
+            "bad argument type; could not clear the reserved AutoLISP evaluator state (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1364,12 +1424,15 @@ mod tests {
         assert_eq!(execution.take_step().source(), "bad");
         assert!(execution.complete_step(lisp_error("bad argument type", 7)));
 
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "bad argument type".into(),
                 form_index: Some(2),
                 location: Some(SourceLocation {
@@ -1388,13 +1451,19 @@ mod tests {
             .unwrap()
             .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(lisp_error("boom", 0)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(native_error("U failed", -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
         assert_eq!(failure.message, "boom; U failed");
@@ -1407,17 +1476,26 @@ mod tests {
             .unwrap()
             .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(execution.complete_step(native_error("End failed", -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "End failed".into(),
                 form_index: None,
                 location: None,
@@ -1432,17 +1510,29 @@ mod tests {
             .unwrap()
             .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(execution.complete_step(native_error("End failed", -5001)));
 
-        assert_eq!(execution.take_step().kind(), StepKind::ClearValue);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::ClearRetainedEvalValue
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected commit failure");
         };
         assert_eq!(failure.message, "End failed");
@@ -1454,13 +1544,16 @@ mod tests {
         let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into())
             .unwrap()
             .0;
-        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::BeginUndoGroup
+        );
         assert!(execution.complete_step(native_error("Begin failed", -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "Begin failed".into(),
                 form_index: None,
                 location: None,
@@ -1475,7 +1568,7 @@ mod tests {
         assert!(execution.record_terminal_failure(native_error("unlock failed", 42)));
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "unlock failed".into(),
                 form_index: None,
                 location: None,
@@ -1490,14 +1583,20 @@ mod tests {
             .unwrap()
             .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(lisp_error("boom", 0)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
         assert!(execution.record_terminal_failure(native_error("restore failed", 43)));
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
         assert_eq!(failure.message, "boom; restore failed");
@@ -1522,10 +1621,10 @@ mod tests {
             "the target database changed during execution",
             -5001,
         )));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "the target database changed during execution".into(),
                 form_index: Some(2),
                 location: Some(SourceLocation {
@@ -1544,13 +1643,19 @@ mod tests {
             .unwrap()
             .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(lisp_error("boom", 0)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
 
         assert!(execution.abandon(native_error("database replaced", -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
         assert_eq!(failure.message, "boom; database replaced");
@@ -1563,8 +1668,8 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
 
         assert!(execution.request_cancel());
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Cancelled));
     }
 
     #[test]
@@ -1572,13 +1677,19 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
 
-        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::BeginUndoGroup
+        );
         assert!(execution.request_cancel());
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Abort);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CloseEmptyUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Cancelled));
     }
 
     #[test]
@@ -1587,13 +1698,19 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
 
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.request_cancel());
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Cancelled));
     }
 
     #[test]
@@ -1602,13 +1719,19 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
         begin(&mut execution);
 
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.request_cancel());
         assert!(execution.complete_step(lisp_error("boom", 0)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected the evaluator failure");
         };
         assert_eq!(failure.message, "boom");
@@ -1621,15 +1744,21 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
         begin(&mut execution);
 
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         execution
             .io
             .record_bridge_failure(ValueBridgeFailure::InvalidSequence);
         assert!(execution.complete_step(lisp_error("boom", 0)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected the evaluator failure");
         };
         assert_eq!(failure.message, "boom");
@@ -1641,20 +1770,26 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
         begin(&mut execution);
 
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         execution
             .io
             .record_bridge_failure(ValueBridgeFailure::InvalidSequence);
         assert!(execution.complete_step(with_cleanup(success(), -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected bridge failure");
         };
         assert_eq!(
             failure.message,
-            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP execution state (native status -5001)"
+            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP evaluator state (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1665,16 +1800,22 @@ mod tests {
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
 
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         execution
             .io
             .record_bridge_failure(ValueBridgeFailure::InvalidSequence);
         assert!(execution.request_cancel());
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected the output bridge failure");
         };
         assert_eq!(
@@ -1688,14 +1829,20 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(success()));
 
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(!execution.request_cancel());
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Success));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Success));
     }
 
     #[test]
@@ -1703,16 +1850,22 @@ mod tests {
         let (mut execution, _output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.request_cancel());
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::RollbackUndoGroup
+        );
         assert!(execution.complete_step(native_error("U failed", -5001)));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
         assert_eq!(
             execution.outcome(),
-            Some(&Outcome::Failure(Failure {
+            Some(&ExecutionOutcome::Failure(ExecutionFailure {
                 message: "U failed".into(),
                 form_index: None,
                 location: None,
@@ -1731,12 +1884,15 @@ mod tests {
         .unwrap()
         .0;
 
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
-        assert_eq!(execution.outcome(), Some(&Outcome::Success));
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
+        assert_eq!(execution.outcome(), Some(&ExecutionOutcome::Success));
     }
 
     fn begin(execution: &mut Execution) {
-        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::BeginUndoGroup
+        );
         assert!(execution.complete_step(success()));
     }
 
@@ -1745,11 +1901,17 @@ mod tests {
             .unwrap()
             .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
         execution
     }
 
@@ -1759,45 +1921,54 @@ mod tests {
                 .unwrap()
                 .0;
         begin(&mut execution);
-        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::EvaluateForm
+        );
         assert!(execution.complete_step(success()));
-        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert_eq!(
+            execution.take_step().kind(),
+            ExecutionStepKind::CommitUndoGroup
+        );
         assert!(execution.complete_step(success()));
         execution
     }
 
-    fn success() -> StepResult {
-        StepResult {
-            kind: StepResultKind::Success,
+    fn success() -> ExecutionStepResult {
+        ExecutionStepResult {
+            kind: ExecutionStepResultKind::Success,
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            cleanup_status: 0,
+            evaluator_state_cleanup_status: 0,
         }
     }
 
-    fn lisp_error(detail: &str, lisp_errno: i32) -> StepResult {
-        StepResult {
-            kind: StepResultKind::LispError,
+    fn lisp_error(detail: &str, lisp_errno: i32) -> ExecutionStepResult {
+        ExecutionStepResult {
+            kind: ExecutionStepResultKind::LispError,
             native_status: 0,
             lisp_errno,
             detail: detail.into(),
-            cleanup_status: 0,
+            evaluator_state_cleanup_status: 0,
         }
     }
 
-    fn native_error(detail: &str, native_status: i32) -> StepResult {
-        StepResult {
-            kind: StepResultKind::NativeError,
+    fn native_error(detail: &str, native_status: i32) -> ExecutionStepResult {
+        ExecutionStepResult {
+            kind: ExecutionStepResultKind::NativeError,
             native_status,
             lisp_errno: 0,
             detail: detail.into(),
-            cleanup_status: 0,
+            evaluator_state_cleanup_status: 0,
         }
     }
 
-    fn with_cleanup(mut result: StepResult, cleanup_status: i32) -> StepResult {
-        result.cleanup_status = cleanup_status;
+    fn with_cleanup(
+        mut result: ExecutionStepResult,
+        evaluator_state_cleanup_status: i32,
+    ) -> ExecutionStepResult {
+        result.evaluator_state_cleanup_status = evaluator_state_cleanup_status;
         result
     }
 }

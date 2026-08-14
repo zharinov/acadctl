@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use acadctl_rpc::Document;
 
-use crate::ffi::NativeDocumentState;
+use crate::ffi::NativeDocumentSnapshot;
 
 const DOCUMENT_ID_LENGTH: usize = 6;
 const DOCUMENT_ID_ALPHABET: [char; 31] = [
@@ -23,7 +23,6 @@ pub struct DocumentRegistry {
 
 struct TrackedDocument {
     native_key: NativeDocumentKey,
-    named: bool,
     document: Document,
 }
 
@@ -36,7 +35,6 @@ pub struct NativeDocumentKey {
 #[derive(Clone)]
 pub struct DocumentTarget {
     pub native_key: NativeDocumentKey,
-    pub named: bool,
     pub document: Document,
 }
 
@@ -47,7 +45,7 @@ impl DocumentRegistry {
         }
     }
 
-    pub fn replace(&mut self, native_documents: Vec<NativeDocumentState>) {
+    pub fn replace(&mut self, native_documents: Vec<NativeDocumentSnapshot>) {
         let mut reserved_ids = self
             .documents
             .iter()
@@ -58,23 +56,17 @@ impl DocumentRegistry {
 
         self.documents.reserve(native_documents.len());
         for native in native_documents {
-            if !seen_tokens.insert(native.token) {
+            if !seen_tokens.insert(native.document_token) {
                 continue;
             }
-            let id = take_document_id(&mut previous, native.token)
+            let id = take_document_id(&mut previous, native.document_token)
                 .unwrap_or_else(|| new_document_id(&mut reserved_ids));
             self.documents.push(TrackedDocument {
                 native_key: NativeDocumentKey {
-                    document_token: native.token,
+                    document_token: native.document_token,
                     database_token: native.database_token,
                 },
-                named: native.named,
-                document: Document {
-                    id,
-                    path: document_path(native.name, native.named),
-                    modified: native.modified,
-                    read_only: native.read_only,
-                },
+                document: public_document(id, native),
             });
         }
     }
@@ -96,15 +88,41 @@ impl DocumentRegistry {
     pub fn find_by_path(&self, path: &str) -> Option<DocumentTarget> {
         self.documents
             .iter()
-            .find(|tracked| tracked.named && paths_equal(&tracked.document.path, path))
+            .find(|tracked| {
+                tracked
+                    .document
+                    .file_path
+                    .as_deref()
+                    .is_some_and(|file_path| paths_equal(file_path, path))
+            })
             .map(document_target)
+    }
+}
+
+fn public_document(id: String, native: NativeDocumentSnapshot) -> Document {
+    let name = document_name(native.name, native.named);
+    let (display_name, file_path) = if native.named {
+        let display_name = std::path::Path::new(&name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&name)
+            .to_owned();
+        (display_name, Some(name))
+    } else {
+        (name, None)
+    };
+    Document {
+        id,
+        display_name,
+        file_path,
+        modified: native.modified,
+        read_only: native.read_only,
     }
 }
 
 fn document_target(tracked: &TrackedDocument) -> DocumentTarget {
     DocumentTarget {
         native_key: tracked.native_key,
-        named: tracked.named,
         document: tracked.document.clone(),
     }
 }
@@ -119,10 +137,10 @@ fn paths_equal(left: &str, right: &str) -> bool {
     left == right
 }
 
-fn take_document_id(documents: &mut Vec<TrackedDocument>, native_token: usize) -> Option<String> {
+fn take_document_id(documents: &mut Vec<TrackedDocument>, document_token: usize) -> Option<String> {
     let position = documents
         .iter()
-        .position(|document| document.native_key.document_token == native_token)?;
+        .position(|document| document.native_key.document_token == document_token)?;
     Some(documents.swap_remove(position).document.id)
 }
 
@@ -135,7 +153,7 @@ fn new_document_id(reserved_ids: &mut HashSet<String>) -> String {
     }
 }
 
-fn document_path(mut name: String, named: bool) -> String {
+fn document_name(mut name: String, named: bool) -> String {
     if !named
         && name
             .get(name.len().saturating_sub(4)..)
@@ -166,7 +184,7 @@ mod tests {
         documents.replace(vec![named_document(1, "/tmp/house.dwg")]);
         let original_id = documents.list()[0].id.clone();
 
-        documents.replace(vec![NativeDocumentState {
+        documents.replace(vec![NativeDocumentSnapshot {
             database_token: 99,
             modified: true,
             read_only: true,
@@ -176,7 +194,8 @@ mod tests {
         let listed = documents.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, original_id);
-        assert_eq!(listed[0].path, "/tmp/site.dwg");
+        assert_eq!(listed[0].display_name, "site.dwg");
+        assert_eq!(listed[0].file_path.as_deref(), Some("/tmp/site.dwg"));
         assert!(listed[0].modified);
         assert!(listed[0].read_only);
         assert_eq!(
@@ -206,20 +225,22 @@ mod tests {
         let listed = documents.list();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, original[1].id);
-        assert_eq!(listed[0].path, "/tmp/site.dwg");
+        assert_eq!(listed[0].display_name, "site.dwg");
+        assert_eq!(listed[0].file_path.as_deref(), Some("/tmp/site.dwg"));
         assert_ne!(listed[1].id, original[0].id);
         assert_ne!(listed[1].id, original[1].id);
-        assert_eq!(listed[1].path, "Drawing1");
+        assert_eq!(listed[1].display_name, "Drawing1");
+        assert_eq!(listed[1].file_path, None);
     }
 
     #[test]
     fn strips_drawing_suffix_only_from_unnamed_documents() {
-        assert_eq!(document_path("Drawing1.DWG".into(), false), "Drawing1");
+        assert_eq!(document_name("Drawing1.DWG".into(), false), "Drawing1");
         assert_eq!(
-            document_path("/tmp/house.DWG".into(), true),
+            document_name("/tmp/house.DWG".into(), true),
             "/tmp/house.DWG"
         );
-        assert_eq!(document_path("図面".into(), false), "図面");
+        assert_eq!(document_name("図面".into(), false), "図面");
     }
 
     #[test]
@@ -239,8 +260,8 @@ mod tests {
                 database_token: 101,
             }
         );
-        assert!(by_id.named);
-        assert_eq!(by_id.document.path, "/tmp/house.dwg");
+        assert_eq!(by_id.document.display_name, "house.dwg");
+        assert_eq!(by_id.document.file_path.as_deref(), Some("/tmp/house.dwg"));
         assert_eq!(
             documents
                 .find_by_path("/tmp/house.dwg")
@@ -263,10 +284,10 @@ mod tests {
         );
     }
 
-    fn named_document(token: usize, name: &str) -> NativeDocumentState {
-        NativeDocumentState {
-            token,
-            database_token: token + 100,
+    fn named_document(document_token: usize, name: &str) -> NativeDocumentSnapshot {
+        NativeDocumentSnapshot {
+            document_token,
+            database_token: document_token + 100,
             name: name.into(),
             named: true,
             modified: false,
@@ -274,10 +295,10 @@ mod tests {
         }
     }
 
-    fn unnamed_document(token: usize, name: &str) -> NativeDocumentState {
-        NativeDocumentState {
+    fn unnamed_document(document_token: usize, name: &str) -> NativeDocumentSnapshot {
+        NativeDocumentSnapshot {
             named: false,
-            ..named_document(token, name)
+            ..named_document(document_token, name)
         }
     }
 }

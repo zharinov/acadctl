@@ -2,12 +2,11 @@ use crate::instances::ListReport;
 
 use super::query_error_message;
 
-pub async fn connect(id: &str) -> Result<super::Client, String> {
+pub async fn resolve_process_id(id: &str) -> Result<u32, String> {
     let report = crate::instances::list()
         .await
         .map_err(|_| "Could not inspect running AutoCAD instances.".to_owned())?;
-    let process_id = resolve_from_report(&report, id)?;
-    super::connect(process_id).await
+    resolve_from_report(&report, id)
 }
 
 fn resolve_from_report(report: &ListReport, id: &str) -> Result<u32, String> {
@@ -90,7 +89,8 @@ mod tests {
     fn document(id: &str) -> Document {
         Document {
             id: id.into(),
-            path: "/tmp/house.dwg".into(),
+            display_name: "house.dwg".into(),
+            file_path: Some("/tmp/house.dwg".into()),
             modified: false,
             read_only: false,
         }

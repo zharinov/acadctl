@@ -5,7 +5,11 @@ use acadctl_rpc::CloseRequest;
 use super::{fail, request_error_message};
 
 pub async fn run(id: String, discard: bool) -> ExitCode {
-    let mut client = match super::target::connect(&id).await {
+    let process_id = match super::target::resolve_process_id(&id).await {
+        Ok(process_id) => process_id,
+        Err(error) => return fail(error),
+    };
+    let mut client = match super::connect_documents(process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
