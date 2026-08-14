@@ -533,6 +533,17 @@ acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
           runUndoCommand(ACRX_T("_End"), UndoGroupState::Inactive);
       stepResult = std::move(undoTransition.result);
       break;
+    case acadctl::NativeExecutionStepKind::Abort:
+      if (formAttempted) {
+        stepResult = stepNativeFailure(
+            RTERROR,
+            "Rust requested an undo-group close after a form was attempted");
+      } else {
+        undoTransition =
+            runUndoCommand(ACRX_T("_End"), UndoGroupState::Inactive);
+        stepResult = std::move(undoTransition.result);
+      }
+      break;
     case acadctl::NativeExecutionStepKind::Rollback:
       undoTransition = rollbackUndoGroup(undoGroup, ownedGroupStarted);
       stepResult = std::move(undoTransition.result);

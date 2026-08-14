@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
+use output::{OutputSink, OutputStream};
 
 pub mod output;
 pub mod value;
@@ -23,8 +24,11 @@ pub struct Execution {
     next_scan: ScanPosition,
     next_form_index: usize,
     phase: Phase,
-    failure: Option<Failure>,
+    form_attempted: bool,
+    cancel_requested: bool,
+    rollback: Option<RollbackCause>,
     outcome: Option<Outcome>,
+    output: OutputSink,
 }
 
 #[allow(
@@ -53,6 +57,7 @@ pub enum ValidationError {
 pub enum Outcome {
     Success,
     Failure(Failure),
+    Cancelled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +88,7 @@ pub enum StepKind {
     Begin,
     Form,
     Commit,
+    Abort,
     Rollback,
     Done,
 }
@@ -122,10 +128,17 @@ enum Phase {
         column: usize,
     },
     AwaitingCommit,
+    Abort,
+    AwaitingAbort,
     Rollback,
     AwaitingRollback,
     Terminal,
     Done,
+}
+
+enum RollbackCause {
+    Failure(Failure),
+    Cancelled,
 }
 
 impl Execution {
@@ -137,7 +150,7 @@ impl Execution {
         mode: ExecutionMode,
         source_name: String,
         mut source: String,
-    ) -> Result<Self, ValidationError> {
+    ) -> Result<(Self, OutputStream), ValidationError> {
         if source.starts_with('\u{feff}') {
             source.drain(..'\u{feff}'.len_utf8());
         }
@@ -154,16 +167,26 @@ impl Execution {
         }
         let next_scan = acadctl_lisp::scan(&source).position();
         let empty = form_count == 0;
-        Ok(Self {
-            mode,
-            source_name,
-            source: Arc::new(source),
-            next_scan,
-            next_form_index: 1,
-            phase: if empty { Phase::Terminal } else { Phase::Begin },
-            failure: None,
-            outcome: empty.then_some(Outcome::Success),
-        })
+        let (output, stream) = output::channel();
+        if empty {
+            output.finish();
+        }
+        Ok((
+            Self {
+                mode,
+                source_name,
+                source: Arc::new(source),
+                next_scan,
+                next_form_index: 1,
+                phase: if empty { Phase::Terminal } else { Phase::Begin },
+                form_attempted: false,
+                cancel_requested: false,
+                rollback: None,
+                outcome: empty.then_some(Outcome::Success),
+                output,
+            },
+            stream,
+        ))
     }
 
     #[allow(
@@ -182,14 +205,66 @@ impl Execution {
         self.outcome.take()
     }
 
+    pub fn output_sink(&self) -> OutputSink {
+        self.output.clone()
+    }
+
+    pub fn request_cancel(&mut self) -> bool {
+        if self.cancel_requested {
+            return true;
+        }
+        if matches!(
+            self.phase,
+            Phase::AwaitingCommit
+                | Phase::Abort
+                | Phase::AwaitingAbort
+                | Phase::Rollback
+                | Phase::AwaitingRollback
+                | Phase::Terminal
+                | Phase::Done
+        ) {
+            return false;
+        }
+        self.cancel_requested = true;
+        true
+    }
+
+    #[allow(
+        dead_code,
+        reason = "queued cancellation is private until the Execute RPC is exposed"
+    )]
+    pub fn cancel_before_start(&mut self) -> bool {
+        if self.outcome.is_some() || !matches!(self.phase, Phase::Begin) {
+            return false;
+        }
+        self.cancel_requested = true;
+        self.outcome = Some(Outcome::Cancelled);
+        self.phase = Phase::Terminal;
+        true
+    }
+
     pub fn take_step(&mut self) -> NativeExecutionStep {
         loop {
             match self.phase {
                 Phase::Begin => {
+                    if self.cancel_requested {
+                        self.outcome = Some(Outcome::Cancelled);
+                        self.phase = Phase::Terminal;
+                        continue;
+                    }
                     self.phase = Phase::AwaitingBegin;
                     return NativeExecutionStep::new(StepKind::Begin);
                 }
                 Phase::BetweenForms => {
+                    if self.cancel_requested {
+                        self.rollback = Some(RollbackCause::Cancelled);
+                        self.phase = if self.form_attempted {
+                            Phase::Rollback
+                        } else {
+                            Phase::Abort
+                        };
+                        continue;
+                    }
                     let mut scanner = acadctl_lisp::Scanner::resume(&self.source, self.next_scan);
                     match scanner.next() {
                         Some(Ok(span)) => {
@@ -201,10 +276,11 @@ impl Execution {
                                 line: span.line,
                                 column: span.column,
                             };
+                            self.form_attempted = true;
                             return NativeExecutionStep::form(Arc::clone(&self.source), span);
                         }
                         Some(Err(error)) => {
-                            self.failure = Some(Failure {
+                            self.rollback = Some(RollbackCause::Failure(Failure {
                                 message: error.kind.message().to_owned(),
                                 form_index: None,
                                 location: Some(SourceLocation {
@@ -213,7 +289,7 @@ impl Execution {
                                     column: error.column,
                                 }),
                                 drawing_outcome: DrawingOutcome::Unknown,
-                            });
+                            }));
                             self.phase = Phase::Rollback;
                         }
                         None => {
@@ -221,6 +297,10 @@ impl Execution {
                             return NativeExecutionStep::new(StepKind::Commit);
                         }
                     }
+                }
+                Phase::Abort => {
+                    self.phase = Phase::AwaitingAbort;
+                    return NativeExecutionStep::new(StepKind::Abort);
                 }
                 Phase::Rollback => {
                     self.phase = Phase::AwaitingRollback;
@@ -233,6 +313,7 @@ impl Execution {
                 Phase::AwaitingBegin
                 | Phase::AwaitingForm { .. }
                 | Phase::AwaitingCommit
+                | Phase::AwaitingAbort
                 | Phase::AwaitingRollback
                 | Phase::Done => return NativeExecutionStep::new(StepKind::Invalid),
             }
@@ -243,7 +324,12 @@ impl Execution {
         match self.phase {
             Phase::AwaitingBegin => {
                 if result.kind == StepResultKind::Success {
-                    self.phase = Phase::BetweenForms;
+                    if self.cancel_requested {
+                        self.rollback = Some(RollbackCause::Cancelled);
+                        self.phase = Phase::Abort;
+                    } else {
+                        self.phase = Phase::BetweenForms;
+                    }
                 } else {
                     self.outcome = Some(Outcome::Failure(Failure {
                         message: result.into_message("could not begin the undo group"),
@@ -260,9 +346,14 @@ impl Execution {
                 column,
             } => {
                 if result.kind == StepResultKind::Success {
-                    self.phase = Phase::BetweenForms;
+                    if self.cancel_requested {
+                        self.rollback = Some(RollbackCause::Cancelled);
+                        self.phase = Phase::Rollback;
+                    } else {
+                        self.phase = Phase::BetweenForms;
+                    }
                 } else {
-                    self.failure = Some(Failure {
+                    self.rollback = Some(RollbackCause::Failure(Failure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
                         location: Some(SourceLocation {
@@ -271,7 +362,7 @@ impl Execution {
                             column,
                         }),
                         drawing_outcome: DrawingOutcome::Unknown,
-                    });
+                    }));
                     self.phase = Phase::Rollback;
                 }
             }
@@ -280,31 +371,64 @@ impl Execution {
                     self.outcome = Some(Outcome::Success);
                     self.phase = Phase::Terminal;
                 } else {
-                    self.failure = Some(Failure {
+                    self.rollback = Some(RollbackCause::Failure(Failure {
                         message: result.into_message("could not finish the undo group"),
                         form_index: None,
                         location: None,
                         drawing_outcome: DrawingOutcome::Unknown,
-                    });
+                    }));
                     self.phase = Phase::Rollback;
                 }
             }
-            Phase::AwaitingRollback => {
-                let Some(mut failure) = self.failure.take() else {
+            Phase::AwaitingAbort => {
+                let Some(RollbackCause::Cancelled) = self.rollback.take() else {
                     return false;
                 };
                 if result.kind == StepResultKind::Success {
-                    failure.drawing_outcome = DrawingOutcome::RolledBack;
+                    self.outcome = Some(Outcome::Cancelled);
                 } else {
-                    let rollback = result.into_message("drawing rollback failed");
-                    failure.message = format!("{}; {rollback}", failure.message);
-                    failure.drawing_outcome = DrawingOutcome::Unknown;
+                    self.outcome = Some(Outcome::Failure(Failure {
+                        message: result.into_message("could not close the cancelled undo group"),
+                        form_index: None,
+                        location: None,
+                        drawing_outcome: DrawingOutcome::Unknown,
+                    }));
                 }
-                self.outcome = Some(Outcome::Failure(failure));
+                self.phase = Phase::Terminal;
+            }
+            Phase::AwaitingRollback => {
+                let Some(cause) = self.rollback.take() else {
+                    return false;
+                };
+                self.outcome = Some(match cause {
+                    RollbackCause::Failure(mut failure) => {
+                        if result.kind == StepResultKind::Success {
+                            failure.drawing_outcome = DrawingOutcome::RolledBack;
+                        } else {
+                            let rollback = result.into_message("drawing rollback failed");
+                            failure.message = format!("{}; {rollback}", failure.message);
+                            failure.drawing_outcome = DrawingOutcome::Unknown;
+                        }
+                        Outcome::Failure(failure)
+                    }
+                    RollbackCause::Cancelled => {
+                        if result.kind == StepResultKind::Success {
+                            Outcome::Cancelled
+                        } else {
+                            Outcome::Failure(Failure {
+                                message: result.into_message("drawing rollback failed"),
+                                form_index: None,
+                                location: None,
+                                drawing_outcome: DrawingOutcome::Unknown,
+                            })
+                        }
+                    }
+                });
                 self.phase = Phase::Terminal;
             }
             Phase::Begin
             | Phase::BetweenForms
+            | Phase::Abort
             | Phase::Rollback
             | Phase::Terminal
             | Phase::Done => return false,
@@ -329,6 +453,12 @@ impl Execution {
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
+            Outcome::Cancelled => Failure {
+                message: cleanup,
+                form_index: None,
+                location: None,
+                drawing_outcome: DrawingOutcome::Unknown,
+            },
         };
         self.outcome = Some(Outcome::Failure(failure));
         true
@@ -337,10 +467,12 @@ impl Execution {
     pub fn abandon(&mut self, result: StepResult) -> bool {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
-        let existing = self
-            .outcome
-            .take()
-            .or_else(|| self.failure.take().map(Outcome::Failure));
+        let existing = self.outcome.take().or_else(|| {
+            self.rollback.take().map(|cause| match cause {
+                RollbackCause::Failure(failure) => Outcome::Failure(failure),
+                RollbackCause::Cancelled => Outcome::Cancelled,
+            })
+        });
         let failure = match existing {
             Some(Outcome::Success) => Failure {
                 message,
@@ -353,6 +485,12 @@ impl Execution {
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
+            Some(Outcome::Cancelled) => Failure {
+                message,
+                form_index: None,
+                location: None,
+                drawing_outcome: DrawingOutcome::Unknown,
+            },
             None => {
                 let (form_index, location) = match phase {
                     Phase::AwaitingForm {
@@ -492,10 +630,14 @@ mod tests {
                 .unwrap(),
             ValidationError::ExpectedOneForm { actual: 2 }
         );
-        let eval = Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a".into()).unwrap();
+        let eval = Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a".into())
+            .unwrap()
+            .0;
         assert_eq!(eval.mode(), ExecutionMode::Eval);
 
-        let exec = Execution::new(ExecutionMode::Exec, "<stdin>".into(), "a b".into()).unwrap();
+        let exec = Execution::new(ExecutionMode::Exec, "<stdin>".into(), "a b".into())
+            .unwrap()
+            .0;
         assert_eq!(exec.mode(), ExecutionMode::Exec);
     }
 
@@ -511,7 +653,8 @@ mod tests {
             "batch.lsp".into(),
             "(setq x 1) ; keep with separator\n(+ x 2)".into(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(execution.take_step().kind(), StepKind::Begin);
         assert!(execution.complete_step(success()));
@@ -535,7 +678,9 @@ mod tests {
     #[test]
     fn rolls_back_a_lisp_failure_at_its_form_location() {
         let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok\n  bad".into()).unwrap();
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok\n  bad".into())
+                .unwrap()
+                .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().source(), "ok");
         assert!(execution.complete_step(success()));
@@ -562,8 +707,9 @@ mod tests {
 
     #[test]
     fn rollback_failure_preserves_the_original_error_and_marks_unknown() {
-        let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into())
+            .unwrap()
+            .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(lisp_error("boom", 0)));
@@ -580,8 +726,9 @@ mod tests {
 
     #[test]
     fn commit_failure_is_rolled_back() {
-        let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
+        let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into())
+            .unwrap()
+            .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(success()));
@@ -604,8 +751,9 @@ mod tests {
 
     #[test]
     fn begin_failure_never_claims_that_drawing_work_started() {
-        let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
+        let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into())
+            .unwrap()
+            .0;
         assert_eq!(execution.take_step().kind(), StepKind::Begin);
         assert!(execution.complete_step(native_error("Begin failed", -5001)));
         assert_eq!(execution.take_step().kind(), StepKind::Done);
@@ -638,8 +786,9 @@ mod tests {
 
     #[test]
     fn cleanup_failure_preserves_an_existing_execution_failure() {
-        let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into())
+            .unwrap()
+            .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(lisp_error("boom", 0)));
@@ -662,7 +811,8 @@ mod tests {
             "batch.lsp".into(),
             "ok\nchanged".into(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().source(), "ok");
         assert!(execution.complete_step(success()));
@@ -690,8 +840,9 @@ mod tests {
 
     #[test]
     fn abandonment_preserves_the_failure_that_started_rollback() {
-        let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into())
+            .unwrap()
+            .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(lisp_error("boom", 0)));
@@ -707,13 +858,110 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_before_begin_never_opens_an_undo_group() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+
+        assert!(execution.request_cancel());
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+    }
+
+    #[test]
+    fn cancellation_during_begin_closes_the_empty_group_without_u() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+
+        assert_eq!(execution.take_step().kind(), StepKind::Begin);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Abort);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+    }
+
+    #[test]
+    fn cancellation_after_a_form_uses_rollback() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.outcome(), Some(&Outcome::Cancelled));
+    }
+
+    #[test]
+    fn evaluator_failure_wins_over_concurrent_cancellation() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        begin(&mut execution);
+
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(lisp_error("boom", 0)));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        let Some(Outcome::Failure(failure)) = execution.outcome() else {
+            panic!("expected the evaluator failure");
+        };
+        assert_eq!(failure.message, "boom");
+        assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
+    }
+
+    #[test]
+    fn cancellation_after_commit_handoff_is_too_late() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.complete_step(success()));
+
+        assert_eq!(execution.take_step().kind(), StepKind::Commit);
+        assert!(!execution.request_cancel());
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+        assert_eq!(execution.outcome(), Some(&Outcome::Success));
+    }
+
+    #[test]
+    fn rollback_failure_overrides_cancellation() {
+        let (mut execution, _output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        begin(&mut execution);
+        assert_eq!(execution.take_step().kind(), StepKind::Form);
+        assert!(execution.request_cancel());
+        assert!(execution.complete_step(success()));
+        assert_eq!(execution.take_step().kind(), StepKind::Rollback);
+        assert!(execution.complete_step(native_error("U failed", -5001)));
+        assert_eq!(execution.take_step().kind(), StepKind::Done);
+
+        assert_eq!(
+            execution.outcome(),
+            Some(&Outcome::Failure(Failure {
+                message: "U failed".into(),
+                form_index: None,
+                location: None,
+                drawing_outcome: DrawingOutcome::Unknown,
+            }))
+        );
+    }
+
+    #[test]
     fn empty_batch_finishes_without_an_undo_group() {
         let mut execution = Execution::new(
             ExecutionMode::Exec,
             "<stdin>".into(),
             "; only a comment".into(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert_eq!(execution.take_step().kind(), StepKind::Done);
         assert_eq!(execution.outcome(), Some(&Outcome::Success));
@@ -725,8 +973,9 @@ mod tests {
     }
 
     fn successful_execution() -> Execution {
-        let mut execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
+        let mut execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into())
+            .unwrap()
+            .0;
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(success()));

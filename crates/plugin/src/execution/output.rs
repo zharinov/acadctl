@@ -5,7 +5,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use tokio::sync::Notify;
@@ -13,7 +16,6 @@ use tokio::sync::Notify;
 pub const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 pub const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 
-#[derive(Clone)]
 pub struct OutputSink {
     shared: Arc<Shared>,
 }
@@ -35,6 +37,7 @@ struct Shared {
     state: Mutex<State>,
     space_available: Condvar,
     data_available: Notify,
+    producers: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -56,6 +59,7 @@ pub fn channel() -> (OutputSink, OutputStream) {
         }),
         space_available: Condvar::new(),
         data_available: Notify::new(),
+        producers: AtomicUsize::new(1),
     });
     (
         OutputSink {
@@ -63,6 +67,15 @@ pub fn channel() -> (OutputSink, OutputStream) {
         },
         OutputStream { shared },
     )
+}
+
+impl Clone for OutputSink {
+    fn clone(&self) -> Self {
+        self.shared.producers.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
 }
 
 impl OutputSink {
@@ -164,6 +177,25 @@ impl OutputSink {
     fn queued_chunks(&self) -> usize {
         let state = lock(&self.shared.state);
         state.ready.len() + usize::from(!state.pending.is_empty())
+    }
+}
+
+impl Drop for OutputSink {
+    fn drop(&mut self) {
+        if self.shared.producers.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+
+        let mut state = lock(&self.shared.state);
+        if emit_result(&state) == EmitResult::Written {
+            state.stopped = true;
+            state.ready.clear();
+            state.pending.clear();
+            state.queued_bytes = 0;
+            drop(state);
+            self.shared.space_available.notify_all();
+            self.shared.data_available.notify_one();
+        }
     }
 }
 
@@ -404,6 +436,38 @@ mod tests {
         sink.request_cancel();
 
         assert_eq!(stream.next_chunk().await.as_deref(), Some("before cancel"));
+        assert_eq!(stream.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_producer_stops_an_unfinished_stream() {
+        let (sink, mut stream) = channel();
+        assert_eq!(sink.emit("discarded"), EmitResult::Written);
+        drop(sink);
+
+        assert_eq!(stream.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_one_producer_does_not_stop_its_clone() {
+        let (sink, mut stream) = channel();
+        let remaining = sink.clone();
+        drop(sink);
+
+        assert_eq!(remaining.emit("kept"), EmitResult::Written);
+        remaining.finish();
+        assert_eq!(stream.next_chunk().await.as_deref(), Some("kept"));
+        assert_eq!(stream.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_finished_producer_preserves_published_output() {
+        let (sink, mut stream) = channel();
+        assert_eq!(sink.emit("kept"), EmitResult::Written);
+        sink.finish();
+        drop(sink);
+
+        assert_eq!(stream.next_chunk().await.as_deref(), Some("kept"));
         assert_eq!(stream.next_chunk().await, None);
     }
 }

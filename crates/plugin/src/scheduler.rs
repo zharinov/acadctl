@@ -7,6 +7,7 @@ use acadctl_rpc::Document;
 use tokio::sync::oneshot;
 
 use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
+use crate::execution::output::OutputSink;
 use crate::execution::{Execution, NativeExecutionStep, Outcome as ExecutionOutcome, StepResult};
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
 
@@ -74,6 +75,18 @@ enum TakeDecision {
         Result<OperationOutcome, Error>,
     ),
     Empty,
+}
+
+#[allow(
+    dead_code,
+    reason = "execution cancellation is private until the Execute RPC is exposed"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelResult {
+    Accepted,
+    TooLate,
+    NotFound,
+    Unavailable,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -316,16 +329,31 @@ pub fn start() {
 }
 
 pub fn stop() {
-    let completions = SCHEDULER.lock().ok().map(|mut scheduler| {
+    let stopped = SCHEDULER.lock().ok().map(|mut scheduler| {
         scheduler.stopping = true;
         scheduler.wake_pending = false;
-        std::mem::take(&mut scheduler.pending)
+        let active_output = scheduler.active.as_mut().and_then(|job| {
+            if let Operation::Execute { execution, .. } = &mut job.operation {
+                let _ = execution.request_cancel();
+                Some(execution.output_sink())
+            } else {
+                None
+            }
+        });
+        let pending = std::mem::take(&mut scheduler.pending)
             .into_iter()
-            .map(|job| job.completion)
-            .collect::<Vec<_>>()
+            .map(|job| (job.completion, job.operation.output_sink()))
+            .collect::<Vec<_>>();
+        (active_output, pending)
     });
-    if let Some(completions) = completions {
-        for completion in completions {
+    if let Some((active_output, pending)) = stopped {
+        if let Some(output) = active_output {
+            output.stop();
+        }
+        for (completion, output) in pending {
+            if let Some(output) = output {
+                output.stop();
+            }
             let _ = completion.send(Err(Error::PluginStopping));
         }
     }
@@ -412,22 +440,95 @@ pub fn complete(request_id: u64, result: NativeActionResult) {
             return;
         }
 
+        let output = job.operation.output_sink();
         let outcome = complete_operation(result, &mut job.operation, &scheduler.documents);
         let pending = if quarantine {
             scheduler.quarantined = true;
             scheduler.wake_pending = false;
             std::mem::take(&mut scheduler.pending)
                 .into_iter()
-                .map(|job| job.completion)
+                .map(|job| (job.completion, job.operation.output_sink()))
                 .collect()
         } else {
             Vec::new()
         };
-        ((job.completion, outcome), pending)
+        ((job.completion, outcome, output), pending)
     };
+    if let Some(output) = completion.2 {
+        output.finish();
+    }
     let _ = completion.0.send(completion.1);
-    for completion in pending {
+    for (completion, output) in pending {
+        if let Some(output) = output {
+            output.stop();
+        }
         let _ = completion.send(Err(Error::NativeStateUnknown));
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "execution cancellation is private until the Execute RPC is exposed"
+)]
+pub fn cancel_execution(request_id: u64) -> CancelResult {
+    enum Action {
+        Active(OutputSink),
+        Pending(OutputSink, oneshot::Sender<Result<OperationOutcome, Error>>),
+        Result(CancelResult),
+    }
+
+    let action = {
+        let Ok(mut scheduler) = SCHEDULER.lock() else {
+            return CancelResult::Unavailable;
+        };
+        if let Some(job) = scheduler.active.as_mut()
+            && job.request_id == request_id
+        {
+            match &mut job.operation {
+                Operation::Execute { execution, .. } => {
+                    if execution.request_cancel() {
+                        Action::Active(execution.output_sink())
+                    } else {
+                        Action::Result(CancelResult::TooLate)
+                    }
+                }
+                Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
+                    Action::Result(CancelResult::NotFound)
+                }
+            }
+        } else if let Some(index) = scheduler.pending.iter().position(|job| {
+            job.request_id == request_id && matches!(job.operation, Operation::Execute { .. })
+        }) {
+            let output = match &mut scheduler.pending[index].operation {
+                Operation::Execute { execution, .. } => execution
+                    .cancel_before_start()
+                    .then(|| execution.output_sink()),
+                Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
+                    unreachable!("only queued executions are selected")
+                }
+            };
+            if let Some(output) = output {
+                let job = scheduler.pending.remove(index).expect("queued job exists");
+                Action::Pending(output, job.completion)
+            } else {
+                Action::Result(CancelResult::TooLate)
+            }
+        } else {
+            Action::Result(CancelResult::NotFound)
+        }
+    };
+
+    match action {
+        Action::Active(output) => {
+            output.request_cancel();
+            CancelResult::Accepted
+        }
+        Action::Pending(output, completion) => {
+            output.request_cancel();
+            let _ = completion.send(Ok(OperationOutcome::Execution(ExecutionOutcome::Cancelled)));
+            CancelResult::Accepted
+        }
+        Action::Result(result) => result,
     }
 }
 
@@ -492,11 +593,14 @@ pub fn wake_failed(status: i32) {
         scheduler.wake_pending = false;
         std::mem::take(&mut scheduler.pending)
             .into_iter()
-            .map(|job| job.completion)
+            .map(|job| (job.completion, job.operation.output_sink()))
             .collect::<Vec<_>>()
     });
     if let Some(completions) = completions {
-        for completion in completions {
+        for (completion, output) in completions {
+            if let Some(output) = output {
+                output.stop();
+            }
             let _ = completion.send(Err(Error::ScheduleFailed(status)));
         }
     }
@@ -679,6 +783,13 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
 }
 
 impl Operation {
+    fn output_sink(&self) -> Option<OutputSink> {
+        match self {
+            Self::Execute { execution, .. } => Some(execution.output_sink()),
+            Self::Open { .. } | Self::Save { .. } | Self::Close { .. } => None,
+        }
+    }
+
     fn document_id(&self) -> &str {
         match self {
             Self::Open { .. } => "",
@@ -839,6 +950,7 @@ mod tests {
             "first\nsecond".into(),
         )
         .unwrap();
+        let execution = execution.0;
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
@@ -872,11 +984,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_cancellation_removes_only_that_execution() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, true)]);
+        let id = list().unwrap()[0].id.clone();
+
+        let active = tokio::spawn(save(id.clone()));
+        tokio::task::yield_now().await;
+        let save_action = take();
+        assert_eq!(save_action.kind, NativeActionKind::Save);
+
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id.clone(), execution));
+        tokio::task::yield_now().await;
+        let execution_id = SCHEDULER
+            .lock()
+            .unwrap()
+            .pending
+            .front()
+            .expect("execution is queued behind save")
+            .request_id;
+
+        assert_eq!(cancel_execution(execution_id), CancelResult::Accepted);
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
+        assert_eq!(output.next_chunk().await, None);
+
+        replace_documents(vec![document(1, 101, false)]);
+        complete(
+            save_action.request_id,
+            result(NativeActionResultKind::Success),
+        );
+        assert!(active.await.unwrap().is_ok());
+        assert!(!native_actions_need_wake());
+        stop();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, true)]);
+        let id = list().unwrap()[0].id.clone();
+
+        let active = tokio::spawn(save(id.clone()));
+        tokio::task::yield_now().await;
+        let save_action = take();
+        assert_eq!(save_action.kind, NativeActionKind::Save);
+
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let queued = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+        let execution_id = SCHEDULER
+            .lock()
+            .unwrap()
+            .pending
+            .front()
+            .expect("execution is queued behind save")
+            .request_id;
+
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), output.next_chunk())
+                .await
+                .is_err()
+        );
+        assert_eq!(cancel_execution(execution_id), CancelResult::Accepted);
+        assert_eq!(output.next_chunk().await, None);
+
+        replace_documents(vec![document(1, 101, false)]);
+        complete(
+            save_action.request_id,
+            result(NativeActionResultKind::Success),
+        );
+        assert!(active.await.unwrap().is_ok());
+        assert!(!native_actions_need_wake());
+        stop();
+    }
+
+    #[tokio::test]
+    async fn wake_failure_stops_a_pending_execution_output_stream() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        wake_failed(42);
+
+        assert_eq!(pending.await.unwrap(), Err(Error::ScheduleFailed(42)));
+        assert_eq!(output.next_chunk().await, None);
+        assert_eq!(take().kind, NativeActionKind::None);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn active_cancellation_rolls_back_after_the_current_form() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+
+        assert_eq!(cancel_execution(action.request_id), CancelResult::Accepted);
+        assert_eq!(cancel_execution(action.request_id), CancelResult::Accepted);
+        assert_eq!(output.next_chunk().await, None);
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Rollback
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+
+        complete(action.request_id, result(NativeActionResultKind::Success));
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn active_cancellation_before_the_first_form_uses_abort_not_rollback() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(cancel_execution(action.request_id), CancelResult::Accepted);
+        assert_eq!(output.next_chunk().await, None);
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Abort
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+
+        complete(action.request_id, result(NativeActionResultKind::Success));
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_commit_handoff_does_not_cancel_output() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Commit
+        );
+
+        assert_eq!(cancel_execution(action.request_id), CancelResult::TooLate);
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
+        assert_eq!(output.next_chunk().await, None);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        let pending = tokio::spawn(execute(id, execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+
+        stop();
+        assert_eq!(output.next_chunk().await, None);
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Rollback
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unpolled_execution_future_closes_output_without_admission() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let (execution, mut output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+
+        let unpolled = execute(id, execution);
+        drop(unpolled);
+
+        assert_eq!(output.next_chunk().await, None);
+        assert!(SCHEDULER.lock().unwrap().idle());
+        stop();
+    }
+
+    #[tokio::test]
     async fn dropped_execution_waiter_does_not_release_its_native_lease() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution =
+        let (execution, mut output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let executing = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
@@ -893,6 +1269,11 @@ mod tests {
 
         executing.abort();
         assert!(executing.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), output.next_chunk())
+                .await
+                .is_err()
+        );
         let later = tokio::spawn(close(id, true));
         tokio::task::yield_now().await;
         assert_eq!(take().kind, NativeActionKind::None);
@@ -908,6 +1289,7 @@ mod tests {
             crate::execution::StepKind::Done
         );
         complete(action.request_id, result(NativeActionResultKind::Success));
+        assert_eq!(output.next_chunk().await, None);
 
         assert!(native_actions_need_wake());
         let close_action = take();
@@ -926,8 +1308,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
+        let execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into())
+            .unwrap()
+            .0;
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 

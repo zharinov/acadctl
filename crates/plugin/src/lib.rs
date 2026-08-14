@@ -49,6 +49,7 @@ mod ffi {
         Begin,
         Form,
         Commit,
+        Abort,
         Rollback,
         Done,
     }
@@ -169,6 +170,7 @@ fn execution_step_kind(step: &NativeExecutionStep) -> ffi::NativeExecutionStepKi
         execution::StepKind::Begin => ffi::NativeExecutionStepKind::Begin,
         execution::StepKind::Form => ffi::NativeExecutionStepKind::Form,
         execution::StepKind::Commit => ffi::NativeExecutionStepKind::Commit,
+        execution::StepKind::Abort => ffi::NativeExecutionStepKind::Abort,
         execution::StepKind::Rollback => ffi::NativeExecutionStepKind::Rollback,
         execution::StepKind::Done => ffi::NativeExecutionStepKind::Done,
     }
