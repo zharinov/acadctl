@@ -20,7 +20,7 @@ cxx-build = "1.0.199"
 futures-util = "0.3.31"
 hyper-util = { version = "0.1.17", features = ["tokio"] }
 nanoid = "0.4.0"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSPathUtilities", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSPathUtilities", "NSString", "alloc"] }
 prost = "0.14.1"
 protoc-bin-vendored = "3.2.0"
 sysinfo = "0.39.6"

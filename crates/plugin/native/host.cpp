@@ -14,6 +14,7 @@
 
 int acdbGetDbmod(AcDbDatabase *database);
 int acdbSetDbmod(AcDbDatabase *database, int value);
+extern "C" int acadctl_wake_native_actions();
 
 namespace {
 
@@ -160,6 +161,16 @@ bool matchesDatabase(AcApDocument *document, std::size_t databaseToken) {
              document->database())) == databaseToken;
 }
 
+void scheduleNextNativeAction() {
+  if (!acadctl::native_actions_need_wake()) {
+    return;
+  }
+  const int status = acadctl_wake_native_actions();
+  if (status != 0) {
+    acadctl::native_action_wake_failed(status);
+  }
+}
+
 ObjectArxBridge::ObjectArxBridge()
     : documentReactor_(*this), editorReactor_(*this) {}
 
@@ -190,45 +201,45 @@ void ObjectArxBridge::stop() {
 }
 
 void ObjectArxBridge::processPendingActions() {
-  while (true) {
-    acadctl::NativeAction action = acadctl::take_native_action();
-    if (action.kind == acadctl::NativeActionKind::None) {
-      return;
-    }
-
-    acadctl::NativeActionResult actionResult =
-        result(acadctl::NativeActionResultKind::Success);
-    switch (action.kind) {
-    case acadctl::NativeActionKind::Open:
-      actionResult = open(action.path);
-      break;
-    case acadctl::NativeActionKind::Save:
-      if (AcApDocument *target = document(action.document_token)) {
-        actionResult =
-            matchesDatabase(target, action.database_token)
-                ? save(target)
-                : result(acadctl::NativeActionResultKind::DocumentChanged);
-      } else {
-        actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
-      }
-      break;
-    case acadctl::NativeActionKind::Close:
-      if (AcApDocument *target = document(action.document_token)) {
-        actionResult =
-            matchesDatabase(target, action.database_token)
-                ? close(target, action.discard)
-                : result(acadctl::NativeActionResultKind::DocumentChanged);
-      } else {
-        actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
-      }
-      break;
-    case acadctl::NativeActionKind::None:
-      return;
-    }
-
-    syncDocuments();
-    acadctl::complete_native_action(action.request_id, std::move(actionResult));
+  acadctl::NativeAction action = acadctl::take_native_action();
+  if (action.kind == acadctl::NativeActionKind::None) {
+    scheduleNextNativeAction();
+    return;
   }
+
+  acadctl::NativeActionResult actionResult =
+      result(acadctl::NativeActionResultKind::Success);
+  switch (action.kind) {
+  case acadctl::NativeActionKind::Open:
+    actionResult = open(action.path);
+    break;
+  case acadctl::NativeActionKind::Save:
+    if (AcApDocument *target = document(action.document_token)) {
+      actionResult =
+          matchesDatabase(target, action.database_token)
+              ? save(target)
+              : result(acadctl::NativeActionResultKind::DocumentChanged);
+    } else {
+      actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+    }
+    break;
+  case acadctl::NativeActionKind::Close:
+    if (AcApDocument *target = document(action.document_token)) {
+      actionResult =
+          matchesDatabase(target, action.database_token)
+              ? close(target, action.discard)
+              : result(acadctl::NativeActionResultKind::DocumentChanged);
+    } else {
+      actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+    }
+    break;
+  case acadctl::NativeActionKind::None:
+    return;
+  }
+
+  syncDocuments();
+  acadctl::complete_native_action(action.request_id, std::move(actionResult));
+  scheduleNextNativeAction();
 }
 
 AcApDocument *ObjectArxBridge::document(std::size_t token) {

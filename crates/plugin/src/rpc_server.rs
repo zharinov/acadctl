@@ -9,15 +9,12 @@ use acadctl_rpc::{
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
-use crate::documents::{DocumentRegistry, DocumentTarget};
-use crate::native_actions::Error as NativeActionError;
+use crate::scheduler::Error as SchedulerError;
 
 const MAX_CONCURRENT_STREAMS: u32 = 32;
 const RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
 static SERVER: Mutex<Option<Server>> = Mutex::new(None);
-static DOCUMENTS: Mutex<DocumentRegistry> = Mutex::new(DocumentRegistry::new());
-static LIFECYCLE_OPERATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Server {
     stop: oneshot::Sender<()>,
@@ -40,57 +37,27 @@ struct Service;
 #[tonic::async_trait]
 impl Acadctl for Service {
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let documents = DOCUMENTS
-            .lock()
-            .map_err(|_| Status::internal("document state is unavailable"))?
-            .list();
+        let documents = crate::scheduler::list().map_err(scheduler_error)?;
         Ok(Response::new(ListResponse { documents }))
     }
 
     async fn open(&self, request: Request<OpenRequest>) -> Result<Response<OpenResponse>, Status> {
         let path = request.into_inner().path;
         validate_open_path(&path)?;
-        let _operation = LIFECYCLE_OPERATION.lock().await;
-
-        if let Some(target) = find_by_path(&path)? {
-            return Ok(Response::new(OpenResponse {
-                document: Some(target.document),
-            }));
-        }
-
-        crate::native_actions::open(path.clone())
+        let document = crate::scheduler::open(path)
             .await
-            .map_err(native_error)?;
-
-        let target = find_by_path(&path)?.ok_or_else(|| {
-            Status::internal("AutoCAD opened the drawing but did not publish its document state")
-        })?;
+            .map_err(scheduler_error)?;
         Ok(Response::new(OpenResponse {
-            document: Some(target.document),
+            document: Some(document),
         }))
     }
 
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let id = request.into_inner().id;
         validate_document_id(&id)?;
-        let _operation = LIFECYCLE_OPERATION.lock().await;
-        let target = find_by_id(&id)?.ok_or_else(|| document_not_found(&id))?;
-        validate_save_target(&target, &id)?;
-
-        if target.document.modified {
-            crate::native_actions::save(target.native_key)
-                .await
-                .map_err(native_error)?;
-        }
-
-        let saved = find_by_id(&id)?.ok_or_else(|| document_not_found(&id))?;
-        if saved.document.modified {
-            return Err(Status::internal(
-                "AutoCAD completed the save but still reports unsaved changes",
-            ));
-        }
+        let document = crate::scheduler::save(id).await.map_err(scheduler_error)?;
         Ok(Response::new(SaveResponse {
-            document: Some(saved.document),
+            document: Some(document),
         }))
     }
 
@@ -100,24 +67,9 @@ impl Acadctl for Service {
     ) -> Result<Response<CloseResponse>, Status> {
         let request = request.into_inner();
         validate_document_id(&request.id)?;
-        let _operation = LIFECYCLE_OPERATION.lock().await;
-        let target = find_by_id(&request.id)?.ok_or_else(|| document_not_found(&request.id))?;
-        if target.document.modified && !request.discard {
-            return Err(unsaved_changes(&request.id));
-        }
-
-        crate::native_actions::close(target.native_key, request.discard)
+        crate::scheduler::close(request.id, request.discard)
             .await
-            .map_err(|error| match error {
-                NativeActionError::Dirty => unsaved_changes(&request.id),
-                error => native_error(error),
-            })?;
-
-        if find_by_id(&request.id)?.is_some() {
-            return Err(Status::internal(
-                "AutoCAD completed the close but the document is still open",
-            ));
-        }
+            .map_err(scheduler_error)?;
         Ok(Response::new(CloseResponse {}))
     }
 }
@@ -146,63 +98,24 @@ fn validate_document_id(id: &str) -> Result<(), Status> {
     }
 }
 
-fn validate_save_target(target: &DocumentTarget, id: &str) -> Result<(), Status> {
-    if !target.named {
-        return Err(Status::failed_precondition(format!(
-            "Document '{id}' has no file name. Save As is not supported yet."
-        )));
-    }
-
-    if target.document.read_only {
-        return Err(Status::failed_precondition(format!(
-            "Document '{id}' is read-only."
-        )));
-    }
-
-    if !is_dwg(std::path::Path::new(&target.document.path)) {
-        return Err(Status::failed_precondition(
-            "Only DWG drawings can be saved",
-        ));
-    }
-
-    Ok(())
-}
-
 fn is_dwg(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("dwg"))
 }
 
-fn find_by_id(id: &str) -> Result<Option<DocumentTarget>, Status> {
-    DOCUMENTS
-        .lock()
-        .map_err(|_| Status::internal("document state is unavailable"))
-        .map(|documents| documents.find_by_id(id))
-}
-
-fn find_by_path(path: &str) -> Result<Option<DocumentTarget>, Status> {
-    DOCUMENTS
-        .lock()
-        .map_err(|_| Status::internal("document state is unavailable"))
-        .map(|documents| documents.find_by_path(path))
-}
-
-fn document_not_found(id: &str) -> Status {
-    Status::not_found(format!("Document '{id}' is not open."))
-}
-
-fn unsaved_changes(id: &str) -> Status {
-    Status::failed_precondition(format!(
-        "Document '{id}' has unsaved changes. Run `acadctl save {id}` first or use `acadctl close {id} --discard`."
-    ))
-}
-
-fn native_error(error: NativeActionError) -> Status {
-    Status::failed_precondition(error.to_string())
+fn scheduler_error(error: SchedulerError) -> Status {
+    if matches!(&error, SchedulerError::DocumentNotFound(_)) {
+        Status::not_found(error.to_string())
+    } else if error.is_internal() {
+        Status::internal(error.to_string())
+    } else {
+        Status::failed_precondition(error.to_string())
+    }
 }
 
 pub fn start() -> Result<(), String> {
+    crate::scheduler::start();
     let mut active = SERVER
         .lock()
         .map_err(|_| "server state is unavailable".to_owned())?;
@@ -234,7 +147,7 @@ pub fn start() -> Result<(), String> {
 }
 
 pub fn stop() {
-    crate::native_actions::cancel_all();
+    crate::scheduler::stop();
     let server = SERVER.lock().ok().and_then(|mut active| active.take());
     if let Some(server) = server {
         server.shutdown();
@@ -242,9 +155,7 @@ pub fn stop() {
 }
 
 pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentState>) {
-    if let Ok(mut active) = DOCUMENTS.lock() {
-        active.replace(documents);
-    }
+    crate::scheduler::replace_documents(documents);
 }
 
 fn run(stop: oneshot::Receiver<()>, startup: mpsc::SyncSender<Result<(), String>>) {
@@ -321,6 +232,7 @@ mod tests {
 
     #[test]
     fn reports_documents_and_stops_promptly() {
+        let _test = crate::scheduler::TEST_LOCK.blocking_lock();
         replace_documents(vec![
             crate::ffi::NativeDocumentState {
                 token: 1,

@@ -63,13 +63,17 @@ mod ffi {
 
         fn complete_native_action(request_id: u64, result: NativeActionResult);
 
+        fn native_actions_need_wake() -> bool;
+
+        fn native_action_wake_failed(status: i32);
+
         fn stop_rpc_server();
     }
 }
 
 mod documents;
-mod native_actions;
 mod rpc_server;
+mod scheduler;
 
 static DOCUMENTS_DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -90,11 +94,19 @@ fn replace_documents(documents: Vec<ffi::NativeDocumentState>) {
 }
 
 fn take_native_action() -> ffi::NativeAction {
-    native_actions::take()
+    scheduler::take()
 }
 
 fn complete_native_action(request_id: u64, result: ffi::NativeActionResult) {
-    native_actions::complete(request_id, result);
+    scheduler::complete(request_id, result);
+}
+
+fn native_actions_need_wake() -> bool {
+    scheduler::native_actions_need_wake()
+}
+
+fn native_action_wake_failed(status: i32) {
+    scheduler::wake_failed(status);
 }
 
 fn stop_rpc_server() {
