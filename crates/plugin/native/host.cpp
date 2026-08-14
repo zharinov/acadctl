@@ -446,7 +446,6 @@ extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
                                            void *applicationId) {
   switch (message) {
   case AcRx::kInitAppMsg: {
-    acrxDynamicLinker->unlockApplication(applicationId);
     acrxDynamicLinker->registerAppMDIAware(applicationId);
     objectArxBridge = std::make_unique<ObjectArxBridge>();
     objectArxBridge->start();
