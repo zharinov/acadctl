@@ -1,8 +1,12 @@
 #include "AcString.h"
 #include "acadctl-plugin/src/lib.rs.h"
+#include "adscodes.h"
+#include "acedCmdNF.h"
+#include "acedads.h"
 #include "acdocman.h"
 #include "aced.h"
 #include "acestext.h"
+#include "acutads.h"
 #include "dbmain.h"
 #include "rxregsvc.h"
 #include <algorithm>
@@ -41,6 +45,10 @@ private:
   acadctl::NativeActionResult save(AcApDocument *document);
 
   acadctl::NativeActionResult close(AcApDocument *document, bool discard);
+
+  acadctl::NativeActionResult runExecution(AcApDocument *document,
+                                            std::size_t databaseToken,
+                                            std::uint64_t executionId);
 
   void publishDocuments();
 
@@ -156,9 +164,432 @@ acadctl::NativeActionResult nativeFailure(
   return {kind, static_cast<std::int32_t>(status), rust::String(detail.utf8Ptr())};
 }
 
+acadctl::NativeActionResult bridgeFailure(
+    acadctl::NativeActionResultKind kind, int status, const char *detail) {
+  return {kind, status, rust::String(detail)};
+}
+
+acadctl::NativeExecutionStepResult stepSuccess() {
+  return {acadctl::NativeExecutionStepResultKind::Success, 0, 0,
+          rust::String()};
+}
+
+acadctl::NativeExecutionStepResult stepNativeFailure(int status,
+                                                      const char *detail) {
+  return {acadctl::NativeExecutionStepResultKind::NativeError, status, 0,
+          rust::String(detail)};
+}
+
+struct ResbufDeleter {
+  void operator()(resbuf *value) const {
+    if (value) {
+      acutRelRb(value);
+    }
+  }
+};
+
+using ResbufPtr = std::unique_ptr<resbuf, ResbufDeleter>;
+
+int putStringSymbol(const ACHAR *name, const AcString &text) {
+  resbuf value{};
+  value.restype = RTSTR;
+  value.resval.rstring = const_cast<ACHAR *>(text.kACharPtr());
+  return acedPutSym(name, &value);
+}
+
+int clearSymbol(const ACHAR *name) {
+  resbuf value{};
+  value.restype = RTNIL;
+  return acedPutSym(name, &value);
+}
+
+ResbufPtr getSymbol(const ACHAR *name, int &status) {
+  resbuf *value = nullptr;
+  status = acedGetSym(name, &value);
+  return ResbufPtr(value);
+}
+
+int integerValue(const resbuf *value) {
+  if (!value) {
+    return 0;
+  }
+  if (value->restype == RTSHORT) {
+    return value->resval.rint;
+  }
+  if (value->restype == RTLONG) {
+    return value->resval.rlong;
+  }
+  return 0;
+}
+
+bool getIntegerSystemVariable(const ACHAR *name, int &value, int &status) {
+  resbuf result{};
+  status = acedGetVar(name, &result);
+  if (status != RTNORM ||
+      (result.restype != RTSHORT && result.restype != RTLONG)) {
+    if (status == RTNORM) {
+      status = RTERROR;
+    }
+    return false;
+  }
+  value = integerValue(&result);
+  return true;
+}
+
+enum class UndoGroupState { Inactive, Active, Unknown };
+
+UndoGroupState observeUndoGroup(int &status) {
+  int undoControl = 0;
+  if (!getIntegerSystemVariable(ACRX_T("UNDOCTL"), undoControl, status)) {
+    return UndoGroupState::Unknown;
+  }
+  return (undoControl & 8) != 0 ? UndoGroupState::Active
+                                : UndoGroupState::Inactive;
+}
+
+int clearEvaluationSymbols() {
+  int firstFailure = RTNORM;
+  for (const ACHAR *name : {ACRX_T("acadctl:*source*"),
+                            ACRX_T("acadctl:*status*"),
+                            ACRX_T("acadctl:*error*"),
+                            ACRX_T("acadctl:*errno*"),
+                            ACRX_T("acadctl:*value*")}) {
+    const int status = clearSymbol(name);
+    if (firstFailure == RTNORM && status != RTNORM) {
+      firstFailure = status;
+    }
+  }
+  return firstFailure;
+}
+
+acadctl::NativeExecutionStepResult finishEvaluation(
+    acadctl::NativeExecutionStepResult result) {
+  const int cleanupStatus = clearEvaluationSymbols();
+  return cleanupStatus == RTNORM
+             ? std::move(result)
+             : stepNativeFailure(
+                   cleanupStatus,
+                   "could not clear the reserved AutoLISP evaluator state");
+}
+
+acadctl::NativeExecutionStepResult evaluateForm(
+    rust::Str source, const AcString &evaluatorText) {
+  const AcString pending(ACRX_T("pending"));
+  const int clearStatus = clearEvaluationSymbols();
+  if (clearStatus != RTNORM) {
+    return stepNativeFailure(
+        clearStatus, "could not clear the reserved AutoLISP evaluator state");
+  }
+  {
+    const AcString form(source.data(), AcString::Utf8,
+                        static_cast<Adesk::UInt32>(source.size()));
+    if (putStringSymbol(ACRX_T("acadctl:*source*"), form) != RTNORM ||
+        putStringSymbol(ACRX_T("acadctl:*status*"), pending) != RTNORM) {
+      return finishEvaluation(stepNativeFailure(
+          RTERROR, "could not stage the AutoLISP form in memory"));
+    }
+  }
+
+  const int commandStatus =
+      acedCommandS(RTSTR, evaluatorText.kACharPtr(), RTNONE);
+  if (commandStatus != RTNORM) {
+    return finishEvaluation(stepNativeFailure(
+        commandStatus, "AutoCAD rejected the evaluator expression"));
+  }
+
+  int statusResult = RTERROR;
+  ResbufPtr status = getSymbol(ACRX_T("acadctl:*status*"), statusResult);
+  if (statusResult != RTNORM || !status) {
+    return finishEvaluation(stepNativeFailure(
+        statusResult, "the evaluator did not publish a result"));
+  }
+
+  int errnoResult = RTERROR;
+  ResbufPtr lispErrno = getSymbol(ACRX_T("acadctl:*errno*"), errnoResult);
+  const int lispErrnoValue =
+      errnoResult == RTNORM ? integerValue(lispErrno.get()) : 0;
+
+  if (status->restype == RTT) {
+    return finishEvaluation(stepSuccess());
+  }
+  if (status->restype != RTNIL) {
+    return finishEvaluation(stepNativeFailure(
+        RTERROR, "the evaluator published an invalid result tag"));
+  }
+
+  int errorResult = RTERROR;
+  ResbufPtr error = getSymbol(ACRX_T("acadctl:*error*"), errorResult);
+  rust::String detail("AutoLISP evaluation failed");
+  if (errorResult == RTNORM && error && error->restype == RTSTR &&
+      error->resval.rstring) {
+    const AcString errorText(error->resval.rstring);
+    detail = rust::String(errorText.utf8Ptr());
+  }
+  return finishEvaluation(
+      {acadctl::NativeExecutionStepResultKind::LispError, 0, lispErrnoValue,
+       std::move(detail)});
+}
+
+struct UndoCommandResult {
+  acadctl::NativeExecutionStepResult result;
+  UndoGroupState state;
+};
+
+UndoCommandResult runUndoCommand(const ACHAR *option,
+                                 UndoGroupState expectedState) {
+  const int commandStatus =
+      acedCommandS(RTSTR, ACRX_T("_.UNDO"), RTSTR, option, RTNONE);
+  int observationStatus = RTERROR;
+  const UndoGroupState state = observeUndoGroup(observationStatus);
+  if (commandStatus != RTNORM) {
+    return {stepNativeFailure(commandStatus, "the UNDO command failed"),
+            state};
+  }
+  if (state == UndoGroupState::Unknown) {
+    return {stepNativeFailure(observationStatus,
+                              "could not read AutoCAD's undo state"),
+            state};
+  }
+  if (state != expectedState) {
+    return {stepNativeFailure(
+                RTERROR,
+                expectedState == UndoGroupState::Active
+                    ? "AutoCAD did not open the requested undo group"
+                    : "AutoCAD did not close the requested undo group"),
+            state};
+  }
+  return {stepSuccess(), state};
+}
+
+UndoCommandResult rollbackUndoGroup(UndoGroupState state,
+                                    bool ownedGroupStarted) {
+  if (!ownedGroupStarted || state == UndoGroupState::Unknown) {
+    return {stepNativeFailure(
+                RTERROR,
+                "the owned undo group could not be identified for rollback"),
+            state};
+  }
+
+  UndoCommandResult end{stepSuccess(), state};
+  if (state == UndoGroupState::Active) {
+    end = runUndoCommand(ACRX_T("_End"), UndoGroupState::Inactive);
+    if (end.state != UndoGroupState::Inactive) {
+      return end;
+    }
+  }
+
+  const int status = acedCommandS(RTSTR, ACRX_T("_.U"), RTNONE);
+  int observationStatus = RTERROR;
+  const UndoGroupState finalState = observeUndoGroup(observationStatus);
+  if (status != RTNORM) {
+    return {stepNativeFailure(status, "the U command failed"), finalState};
+  }
+  if (finalState != UndoGroupState::Inactive) {
+    return {stepNativeFailure(
+                observationStatus,
+                "could not prove that rollback closed the owned undo group"),
+            finalState};
+  }
+  if (end.result.kind !=
+      acadctl::NativeExecutionStepResultKind::Success) {
+    return {std::move(end.result), finalState};
+  }
+  return {stepSuccess(), finalState};
+}
+
 bool matchesDatabase(AcApDocument *document, std::size_t databaseToken) {
   return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(
              document->database())) == databaseToken;
+}
+
+bool matchesExecutionContext(AcApDocument *document,
+                             std::size_t databaseToken,
+                             AcApDocument *expectedActive) {
+  return matchesDatabase(document, databaseToken) &&
+         acDocManager->curDocument() == document &&
+         acDocManager->mdiActiveDocument() == expectedActive;
+}
+
+acadctl::NativeActionResult abandonLostExecutionContext(
+    std::uint64_t executionId, bool leaseMayBeOpen) {
+  if (!acadctl::abandon_execution(
+          executionId,
+          stepNativeFailure(
+              RTERROR, "the target document context changed during execution"))) {
+    return bridgeFailure(
+        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
+        "Rust could not terminalize an execution after context loss");
+  }
+  return leaseMayBeOpen
+             ? bridgeFailure(
+                   acadctl::NativeActionResultKind::ExecutionLeaseFailed,
+                   RTERROR,
+                   "context loss obscured an open undo group")
+             : result(acadctl::NativeActionResultKind::Success);
+}
+
+acadctl::NativeActionResult runExecutionSteps(std::uint64_t executionId,
+                                              AcApDocument *document,
+                                              std::size_t databaseToken,
+                                              AcApDocument *expectedActive) {
+  UndoGroupState undoGroup = UndoGroupState::Inactive;
+  bool ownedGroupStarted = false;
+  bool ownedLeaseOpen = false;
+  bool formAttempted = false;
+  const rust::Str evaluator = acadctl::execution_evaluator_source();
+  const AcString evaluatorText(
+      evaluator.data(), AcString::Utf8,
+      static_cast<Adesk::UInt32>(evaluator.size()));
+  while (true) {
+    if (!matchesExecutionContext(document, databaseToken, expectedActive)) {
+      return abandonLostExecutionContext(executionId, ownedLeaseOpen);
+    }
+    rust::Box<acadctl::NativeExecutionStep> step =
+        acadctl::take_execution_step(executionId);
+    const acadctl::NativeExecutionStepKind kind =
+        acadctl::execution_step_kind(*step);
+    if (kind == acadctl::NativeExecutionStepKind::Done) {
+      if (undoGroup == UndoGroupState::Unknown) {
+        acadctl::abandon_execution(
+            executionId,
+            stepNativeFailure(
+                RTERROR, "the execution ended with unknown undo-group state"));
+        return bridgeFailure(
+            acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+            "the execution ended with unknown undo-group state");
+      }
+      if (undoGroup == UndoGroupState::Active) {
+        UndoCommandResult cleanup =
+            formAttempted
+                ? rollbackUndoGroup(undoGroup, ownedGroupStarted)
+                : runUndoCommand(ACRX_T("_End"),
+                                 UndoGroupState::Inactive);
+        undoGroup = cleanup.state;
+        ownedLeaseOpen = undoGroup != UndoGroupState::Inactive;
+        if (formAttempted ||
+            cleanup.result.kind !=
+                acadctl::NativeExecutionStepResultKind::Success) {
+          acadctl::NativeExecutionStepResult terminalFailure =
+              cleanup.result.kind ==
+                      acadctl::NativeExecutionStepResultKind::Success
+                  ? stepNativeFailure(
+                        RTERROR,
+                        "an unexpected open undo group was rolled back")
+                  : std::move(cleanup.result);
+          if (!acadctl::abandon_execution(executionId,
+                                           std::move(terminalFailure))) {
+            return bridgeFailure(
+                acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+                RTERROR,
+                "Rust could not record emergency undo-group cleanup");
+          }
+        }
+        if (ownedLeaseOpen) {
+          return bridgeFailure(
+              acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+              "the owned undo group could not be closed");
+        }
+      }
+      return result(acadctl::NativeActionResultKind::Success);
+    }
+    if (kind == acadctl::NativeExecutionStepKind::Invalid) {
+      if (undoGroup == UndoGroupState::Unknown) {
+        return bridgeFailure(
+            acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+            "Rust returned an invalid step while undo-group state was unknown");
+      }
+      if (undoGroup == UndoGroupState::Active) {
+        UndoCommandResult cleanup =
+            formAttempted
+                ? rollbackUndoGroup(undoGroup, ownedGroupStarted)
+                : runUndoCommand(ACRX_T("_End"),
+                                 UndoGroupState::Inactive);
+        if (cleanup.state != UndoGroupState::Inactive) {
+          return bridgeFailure(
+              acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+              "an invalid execution step left the undo group open");
+        }
+      }
+      return bridgeFailure(
+          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
+          "Rust returned an invalid execution step");
+    }
+
+    acadctl::NativeExecutionStepResult stepResult = stepSuccess();
+    UndoCommandResult undoTransition{stepSuccess(), undoGroup};
+    switch (kind) {
+    case acadctl::NativeExecutionStepKind::Begin:
+      undoTransition =
+          runUndoCommand(ACRX_T("_Begin"), UndoGroupState::Active);
+      stepResult = std::move(undoTransition.result);
+      break;
+    case acadctl::NativeExecutionStepKind::Form:
+      formAttempted = true;
+      stepResult = evaluateForm(acadctl::execution_step_source(*step),
+                                evaluatorText);
+      break;
+    case acadctl::NativeExecutionStepKind::Commit:
+      undoTransition =
+          runUndoCommand(ACRX_T("_End"), UndoGroupState::Inactive);
+      stepResult = std::move(undoTransition.result);
+      break;
+    case acadctl::NativeExecutionStepKind::Rollback:
+      undoTransition = rollbackUndoGroup(undoGroup, ownedGroupStarted);
+      stepResult = std::move(undoTransition.result);
+      break;
+    case acadctl::NativeExecutionStepKind::Invalid:
+    case acadctl::NativeExecutionStepKind::Done:
+      break;
+    }
+    if (!matchesExecutionContext(document, databaseToken, expectedActive)) {
+      return abandonLostExecutionContext(
+          executionId,
+          ownedLeaseOpen ||
+              kind == acadctl::NativeExecutionStepKind::Begin);
+    }
+    if (kind == acadctl::NativeExecutionStepKind::Form) {
+      int observationStatus = RTERROR;
+      undoGroup = observeUndoGroup(observationStatus);
+      ownedLeaseOpen = undoGroup != UndoGroupState::Inactive;
+      if (stepResult.kind ==
+              acadctl::NativeExecutionStepResultKind::Success &&
+          undoGroup != UndoGroupState::Active) {
+        stepResult = stepNativeFailure(
+            undoGroup == UndoGroupState::Unknown ? observationStatus
+                                                 : RTERROR,
+            "the owned undo group changed during AutoLISP evaluation");
+      }
+    } else {
+      undoGroup = undoTransition.state;
+      if (kind == acadctl::NativeExecutionStepKind::Begin) {
+        ownedGroupStarted = undoGroup != UndoGroupState::Inactive;
+      }
+      ownedLeaseOpen = undoGroup != UndoGroupState::Inactive;
+    }
+    if (!acadctl::complete_execution_step(executionId,
+                                           std::move(stepResult))) {
+      if (undoGroup == UndoGroupState::Unknown) {
+        return bridgeFailure(
+            acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+            "Rust rejected a result while undo-group state was unknown");
+      }
+      if (undoGroup == UndoGroupState::Active) {
+        UndoCommandResult cleanup =
+            formAttempted
+                ? rollbackUndoGroup(undoGroup, ownedGroupStarted)
+                : runUndoCommand(ACRX_T("_End"),
+                                 UndoGroupState::Inactive);
+        if (cleanup.state != UndoGroupState::Inactive) {
+          return bridgeFailure(
+              acadctl::NativeActionResultKind::ExecutionLeaseFailed, RTERROR,
+              "Rust rejected a result and the undo group stayed open");
+        }
+      }
+      return bridgeFailure(
+          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
+          "Rust rejected an execution step result");
+    }
+  }
 }
 
 void scheduleNextNativeAction() {
@@ -228,6 +659,16 @@ void ObjectArxBridge::processPendingActions() {
       actionResult =
           matchesDatabase(target, action.database_token)
               ? close(target, action.discard)
+              : result(acadctl::NativeActionResultKind::DocumentChanged);
+    } else {
+      actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+    }
+    break;
+  case acadctl::NativeActionKind::RunExecution:
+    if (AcApDocument *target = document(action.document_token)) {
+      actionResult =
+          matchesDatabase(target, action.database_token)
+              ? runExecution(target, action.database_token, action.request_id)
               : result(acadctl::NativeActionResultKind::DocumentChanged);
     } else {
       actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
@@ -343,6 +784,112 @@ acadctl::NativeActionResult ObjectArxBridge::close(AcApDocument *document,
              ? result(acadctl::NativeActionResultKind::Success)
              : nativeFailure(acadctl::NativeActionResultKind::CloseFailed,
                              status);
+}
+
+acadctl::NativeActionResult
+ObjectArxBridge::runExecution(AcApDocument *document,
+                              std::size_t databaseToken,
+                              std::uint64_t executionId) {
+  if (!document->isQuiescent()) {
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
+  }
+  if (!document->database()->undoRecording()) {
+    return result(acadctl::NativeActionResultKind::UndoDisabled);
+  }
+
+  AcApDocument *previousCurrent = acDocManager->curDocument();
+  AcApDocument *previousActive = acDocManager->mdiActiveDocument();
+  if (!previousActive) {
+    return nativeFailure(acadctl::NativeActionResultKind::ContextFailed,
+                         Acad::eNoDocument);
+  }
+  if (previousCurrent != previousActive || !previousActive->isQuiescent()) {
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
+  }
+  const Acad::ErrorStatus lockStatus = acDocManager->lockDocument(
+      document, AcAp::kXWrite, nullptr, nullptr, false);
+  if (lockStatus != Acad::eOk) {
+    return nativeFailure(acadctl::NativeActionResultKind::LockFailed,
+                         lockStatus);
+  }
+
+  const bool changedCurrent = previousCurrent != document;
+  Acad::ErrorStatus setupStatus = Acad::eOk;
+  if (changedCurrent) {
+    setupStatus =
+        acDocManager->setCurDocument(document, AcAp::kNone, false);
+  }
+
+  acadctl::NativeActionResult executionResult =
+      result(acadctl::NativeActionResultKind::Success);
+  if (setupStatus != Acad::eOk) {
+    executionResult = nativeFailure(
+        acadctl::NativeActionResultKind::ContextFailed, setupStatus);
+  } else if (acDocManager->curDocument() != document ||
+             acDocManager->mdiActiveDocument() != previousActive) {
+    executionResult = nativeFailure(
+        acadctl::NativeActionResultKind::ContextFailed,
+        Acad::eInvalidContext);
+  } else if (!matchesDatabase(document, databaseToken)) {
+    executionResult =
+        result(acadctl::NativeActionResultKind::DocumentChanged);
+  } else if (!document->isQuiescent()) {
+    executionResult = result(acadctl::NativeActionResultKind::NotQuiescent);
+  } else {
+    int commandActivity = 0;
+    int commandActivityStatus = RTERROR;
+    if (!getIntegerSystemVariable(ACRX_T("CMDACTIVE"), commandActivity,
+                                  commandActivityStatus)) {
+      executionResult = bridgeFailure(
+          acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+          commandActivityStatus, "could not read AutoCAD command activity");
+    } else {
+      int undoStatus = RTERROR;
+      const UndoGroupState undoState = observeUndoGroup(undoStatus);
+      if (commandActivity != 0 || undoState == UndoGroupState::Active) {
+        executionResult =
+            result(acadctl::NativeActionResultKind::NotQuiescent);
+      } else if (undoState == UndoGroupState::Unknown) {
+        executionResult = bridgeFailure(
+            acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+            undoStatus, "could not read AutoCAD's undo state");
+      } else {
+        executionResult = runExecutionSteps(executionId, document,
+                                            databaseToken, previousActive);
+      }
+    }
+  }
+
+  Acad::ErrorStatus cleanupStatus = Acad::eOk;
+  if (changedCurrent) {
+    const std::size_t activeToken = static_cast<std::size_t>(
+        reinterpret_cast<std::uintptr_t>(previousActive));
+    if (this->document(activeToken) == previousActive) {
+      const Acad::ErrorStatus restoreStatus =
+          acDocManager->setCurDocument(previousActive, AcAp::kNone, false);
+      if (cleanupStatus == Acad::eOk) {
+        cleanupStatus = restoreStatus;
+      }
+    } else if (cleanupStatus == Acad::eOk) {
+      cleanupStatus = Acad::eNoDocument;
+    }
+  }
+  if ((acDocManager->mdiActiveDocument() != previousActive ||
+       acDocManager->curDocument() != previousActive) &&
+      cleanupStatus == Acad::eOk) {
+    cleanupStatus = Acad::eInvalidContext;
+  }
+  const Acad::ErrorStatus unlockStatus =
+      acDocManager->unlockDocument(document);
+  if (cleanupStatus == Acad::eOk) {
+    cleanupStatus = unlockStatus;
+  }
+  if (cleanupStatus != Acad::eOk) {
+    return nativeFailure(
+        acadctl::NativeActionResultKind::ContextCleanupFailed,
+        cleanupStatus);
+  }
+  return executionResult;
 }
 
 void ObjectArxBridge::publishDocuments() {

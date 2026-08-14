@@ -9,6 +9,7 @@ rust-version.workspace = true
 crate-type = ["staticlib"]
 
 [dependencies]
+acadctl-lisp = { path = "../lisp" }
 acadctl-rpc = { path = "../rpc" }
 cxx.workspace = true
 nanoid.workspace = true

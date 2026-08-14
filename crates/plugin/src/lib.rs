@@ -18,6 +18,7 @@ mod ffi {
         Open,
         Save,
         Close,
+        RunExecution,
     }
 
     #[derive(Debug)]
@@ -33,6 +34,31 @@ mod ffi {
         LockFailed,
         SaveFailed,
         CloseFailed,
+        NotQuiescent,
+        UndoDisabled,
+        ContextFailed,
+        ContextCleanupFailed,
+        ExecutionLeaseFailed,
+        ExecutionBridgeFailed,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeExecutionStepKind {
+        Invalid,
+        Begin,
+        Form,
+        Commit,
+        Rollback,
+        Done,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeExecutionStepResultKind {
+        Success,
+        LispError,
+        NativeError,
     }
 
     struct NativeAction {
@@ -50,7 +76,16 @@ mod ffi {
         native_detail: String,
     }
 
+    struct NativeExecutionStepResult {
+        kind: NativeExecutionStepResultKind,
+        native_status: i32,
+        lisp_errno: i32,
+        detail: String,
+    }
+
     extern "Rust" {
+        type NativeExecutionStep;
+
         fn start_rpc_server() -> String;
 
         fn mark_documents_dirty();
@@ -67,13 +102,28 @@ mod ffi {
 
         fn native_action_wake_failed(status: i32);
 
+        fn take_execution_step(execution_id: u64) -> Box<NativeExecutionStep>;
+
+        fn execution_step_kind(step: &NativeExecutionStep) -> NativeExecutionStepKind;
+
+        fn execution_step_source(step: &NativeExecutionStep) -> &str;
+
+        fn execution_evaluator_source() -> &'static str;
+
+        fn complete_execution_step(execution_id: u64, result: NativeExecutionStepResult) -> bool;
+
+        fn abandon_execution(execution_id: u64, result: NativeExecutionStepResult) -> bool;
+
         fn stop_rpc_server();
     }
 }
 
 mod documents;
+mod execution;
 mod rpc_server;
 mod scheduler;
+
+use execution::NativeExecutionStep;
 
 static DOCUMENTS_DIRTY: AtomicBool = AtomicBool::new(false);
 
@@ -107,6 +157,52 @@ fn native_actions_need_wake() -> bool {
 
 fn native_action_wake_failed(status: i32) {
     scheduler::wake_failed(status);
+}
+
+fn take_execution_step(execution_id: u64) -> Box<NativeExecutionStep> {
+    Box::new(scheduler::take_execution_step(execution_id))
+}
+
+fn execution_step_kind(step: &NativeExecutionStep) -> ffi::NativeExecutionStepKind {
+    match step.kind() {
+        execution::StepKind::Invalid => ffi::NativeExecutionStepKind::Invalid,
+        execution::StepKind::Begin => ffi::NativeExecutionStepKind::Begin,
+        execution::StepKind::Form => ffi::NativeExecutionStepKind::Form,
+        execution::StepKind::Commit => ffi::NativeExecutionStepKind::Commit,
+        execution::StepKind::Rollback => ffi::NativeExecutionStepKind::Rollback,
+        execution::StepKind::Done => ffi::NativeExecutionStepKind::Done,
+    }
+}
+
+fn execution_step_source(step: &NativeExecutionStep) -> &str {
+    step.source()
+}
+
+fn execution_evaluator_source() -> &'static str {
+    execution::EVALUATOR_SOURCE
+}
+
+fn complete_execution_step(execution_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
+    scheduler::complete_execution_step(execution_id, execution_step_result(result))
+}
+
+fn abandon_execution(execution_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
+    scheduler::abandon_execution(execution_id, execution_step_result(result))
+}
+
+fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::StepResult {
+    let kind = match result.kind {
+        ffi::NativeExecutionStepResultKind::Success => execution::StepResultKind::Success,
+        ffi::NativeExecutionStepResultKind::LispError => execution::StepResultKind::LispError,
+        ffi::NativeExecutionStepResultKind::NativeError => execution::StepResultKind::NativeError,
+        _ => execution::StepResultKind::NativeError,
+    };
+    execution::StepResult {
+        kind,
+        native_status: result.native_status,
+        lisp_errno: result.lisp_errno,
+        detail: result.detail,
+    }
 }
 
 fn stop_rpc_server() {

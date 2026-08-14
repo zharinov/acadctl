@@ -21,6 +21,7 @@ version = "0.7.2"
 name = "acadctl-plugin"
 version = "0.7.2"
 dependencies = [
+ "acadctl-lisp",
  "acadctl-rpc",
  "cxx",
  "cxx-build",

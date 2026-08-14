@@ -7,6 +7,7 @@ use acadctl_rpc::Document;
 use tokio::sync::oneshot;
 
 use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
+use crate::execution::{Execution, NativeExecutionStep, Outcome as ExecutionOutcome, StepResult};
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -21,6 +22,7 @@ struct Scheduler {
     active: Option<Job>,
     wake_pending: bool,
     stopping: bool,
+    quarantined: bool,
 }
 
 struct Job {
@@ -30,14 +32,34 @@ struct Job {
 }
 
 enum Operation {
-    Open { path: String },
-    Save { id: String },
-    Close { id: String, discard: bool },
+    Open {
+        path: String,
+    },
+    Save {
+        id: String,
+    },
+    Close {
+        id: String,
+        discard: bool,
+    },
+    #[allow(
+        dead_code,
+        reason = "request admission stays private until the native proof gates pass"
+    )]
+    Execute {
+        id: String,
+        execution: Box<Execution>,
+    },
 }
 
 enum OperationOutcome {
     Document(Document),
     Closed,
+    #[allow(
+        dead_code,
+        reason = "request admission stays private until the native proof gates pass"
+    )]
+    Execution(ExecutionOutcome),
 }
 
 enum Prepared {
@@ -74,6 +96,14 @@ pub enum Error {
     OpenNotPublished,
     SaveNotPublished,
     CloseNotPublished,
+    NotQuiescent,
+    UndoDisabled,
+    ContextFailed(NativeFailure),
+    ContextCleanupFailed(NativeFailure),
+    ExecutionLeaseFailed(NativeFailure),
+    ExecutionBridgeFailed(NativeFailure),
+    ExecutionNotFinished,
+    NativeStateUnknown,
     UnknownResult(u8),
 }
 
@@ -129,6 +159,30 @@ impl fmt::Display for Error {
             Self::CloseNotPublished => {
                 formatter.write_str("AutoCAD completed the close but the document is still open")
             }
+            Self::NotQuiescent => formatter.write_str("The document is busy"),
+            Self::UndoDisabled => {
+                formatter.write_str("Undo recording is disabled for the document")
+            }
+            Self::ContextFailed(failure) => {
+                failure.fmt_with_context(formatter, "Could not establish document context")
+            }
+            Self::ContextCleanupFailed(failure) => failure.fmt_with_context(
+                formatter,
+                "Could not release the AutoCAD document context safely",
+            ),
+            Self::ExecutionLeaseFailed(failure) => failure.fmt_with_context(
+                formatter,
+                "Could not close the AutoCAD execution lease safely",
+            ),
+            Self::ExecutionBridgeFailed(failure) => {
+                failure.fmt_with_context(formatter, "The AutoLISP execution bridge failed")
+            }
+            Self::ExecutionNotFinished => {
+                formatter.write_str("The native execution ended without a terminal outcome")
+            }
+            Self::NativeStateUnknown => formatter.write_str(
+                "AutoCAD's mutation context is unknown; restart AutoCAD before issuing another mutation",
+            ),
             Self::UnknownResult(kind) => {
                 write!(
                     formatter,
@@ -160,6 +214,12 @@ impl Error {
                 | Self::OpenNotPublished
                 | Self::SaveNotPublished
                 | Self::CloseNotPublished
+                | Self::ContextFailed(_)
+                | Self::ContextCleanupFailed(_)
+                | Self::ExecutionLeaseFailed(_)
+                | Self::ExecutionBridgeFailed(_)
+                | Self::ExecutionNotFinished
+                | Self::NativeStateUnknown
         )
     }
 }
@@ -172,6 +232,7 @@ impl Scheduler {
             active: None,
             wake_pending: false,
             stopping: false,
+            quarantined: false,
         }
     }
 
@@ -180,7 +241,12 @@ impl Scheduler {
     }
 
     fn request_wake(&mut self) -> bool {
-        if self.stopping || self.active.is_some() || self.pending.is_empty() || self.wake_pending {
+        if self.stopping
+            || self.quarantined
+            || self.active.is_some()
+            || self.pending.is_empty()
+            || self.wake_pending
+        {
             return false;
         }
         self.wake_pending = true;
@@ -191,21 +257,41 @@ impl Scheduler {
 pub async fn open(path: String) -> Result<Document, Error> {
     match dispatch(Operation::Open { path }).await? {
         OperationOutcome::Document(document) => Ok(document),
-        OperationOutcome::Closed => Err(Error::OpenNotPublished),
+        OperationOutcome::Closed | OperationOutcome::Execution(_) => Err(Error::OpenNotPublished),
     }
 }
 
 pub async fn save(id: String) -> Result<Document, Error> {
     match dispatch(Operation::Save { id }).await? {
         OperationOutcome::Document(document) => Ok(document),
-        OperationOutcome::Closed => Err(Error::SaveNotPublished),
+        OperationOutcome::Closed | OperationOutcome::Execution(_) => Err(Error::SaveNotPublished),
     }
 }
 
 pub async fn close(id: String, discard: bool) -> Result<(), Error> {
     match dispatch(Operation::Close { id, discard }).await? {
         OperationOutcome::Closed => Ok(()),
-        OperationOutcome::Document(_) => Err(Error::CloseNotPublished),
+        OperationOutcome::Document(_) | OperationOutcome::Execution(_) => {
+            Err(Error::CloseNotPublished)
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "request admission stays private until the native proof gates pass"
+)]
+pub async fn execute(id: String, execution: Execution) -> Result<ExecutionOutcome, Error> {
+    match dispatch(Operation::Execute {
+        id,
+        execution: Box::new(execution),
+    })
+    .await?
+    {
+        OperationOutcome::Execution(outcome) => Ok(outcome),
+        OperationOutcome::Document(_) | OperationOutcome::Closed => {
+            Err(Error::ExecutionNotFinished)
+        }
     }
 }
 
@@ -225,6 +311,7 @@ pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentState>) {
 pub fn start() {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
         scheduler.stopping = false;
+        scheduler.quarantined = false;
     }
 }
 
@@ -232,9 +319,8 @@ pub fn stop() {
     let completions = SCHEDULER.lock().ok().map(|mut scheduler| {
         scheduler.stopping = true;
         scheduler.wake_pending = false;
-        scheduler
-            .pending
-            .drain(..)
+        std::mem::take(&mut scheduler.pending)
+            .into_iter()
             .map(|job| job.completion)
             .collect::<Vec<_>>()
     });
@@ -250,6 +336,9 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
         let mut scheduler = SCHEDULER.lock().map_err(|_| Error::StateUnavailable)?;
         if scheduler.stopping {
             return Err(Error::PluginStopping);
+        }
+        if scheduler.quarantined {
+            return Err(Error::NativeStateUnknown);
         }
         if scheduler.idle()
             && let Prepared::Immediate(outcome) = prepare(&operation, &scheduler.documents)
@@ -280,7 +369,7 @@ pub fn take() -> NativeAction {
             return empty_action();
         };
         scheduler.wake_pending = false;
-        if scheduler.stopping || scheduler.active.is_some() {
+        if scheduler.stopping || scheduler.quarantined || scheduler.active.is_some() {
             TakeDecision::Empty
         } else if let Some(job) = scheduler.pending.pop_front() {
             match prepare(&job.operation, &scheduler.documents) {
@@ -307,11 +396,15 @@ pub fn take() -> NativeAction {
 }
 
 pub fn complete(request_id: u64, result: NativeActionResult) {
-    let completion = {
+    let quarantine = matches!(
+        result.kind,
+        NativeActionResultKind::ContextCleanupFailed | NativeActionResultKind::ExecutionLeaseFailed
+    );
+    let (completion, pending) = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
             return;
         };
-        let Some(job) = scheduler.active.take() else {
+        let Some(mut job) = scheduler.active.take() else {
             return;
         };
         if job.request_id != request_id {
@@ -319,11 +412,73 @@ pub fn complete(request_id: u64, result: NativeActionResult) {
             return;
         }
 
-        let outcome = interpret(result, &job.operation)
-            .and_then(|()| finalize(&job.operation, &scheduler.documents));
-        (job.completion, outcome)
+        let outcome = complete_operation(result, &mut job.operation, &scheduler.documents);
+        let pending = if quarantine {
+            scheduler.quarantined = true;
+            scheduler.wake_pending = false;
+            std::mem::take(&mut scheduler.pending)
+                .into_iter()
+                .map(|job| job.completion)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ((job.completion, outcome), pending)
     };
     let _ = completion.0.send(completion.1);
+    for completion in pending {
+        let _ = completion.send(Err(Error::NativeStateUnknown));
+    }
+}
+
+pub fn take_execution_step(execution_id: u64) -> NativeExecutionStep {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return NativeExecutionStep::invalid();
+    };
+    let Some(job) = scheduler.active.as_mut() else {
+        return NativeExecutionStep::invalid();
+    };
+    if job.request_id != execution_id {
+        return NativeExecutionStep::invalid();
+    }
+    match &mut job.operation {
+        Operation::Execute { execution, .. } => execution.take_step(),
+        Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
+            NativeExecutionStep::invalid()
+        }
+    }
+}
+
+pub fn complete_execution_step(execution_id: u64, result: StepResult) -> bool {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return false;
+    };
+    let Some(job) = scheduler.active.as_mut() else {
+        return false;
+    };
+    if job.request_id != execution_id {
+        return false;
+    }
+    match &mut job.operation {
+        Operation::Execute { execution, .. } => execution.complete_step(result),
+        Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
+    }
+}
+
+pub fn abandon_execution(execution_id: u64, result: StepResult) -> bool {
+    let Ok(mut scheduler) = SCHEDULER.lock() else {
+        return false;
+    };
+    let Some(job) = scheduler.active.as_mut() else {
+        return false;
+    };
+    if job.request_id != execution_id {
+        return false;
+    }
+    match &mut job.operation {
+        Operation::Execute { execution, .. } => execution.abandon(result),
+        Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
+    }
 }
 
 pub fn native_actions_need_wake() -> bool {
@@ -335,9 +490,8 @@ pub fn native_actions_need_wake() -> bool {
 pub fn wake_failed(status: i32) {
     let completions = SCHEDULER.lock().ok().map(|mut scheduler| {
         scheduler.wake_pending = false;
-        scheduler
-            .pending
-            .drain(..)
+        std::mem::take(&mut scheduler.pending)
+            .into_iter()
             .map(|job| job.completion)
             .collect::<Vec<_>>()
     });
@@ -377,6 +531,23 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
             )),
             None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
         },
+        Operation::Execute { id, execution } => match documents.find_by_id(id) {
+            Some(_) if execution.outcome().is_some() => {
+                Prepared::Immediate(Ok(OperationOutcome::Execution(
+                    execution
+                        .outcome()
+                        .expect("terminal execution has an outcome")
+                        .clone(),
+                )))
+            }
+            Some(target) => Prepared::Native(native_action(
+                NativeActionKind::RunExecution,
+                Some(target.native_key),
+                String::new(),
+                false,
+            )),
+            None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
+        },
     }
 }
 
@@ -402,7 +573,7 @@ fn prepare_save(id: &str, target: DocumentTarget) -> Prepared {
 }
 
 fn finalize(
-    operation: &Operation,
+    operation: &mut Operation,
     documents: &DocumentRegistry,
 ) -> Result<OperationOutcome, Error> {
     match operation {
@@ -427,7 +598,36 @@ fn finalize(
                 Err(Error::CloseNotPublished)
             }
         }
+        Operation::Execute { execution, .. } => execution
+            .take_outcome()
+            .map(OperationOutcome::Execution)
+            .ok_or(Error::ExecutionNotFinished),
     }
+}
+
+fn complete_operation(
+    mut result: NativeActionResult,
+    operation: &mut Operation,
+    documents: &DocumentRegistry,
+) -> Result<OperationOutcome, Error> {
+    if matches!(
+        result.kind,
+        NativeActionResultKind::ContextCleanupFailed | NativeActionResultKind::ExecutionLeaseFailed
+    ) && let Operation::Execute { execution, .. } = operation
+        && execution.outcome().is_some()
+    {
+        let recorded = execution.record_terminal_failure(StepResult {
+            kind: crate::execution::StepResultKind::NativeError,
+            native_status: result.native_status,
+            lisp_errno: 0,
+            detail: std::mem::take(&mut result.native_detail),
+        });
+        debug_assert!(recorded);
+        return finalize(operation, documents);
+    }
+
+    interpret(result, operation)?;
+    finalize(operation, documents)
 }
 
 fn native_action(
@@ -468,6 +668,12 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         NativeActionResultKind::LockFailed => Err(Error::LockFailed(failure)),
         NativeActionResultKind::SaveFailed => Err(Error::SaveFailed(failure)),
         NativeActionResultKind::CloseFailed => Err(Error::CloseFailed(failure)),
+        NativeActionResultKind::NotQuiescent => Err(Error::NotQuiescent),
+        NativeActionResultKind::UndoDisabled => Err(Error::UndoDisabled),
+        NativeActionResultKind::ContextFailed => Err(Error::ContextFailed(failure)),
+        NativeActionResultKind::ContextCleanupFailed => Err(Error::ContextCleanupFailed(failure)),
+        NativeActionResultKind::ExecutionLeaseFailed => Err(Error::ExecutionLeaseFailed(failure)),
+        NativeActionResultKind::ExecutionBridgeFailed => Err(Error::ExecutionBridgeFailed(failure)),
         kind => Err(Error::UnknownResult(kind.repr)),
     }
 }
@@ -476,7 +682,7 @@ impl Operation {
     fn document_id(&self) -> &str {
         match self {
             Self::Open { .. } => "",
-            Self::Save { id } | Self::Close { id, .. } => id,
+            Self::Save { id } | Self::Close { id, .. } | Self::Execute { id, .. } => id,
         }
     }
 }
@@ -621,11 +827,165 @@ mod tests {
         assert!(active.await.unwrap().is_ok());
     }
 
+    #[tokio::test]
+    async fn drives_a_batch_through_one_native_execution_lease() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let execution = Execution::new("batch.lsp".into(), "first\nsecond".into()).unwrap();
+        let pending = tokio::spawn(execute(id.clone(), execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        assert_eq!(action.document_token, 1);
+        assert_eq!(action.database_token, 101);
+
+        let begin = take_execution_step(action.request_id);
+        assert_eq!(begin.kind(), crate::execution::StepKind::Begin);
+        assert!(complete_execution_step(action.request_id, step_success()));
+
+        let first = take_execution_step(action.request_id);
+        assert_eq!(first.source(), "first");
+        assert!(complete_execution_step(action.request_id, step_success()));
+        let second = take_execution_step(action.request_id);
+        assert_eq!(second.source(), "second");
+        assert!(complete_execution_step(action.request_id, step_success()));
+
+        let commit = take_execution_step(action.request_id);
+        assert_eq!(commit.kind(), crate::execution::StepKind::Commit);
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+
+        complete(action.request_id, result(NativeActionResultKind::Success));
+        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn dropped_execution_waiter_does_not_release_its_native_lease() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let execution = Execution::new("batch.lsp".into(), "form".into()).unwrap();
+        let executing = tokio::spawn(execute(id.clone(), execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        let form = take_execution_step(action.request_id);
+        assert_eq!(form.source(), "form");
+
+        executing.abort();
+        assert!(executing.await.unwrap_err().is_cancelled());
+        let later = tokio::spawn(close(id, true));
+        tokio::task::yield_now().await;
+        assert_eq!(take().kind, NativeActionKind::None);
+
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Commit
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+        complete(action.request_id, result(NativeActionResultKind::Success));
+
+        assert!(native_actions_need_wake());
+        let close_action = take();
+        assert_eq!(close_action.kind, NativeActionKind::Close);
+        replace_documents(Vec::new());
+        complete(
+            close_action.request_id,
+            result(NativeActionResultKind::Success),
+        );
+        assert!(later.await.unwrap().is_ok());
+        stop();
+    }
+
+    #[tokio::test]
+    async fn context_cleanup_failure_amends_a_terminal_execution_outcome() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+        let execution = Execution::new("batch.lsp".into(), "ok".into()).unwrap();
+        let pending = tokio::spawn(execute(id.clone(), execution));
+        tokio::task::yield_now().await;
+
+        let action = take();
+        assert_eq!(action.kind, NativeActionKind::RunExecution);
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Begin
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Form
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Commit
+        );
+        assert!(complete_execution_step(action.request_id, step_success()));
+        assert_eq!(
+            take_execution_step(action.request_id).kind(),
+            crate::execution::StepKind::Done
+        );
+
+        let blocked = tokio::spawn(save(id.clone()));
+        tokio::task::yield_now().await;
+
+        complete(
+            action.request_id,
+            NativeActionResult {
+                kind: NativeActionResultKind::ContextCleanupFailed,
+                native_status: 42,
+                native_detail: "unlock failed".into(),
+            },
+        );
+
+        assert_eq!(
+            pending.await.unwrap().unwrap(),
+            ExecutionOutcome::Failure(crate::execution::Failure {
+                message: "unlock failed".into(),
+                form_index: None,
+                location: None,
+                drawing_outcome: crate::execution::DrawingOutcome::Unknown,
+            })
+        );
+        assert_eq!(blocked.await.unwrap(), Err(Error::NativeStateUnknown));
+        assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
+        assert_eq!(take().kind, NativeActionKind::None);
+        stop();
+    }
+
     fn result(kind: NativeActionResultKind) -> NativeActionResult {
         NativeActionResult {
             kind,
             native_status: 0,
             native_detail: String::new(),
+        }
+    }
+
+    fn step_success() -> StepResult {
+        StepResult {
+            kind: crate::execution::StepResultKind::Success,
+            native_status: 0,
+            lisp_errno: 0,
+            detail: String::new(),
         }
     }
 

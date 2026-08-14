@@ -609,3 +609,57 @@ The earlier handler-held lifecycle mutex plus a separate native queue was reject
 The ObjectARX module remains application-locked after loading. `beginExecuteInApplicationContext` is asynchronous, so a scheduled callback can still hold a raw code address after the scheduling call returns. The registered AutoLISP functions also re-enter the module. Allowing a manual `ARXUNLOAD` without a proven native activity lease could therefore unload code that AutoCAD is about to call.
 
 Mid-session dynamic unload was rejected for the initial implementation. AutoCAD process shutdown still runs the normal plugin teardown, and a later unload feature requires a reference-counted native callback lease whose last release is proven to occur after every queued application callback and nested AutoLISP callback has returned. Plugin reload testing consequently uses a fresh AutoCAD process rather than weakening callback lifetime safety.
+
+### 2026-08-14 — I-015: one-form evaluation uses staged symbols and a fixed driver
+
+The private execution bridge stages an exact scanner span in the target document's AutoLISP environment through a reserved `acadctl:*source*` symbol, then invokes one compile-time embedded, fixed AutoLISP expression synchronously. The driver wraps the staged text in an outer list, requires that the reader produce exactly one element, evaluates that element, and writes only tagged status, error, `ERRNO`, and value state to reserved symbols. Request source is never interpolated into a command string, written to a temporary file, or resolved through AutoCAD support paths.
+
+The success tag is constructed inside `vl-catch-all-apply`. Live AutoCAD 2027 checks proved that a form which successfully returns a catch-all error object remains a successful value, while an error escaping `read` or `eval` remains a request failure. Classifying the returned payload itself with `vl-catch-all-error-p` was rejected because it cannot distinguish those cases.
+
+Successful `exec` form values are cleared immediately. The eventual `eval` path will retain its one value through successful undo-group finalization, stream its readable representation only afterward, and then clear it. Serializing or emitting the implicit value before `_UNDO _End` was rejected because a later finalization failure must produce no implicit value, and buffering a whole rendered value would violate bounded output.
+
+### 2026-08-14 — I-016: U+0000 is rejected before native staging
+
+Source containing U+0000 is invalid at the CLI boundary and at the authoritative plugin boundary. ObjectARX stages strings through a NUL-terminated native interface, so accepting an interior zero byte would allow the Rust scanner and the target AutoLISP reader to observe different source. Live AutoCAD 2027 checks also established that ordinary AutoLISP string constructors discard character code zero, so this rejection does not exclude a representable AutoLISP source character.
+
+Silently truncating at U+0000 was rejected because the displayed and validated batch could differ from the executed batch. Treating the CLI check alone as sufficient was rejected because another local RPC client could bypass it.
+
+### 2026-08-14 — I-017: rollback failure remains an execution outcome
+
+Rust owns the structured terminal outcome even when native rollback fails. After C++ reports a failed rollback step, the execution state records the original failure plus the rollback failure and marks the drawing outcome unknown. The native step loop may then finish with an unknown undo-group state without replacing that result with a generic bridge-protocol error.
+
+Issuing an additional blind `U` after a successfully closed group was rejected as internal-error recovery. A group that created no undo record could expose the preceding user-owned history step. Internal result-correlation failure therefore reports an unknown bridge outcome; it attempts rollback only while the bridge still positively knows that its own group is open. Normal rollback itself remains behind the live undo proof gate.
+
+### 2026-08-14 — I-018: native execution is compile-proved but not runtime-proved
+
+The private bridge compiles and links against the installed ObjectARX 2027 SDK with the required application-context, document-locking, symbol, synchronous-command, and undo APIs. The embedded reader/evaluator expression has separately passed live AutoLISP conformance checks in AutoCAD 2027.
+
+These are not yet evidence that `acedPutSym` followed by `acedCommandS` works through the plugin callback, that an inactive target receives the correct Lisp environment without UI activation, or that `_UNDO _Begin`, `_End`, and `U` provide the expected reactor-observable group. Replacing the installed trusted ApplicationAddins bundle with the newly built private slice was not performed because that persistent external change requires explicit user approval. The public commands remain absent, and static linkability plus a manually entered Lisp oracle are not reported as a passed native proof gate.
+
+### 2026-08-14 — I-019: execution starts only from a stable current-document context
+
+The application-context callback admits execution only when AutoCAD's current document and MDI-active document are the same stable, quiescent document and `CMDACTIVE` reports no command, script, Lisp, or dialog activity. It then locks the target, makes the target current without activation, and verifies the exact current pointer, unchanged active pointer, document token, and database token before opening the undo group. Cleanup restores current to the previously active document, following the ObjectARX document-manager contract, and verifies both current and active pointers before unlocking.
+
+Restoring an arbitrary pre-callback current pointer was rejected. ObjectARX explicitly permits current and MDI-active to differ temporarily and instructs callers to reset current to the active document after temporary database work. Admitting work while those pointers already differ was also rejected because acadctl cannot prove that it is not intruding on another native context transition.
+
+The expected active pointer and database token remain attached to the whole native lease. Before and after every native execution step, the bridge rechecks the exact target current pointer, unchanged active pointer, and database token before reading another implicit system variable or issuing another command. If a form loses that context, Rust terminalizes the request with an unknown drawing outcome and C++ never attempts rollback through the wrong document context. If an owned undo group may remain in the displaced context, the scheduler enters the quarantine described below.
+
+### 2026-08-14 — I-020: an unproved native lease quarantines mutation scheduling
+
+Restore failure, an unexpected current or active document, unlock failure, an undo group that cannot be proved closed, and database replacement while a group may be open all make the process's native mutation context unknown. The current request retains its structured failure and unknown drawing outcome, but the one-process mutation scheduler is then quarantined: queued mutations fail, new mutations are rejected, stale callbacks take no action, and no next application-context callback is scheduled. Read-only document listing remains available. Only a fresh AutoCAD process clears this condition.
+
+Releasing the active scheduler job and continuing after such a failure was rejected. A leaked document lock, wrong current context, or open undo group would invalidate FIFO isolation for every later lifecycle, execution, or history action. Treating a server reconnect as recovery was rejected because restarting the RPC runtime does not repair AutoCAD native state.
+
+### 2026-08-14 — I-021: undo command status and observed group state are separate evidence
+
+Before `_UNDO _Begin`, the bridge reads `UNDOCTL` and refuses admission when bit 8 shows an existing group. Every Begin and End command returns both its command result and the subsequently observed group state. Rust receives the operation result; the mechanical native lease separately remembers whether the owned group is active, inactive, or unknown. A failed End with the group proved inactive permits later scheduling after the drawing outcome is reported unknown; an End whose closure cannot be proved quarantines the scheduler.
+
+Using `undoRecording()` alone was rejected because it says recording is enabled but does not exclude a pre-existing user group. Treating `acedCommandS` success or failure as proof of the resulting group state was rejected because a command can partially transition before reporting failure. Issuing `U` when this request never positively opened a group was rejected because it could undo the preceding user-owned step.
+
+The normal rollback path remains a live proof gate. In addition to proving `_End` plus `U` restores representative failures, verification must determine whether that sequence leaves the failed request on AutoCAD's redo stack. A rollback that can later be resurrected by an ordinary user `REDO` is not accepted as the final implementation; static command return codes do not answer that question.
+
+### 2026-08-14 — I-022: native staging roots and transient conversions are explicitly released
+
+The Rust execution owns one `Arc<String>` source and hands C++ borrowed form slices. The temporary macOS `AcString` form conversion is scoped only through `acedPutSym` and is destroyed before the evaluator runs, avoiding roughly 16 MiB of avoidable overlap for a 4 MiB ASCII form. The fixed evaluator conversion is constructed once per batch rather than once per form.
+
+Every reserved Lisp staging symbol is cleared before and after evaluation, and a failed clear is a native form failure rather than a reported success. Ignoring cleanup was rejected because `acadctl:*source*` or an arbitrarily large `acadctl:*value*` could remain globally rooted and contaminate later requests. Terminal outcomes and error details are moved out of the scheduler job instead of cloned when ownership can be transferred.
