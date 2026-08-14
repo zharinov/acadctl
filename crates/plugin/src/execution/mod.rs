@@ -13,6 +13,11 @@ pub const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 pub const EVALUATOR_SOURCE: &str = include_str!("../../lisp/acadctl.lsp");
 
 pub struct Execution {
+    #[allow(
+        dead_code,
+        reason = "the stored mode is consumed when public output is wired"
+    )]
+    mode: ExecutionMode,
     source_name: String,
     source: Arc<String>,
     next_scan: ScanPosition,
@@ -26,10 +31,21 @@ pub struct Execution {
     dead_code,
     reason = "request admission stays private until the native proof gates pass"
 )]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Eval,
+    Exec,
+}
+
+#[allow(
+    dead_code,
+    reason = "request admission stays private until the native proof gates pass"
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
     SourceTooLarge,
     NullCharacter,
+    ExpectedOneForm { actual: usize },
     Scan(ScanError),
 }
 
@@ -117,7 +133,11 @@ impl Execution {
         dead_code,
         reason = "request admission stays private until the native proof gates pass"
     )]
-    pub fn new(source_name: String, mut source: String) -> Result<Self, ValidationError> {
+    pub fn new(
+        mode: ExecutionMode,
+        source_name: String,
+        mut source: String,
+    ) -> Result<Self, ValidationError> {
         if source.starts_with('\u{feff}') {
             source.drain(..'\u{feff}'.len_utf8());
         }
@@ -129,9 +149,13 @@ impl Execution {
         }
 
         let form_count = acadctl_lisp::validate(&source).map_err(ValidationError::Scan)?;
+        if mode == ExecutionMode::Eval && form_count != 1 {
+            return Err(ValidationError::ExpectedOneForm { actual: form_count });
+        }
         let next_scan = acadctl_lisp::scan(&source).position();
         let empty = form_count == 0;
         Ok(Self {
+            mode,
             source_name,
             source: Arc::new(source),
             next_scan,
@@ -140,6 +164,14 @@ impl Execution {
             failure: None,
             outcome: empty.then_some(Outcome::Success),
         })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the stored mode is consumed when public output is wired"
+    )]
+    pub const fn mode(&self) -> ExecutionMode {
+        self.mode
     }
 
     pub fn outcome(&self) -> Option<&Outcome> {
@@ -408,30 +440,63 @@ mod tests {
 
     #[test]
     fn validates_source_before_native_admission() {
-        assert!(Execution::new("<stdin>".into(), "x".repeat(MAX_SOURCE_BYTES)).is_ok());
         assert!(
             Execution::new(
+                ExecutionMode::Exec,
+                "<stdin>".into(),
+                "x".repeat(MAX_SOURCE_BYTES),
+            )
+            .is_ok()
+        );
+        assert!(
+            Execution::new(
+                ExecutionMode::Exec,
                 "<stdin>".into(),
                 format!("\u{feff}{}", "x".repeat(MAX_SOURCE_BYTES)),
             )
             .is_ok()
         );
         assert_eq!(
-            Execution::new("<stdin>".into(), "x".repeat(MAX_SOURCE_BYTES + 1))
-                .err()
-                .unwrap(),
+            Execution::new(
+                ExecutionMode::Exec,
+                "<stdin>".into(),
+                "x".repeat(MAX_SOURCE_BYTES + 1),
+            )
+            .err()
+            .unwrap(),
             ValidationError::SourceTooLarge
         );
         assert_eq!(
-            Execution::new("<stdin>".into(), "x\0y".into())
+            Execution::new(ExecutionMode::Exec, "<stdin>".into(), "x\0y".into())
                 .err()
                 .unwrap(),
             ValidationError::NullCharacter
         );
         assert!(matches!(
-            Execution::new("<stdin>".into(), "(unfinished".into()),
+            Execution::new(ExecutionMode::Exec, "<stdin>".into(), "(unfinished".into(),),
             Err(ValidationError::Scan(_))
         ));
+    }
+
+    #[test]
+    fn eval_requires_exactly_one_form_while_exec_accepts_a_batch() {
+        assert_eq!(
+            Execution::new(ExecutionMode::Eval, "<stdin>".into(), "".into())
+                .err()
+                .unwrap(),
+            ValidationError::ExpectedOneForm { actual: 0 }
+        );
+        assert_eq!(
+            Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a b".into())
+                .err()
+                .unwrap(),
+            ValidationError::ExpectedOneForm { actual: 2 }
+        );
+        let eval = Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a".into()).unwrap();
+        assert_eq!(eval.mode(), ExecutionMode::Eval);
+
+        let exec = Execution::new(ExecutionMode::Exec, "<stdin>".into(), "a b".into()).unwrap();
+        assert_eq!(exec.mode(), ExecutionMode::Exec);
     }
 
     #[test]
@@ -442,6 +507,7 @@ mod tests {
     #[test]
     fn yields_exact_forms_then_commits() {
         let mut execution = Execution::new(
+            ExecutionMode::Exec,
             "batch.lsp".into(),
             "(setq x 1) ; keep with separator\n(+ x 2)".into(),
         )
@@ -468,7 +534,8 @@ mod tests {
 
     #[test]
     fn rolls_back_a_lisp_failure_at_its_form_location() {
-        let mut execution = Execution::new("batch.lsp".into(), "ok\n  bad".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok\n  bad".into()).unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().source(), "ok");
         assert!(execution.complete_step(success()));
@@ -495,7 +562,8 @@ mod tests {
 
     #[test]
     fn rollback_failure_preserves_the_original_error_and_marks_unknown() {
-        let mut execution = Execution::new("batch.lsp".into(), "bad".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(lisp_error("boom", 0)));
@@ -512,7 +580,8 @@ mod tests {
 
     #[test]
     fn commit_failure_is_rolled_back() {
-        let mut execution = Execution::new("batch.lsp".into(), "ok".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(success()));
@@ -535,7 +604,8 @@ mod tests {
 
     #[test]
     fn begin_failure_never_claims_that_drawing_work_started() {
-        let mut execution = Execution::new("batch.lsp".into(), "ok".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
         assert_eq!(execution.take_step().kind(), StepKind::Begin);
         assert!(execution.complete_step(native_error("Begin failed", -5001)));
         assert_eq!(execution.take_step().kind(), StepKind::Done);
@@ -568,7 +638,8 @@ mod tests {
 
     #[test]
     fn cleanup_failure_preserves_an_existing_execution_failure() {
-        let mut execution = Execution::new("batch.lsp".into(), "bad".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(lisp_error("boom", 0)));
@@ -586,7 +657,12 @@ mod tests {
 
     #[test]
     fn abandonment_terminalizes_an_in_flight_form_as_unknown() {
-        let mut execution = Execution::new("batch.lsp".into(), "ok\nchanged".into()).unwrap();
+        let mut execution = Execution::new(
+            ExecutionMode::Exec,
+            "batch.lsp".into(),
+            "ok\nchanged".into(),
+        )
+        .unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().source(), "ok");
         assert!(execution.complete_step(success()));
@@ -614,7 +690,8 @@ mod tests {
 
     #[test]
     fn abandonment_preserves_the_failure_that_started_rollback() {
-        let mut execution = Execution::new("batch.lsp".into(), "bad".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(lisp_error("boom", 0)));
@@ -631,7 +708,12 @@ mod tests {
 
     #[test]
     fn empty_batch_finishes_without_an_undo_group() {
-        let mut execution = Execution::new("<stdin>".into(), "; only a comment".into()).unwrap();
+        let mut execution = Execution::new(
+            ExecutionMode::Exec,
+            "<stdin>".into(),
+            "; only a comment".into(),
+        )
+        .unwrap();
 
         assert_eq!(execution.take_step().kind(), StepKind::Done);
         assert_eq!(execution.outcome(), Some(&Outcome::Success));
@@ -643,7 +725,8 @@ mod tests {
     }
 
     fn successful_execution() -> Execution {
-        let mut execution = Execution::new("batch.lsp".into(), "ok".into()).unwrap();
+        let mut execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
         begin(&mut execution);
         assert_eq!(execution.take_step().kind(), StepKind::Form);
         assert!(execution.complete_step(success()));

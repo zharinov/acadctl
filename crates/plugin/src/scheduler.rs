@@ -720,6 +720,7 @@ fn wake_native_actions() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::ExecutionMode;
 
     #[test]
     fn preserves_native_guard_outcomes_as_types() {
@@ -832,7 +833,12 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution = Execution::new("batch.lsp".into(), "first\nsecond".into()).unwrap();
+        let execution = Execution::new(
+            ExecutionMode::Exec,
+            "batch.lsp".into(),
+            "first\nsecond".into(),
+        )
+        .unwrap();
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
@@ -870,7 +876,8 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution = Execution::new("batch.lsp".into(), "form".into()).unwrap();
+        let execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let executing = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
@@ -919,7 +926,8 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution = Execution::new("batch.lsp".into(), "ok".into()).unwrap();
+        let execution =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
         let pending = tokio::spawn(execute(id.clone(), execution));
         tokio::task::yield_now().await;
 
