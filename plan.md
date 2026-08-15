@@ -170,19 +170,21 @@ There are two related printer modes:
 - The implicit `eval` result uses readable Lisp-native formatting for ordinary values, analogous to `prin1`.
 - `acadctl:println` uses display formatting for ordinary values, analogous to `princ`.
 
-Both modes use stable forms for opaque values, including when an opaque value is nested inside ordinary data:
+Both modes render a valid entity handle as AutoLISP's native resolver form and use stable forms for the remaining opaque values, including when they are nested inside ordinary data:
 
 ```text
-#<Entity 5A2>
+(handent "5A2")
 #<SelectionSet>
 #<VlaObject>
 #<File>
 #<Function>
+#<Cycle>
+#<TooDeep>
 ```
 
-Type names use PascalCase. A payload appears only when it is useful. These forms are displays, not new readable AutoLISP literals.
+An entity whose handle cannot be represented safely remains `#<Entity>`. Opaque type names use PascalCase. These forms are displays, not new readable AutoLISP literals.
 
-Only an entity handle is intentionally reusable identity. The entity from `#<Entity 5A2>` can later be resolved with `(handent "5A2")`, subject to the entity still being live in that drawing. Selection-set, VLA-object, file, and function displays are descriptive type tags rather than general object handles.
+Only an entity handle is intentionally reusable identity. `(handent "5A2")` resolves it in the current drawing, subject to the entity still being available there. Selection-set, VLA-object, file, and function displays are descriptive type tags rather than general object handles. `Cycle` and `TooDeep` describe incomplete traversal rather than AutoLISP value types.
 
 The implicit `eval` value is emitted only after successful completion of the drawing undo group. If execution or finalization fails, there is no implicit value. Previously streamed `acadctl:println` output remains visible.
 
@@ -1092,3 +1094,9 @@ The first-Ctrl+C boundary was also exercised after commit while a 500,000-elemen
 The remaining bounded-resource observations are measurements rather than allocator guarantees. Eight admitted 4 MiB sources increased the AutoCAD process's observed RSS by about 35 MiB; queued jobs that lost the five-second start race expired normally. Nine held local connections made the next caller time out at five seconds, and releasing them restored `ls` immediately. A 4 MiB source whose only executable form preceded a maximum trailing comment completed in 0.70 seconds end to end. Twenty thousand no-op forms completed in 10.77 seconds, and an exact 4 MiB source containing 1,398,101 tiny forms responded to the first Ctrl+C and settled with status 130 in 1.038 seconds. The dense case remains intentionally cancellable and linear rather than receiving a form-count limit that could be bypassed with one enclosing form.
 
 A subnormal produced by multiplying two normal AutoLISP reals remained nonzero and both the Rust visitor and AutoLISP's own `vl-prin1-to-string` rendered it as `1.0e-308`. This closes I-037's native-domain formatting question for the tested host. The macOS evidence does not claim Windows process identity, console-signal, or native host behavior; those remain platform-specific validation before a Windows release. Observed RSS values likewise describe this pinned build and workload, not an exact heap contract.
+
+### 2026-08-15 — I-079: value displays expose native entity resolution and direct traversal failures
+
+This entry supersedes the entity, cycle, and depth-limit display forms in I-027, I-028, I-041, and the earlier value-printer contract. A valid entity handle renders directly as `(handent "5A2")`; if the bridge cannot provide a valid handle, the renderer retains the honest `#<Entity>` fallback. No `acadctl:` alias duplicates AutoLISP's existing resolver.
+
+Cycle detection renders `#<Cycle>`, and either the Lisp visitor or Rust printer reaching its nesting boundary renders `#<TooDeep>`. These are traversal outcomes, not members of a generic AutoLISP `Object` type. Unsupported runtime types may still use `#<Object TypeName>` until they receive a more precise representation.

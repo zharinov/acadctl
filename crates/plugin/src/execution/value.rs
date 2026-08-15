@@ -79,6 +79,8 @@ enum OpaqueKind {
     Function,
     Error,
     Object,
+    Cycle,
+    TooDeep,
 }
 
 impl ValuePrinter {
@@ -108,7 +110,7 @@ impl ValuePrinter {
         }
         self.require_no_atom()?;
         if self.lists.len() == MAX_VALUE_DEPTH {
-            self.opaque_value(OpaqueKind::Object, Some("DepthLimit"))?;
+            self.too_deep()?;
             self.skipped_lists = 1;
             return Ok(());
         }
@@ -299,7 +301,17 @@ impl ValuePrinter {
                     && handle.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
             .map(str::to_ascii_uppercase);
-        self.opaque_value(OpaqueKind::Entity, handle.as_deref())
+        let Some(handle) = handle else {
+            return self.opaque_value(OpaqueKind::Entity, None);
+        };
+        if self.skipped_lists != 0 {
+            return self.poll_output();
+        }
+        self.require_no_atom()?;
+        self.before_value()?;
+        self.write("(handent \"")?;
+        self.write(&handle)?;
+        self.write("\")")
     }
 
     pub fn selection_set(&mut self) -> Result<(), PrintError> {
@@ -327,6 +339,14 @@ impl ValuePrinter {
             OpaqueKind::Object,
             label.filter(|label| valid_label(label, MAX_OBJECT_LABEL_BYTES)),
         )
+    }
+
+    pub fn cycle(&mut self) -> Result<(), PrintError> {
+        self.opaque_value(OpaqueKind::Cycle, None)
+    }
+
+    pub fn too_deep(&mut self) -> Result<(), PrintError> {
+        self.opaque_value(OpaqueKind::TooDeep, None)
     }
 
     pub fn finish(self) -> Result<(), PrintError> {
@@ -508,6 +528,8 @@ impl OpaqueKind {
             Self::Function => "Function",
             Self::Error => "Error",
             Self::Object => "Object",
+            Self::Cycle => "Cycle",
+            Self::TooDeep => "TooDeep",
         }
     }
 }
@@ -700,17 +722,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_kind_specific_opaque_displays() {
+    async fn uses_resolvable_entities_and_kind_specific_opaque_displays() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Display);
         printer.begin_list().unwrap();
         printer.entity(Some("5a2")).unwrap();
+        printer.entity(Some("not-a-handle")).unwrap();
         printer.selection_set().unwrap();
         printer.vla_object().unwrap();
         printer.file().unwrap();
         printer.function().unwrap();
-        printer.object(Some("Cycle")).unwrap();
+        printer.cycle().unwrap();
+        printer.too_deep().unwrap();
         printer.object(Some("bad label")).unwrap();
         printer.end_list().unwrap();
         printer.finish().unwrap();
@@ -718,7 +742,7 @@ mod tests {
 
         assert_eq!(
             collect(stream).await,
-            "(#<Entity 5A2> #<SelectionSet> #<VlaObject> #<File> #<Function> #<Object Cycle> #<Object>)\n"
+            "((handent \"5A2\") #<Entity> #<SelectionSet> #<VlaObject> #<File> #<Function> #<Cycle> #<TooDeep> #<Object>)\n"
         );
     }
 
@@ -860,7 +884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replaces_excessive_depth_with_an_honest_opaque_value() {
+    async fn replaces_excessive_depth_with_too_deep() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
@@ -875,7 +899,7 @@ mod tests {
         terminal.finish();
 
         let output = collect(stream).await;
-        assert!(output.contains("#<Object DepthLimit>"));
+        assert!(output.contains("#<TooDeep>"));
         assert!(!output.contains('1'));
         assert_eq!(std::mem::size_of::<ListState>(), 1);
     }

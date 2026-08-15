@@ -36,6 +36,8 @@ pub enum ValueEvent<'a> {
     Function,
     ErrorObject,
     Object(Option<&'a str>),
+    Cycle,
+    TooDeep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,6 +130,8 @@ impl NativeValueWriter {
             ValueEvent::Function => printer.function(),
             ValueEvent::ErrorObject => printer.error_object(),
             ValueEvent::Object(label) => printer.object(label),
+            ValueEvent::Cycle => printer.cycle(),
+            ValueEvent::TooDeep => printer.too_deep(),
         };
         self.handle(result)
     }

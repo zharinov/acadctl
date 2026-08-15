@@ -44,7 +44,7 @@
                     ((vl-consp acadctl:current)
                       (if (>= acadctl:depth {{MAX_DEPTH}})
                         (setq acadctl:continue
-                          ({{CALLBACK}} {{DEPTH_LIMIT}} nil))
+                          ({{CALLBACK}} {{TOO_DEEP}} nil))
                         (progn
                           (setq acadctl:continue
                             ({{CALLBACK}} {{BEGIN_LIST}} nil))

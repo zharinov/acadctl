@@ -37,7 +37,7 @@ pub(crate) enum EventCode {
     ErrorObject = 19,
     Object = 20,
     Cycle = 21,
-    DepthLimit = 22,
+    TooDeep = 22,
 }
 
 pub(crate) enum Payload<'a> {
@@ -80,7 +80,7 @@ impl EventCode {
         Self::ErrorObject,
         Self::Object,
         Self::Cycle,
-        Self::DepthLimit,
+        Self::TooDeep,
     ];
 
     pub(crate) fn from_raw(code: i32) -> Option<Self> {
@@ -114,8 +114,8 @@ pub(crate) fn value_event<'a>(code: i32, payload: Payload<'a>) -> ValueEvent<'a>
         (Some(EventCode::Function), Payload::Nil) => ValueEvent::Function,
         (Some(EventCode::ErrorObject), Payload::Nil) => ValueEvent::ErrorObject,
         (Some(EventCode::Object), Payload::String(label)) => ValueEvent::Object(Some(label)),
-        (Some(EventCode::Cycle), Payload::Nil) => ValueEvent::Object(Some("Cycle")),
-        (Some(EventCode::DepthLimit), Payload::Nil) => ValueEvent::Object(Some("DepthLimit")),
+        (Some(EventCode::Cycle), Payload::Nil) => ValueEvent::Cycle,
+        (Some(EventCode::TooDeep), Payload::Nil) => ValueEvent::TooDeep,
         _ => ValueEvent::Invalid,
     }
 }
@@ -165,7 +165,7 @@ fn write_marker(output: &mut String, marker: &str, callback_name: &str) {
         "ERROR_OBJECT" => EventCode::ErrorObject as usize,
         "OBJECT" => EventCode::Object as usize,
         "CYCLE" => EventCode::Cycle as usize,
-        "DEPTH_LIMIT" => EventCode::DepthLimit as usize,
+        "TOO_DEEP" => EventCode::TooDeep as usize,
         _ => panic!("unknown embedded eval value visitor marker: {marker}"),
     };
     write!(output, "{value}").expect("writing to a String cannot fail");
@@ -196,11 +196,11 @@ mod tests {
         ));
         assert!(matches!(
             value_event(EventCode::Cycle as i32, Payload::Nil),
-            ValueEvent::Object(Some("Cycle"))
+            ValueEvent::Cycle
         ));
         assert!(matches!(
-            value_event(EventCode::DepthLimit as i32, Payload::Nil),
-            ValueEvent::Object(Some("DepthLimit"))
+            value_event(EventCode::TooDeep as i32, Payload::Nil),
+            ValueEvent::TooDeep
         ));
     }
 }
