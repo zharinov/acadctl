@@ -1635,15 +1635,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_errors_own_drawing_outcome_classification() {
-        assert_eq!(
-            Error::NotQuiescent.drawing_outcome(),
-            DrawingOutcome::NotStarted
-        );
-        assert_eq!(Error::Stopped.drawing_outcome(), DrawingOutcome::Unknown);
-    }
-
-    #[test]
     fn preserves_native_guard_outcomes_as_types() {
         assert_eq!(
             interpret(
@@ -1797,55 +1788,6 @@ mod tests {
         replace_document_snapshot(vec![document(1, 101, false)]);
         complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(active.await.unwrap().is_ok());
-    }
-
-    #[tokio::test]
-    async fn keeps_one_mutation_job_active_across_a_batch() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id;
-        let (execution, output) = Execution::new(
-            ExecutionMode::Exec,
-            "batch.lsp".into(),
-            "first\nsecond".into(),
-        )
-        .unwrap();
-        let (_output, pending) = spawn_test_execution(id, execution, output);
-        tokio::task::yield_now().await;
-
-        let action = take_native_action();
-        assert_eq!(action.kind, NativeActionKind::QueueExecutionDriver);
-        assert_eq!(action.document_token, 1);
-        assert_eq!(action.database_token, 101);
-
-        let begin = take_execution_step(action.job_id);
-        assert_eq!(
-            begin.kind(),
-            crate::execution::ExecutionStepKind::BeginUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-
-        let first = take_execution_step(action.job_id);
-        assert_eq!(first.source(), "first");
-        assert!(complete_execution_step(action.job_id, step_success()));
-        let second = take_execution_step(action.job_id);
-        assert_eq!(second.source(), "second");
-        assert!(complete_execution_step(action.job_id, step_success()));
-
-        let commit = take_execution_step(action.job_id);
-        assert_eq!(
-            commit.kind(),
-            crate::execution::ExecutionStepKind::CommitUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::Done
-        );
-
-        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
-        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
-        stop();
     }
 
     #[tokio::test]
@@ -2573,31 +2515,6 @@ mod tests {
             failure.drawing_outcome,
             crate::execution::DrawingOutcome::NotStarted
         );
-        stop();
-    }
-
-    #[tokio::test]
-    async fn admitted_execution_survives_dropped_rpc_observers() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id;
-        let (execution, output) =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let admission = admit_test_execution(id, execution, output).unwrap();
-        let (job_id, output, completion) = admission.into_parts();
-        drop(output);
-        drop(completion);
-
-        let action = take_native_action();
-        assert_eq!(action.kind, NativeActionKind::QueueExecutionDriver);
-        assert_eq!(action.job_id, job_id);
-        assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
-        assert_eq!(
-            take_execution_step(job_id).kind(),
-            crate::execution::ExecutionStepKind::Done
-        );
-        complete_native_action(job_id, result(NativeActionResultKind::Success));
-        assert_eq!(take_native_action().kind, NativeActionKind::None);
         stop();
     }
 

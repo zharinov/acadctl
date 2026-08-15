@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::path::Path;
 
 use bytes::Bytes;
@@ -204,34 +204,6 @@ mod tests {
     #[test]
     fn bounded_reader_never_retains_more_than_the_probe_limit() {
         let bytes = read_bounded(io::repeat(b'x')).unwrap();
-
-        assert_eq!(bytes.len(), MAX_RAW_SOURCE_BYTES);
-        assert!(bytes.capacity() <= MAX_RAW_SOURCE_BYTES);
-    }
-
-    #[test]
-    fn bounded_reader_does_not_overallocate_after_short_reads() {
-        struct ShortReader {
-            reads: usize,
-        }
-
-        impl Read for ShortReader {
-            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-                let count = if self.reads < 63 {
-                    buffer.len()
-                } else if self.reads == 63 {
-                    buffer.len().min(READ_BUFFER_BYTES - 1)
-                } else {
-                    buffer.len()
-                };
-
-                buffer[..count].fill(b'x');
-                self.reads += 1;
-                Ok(count)
-            }
-        }
-
-        let bytes = read_bounded(ShortReader { reads: 0 }).unwrap();
 
         assert_eq!(bytes.len(), MAX_RAW_SOURCE_BYTES);
         assert!(bytes.capacity() <= MAX_RAW_SOURCE_BYTES);

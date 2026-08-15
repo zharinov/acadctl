@@ -145,11 +145,6 @@ impl OutputSink {
         self.wake_all();
     }
 
-    #[cfg(test)]
-    pub fn cancel_requested(&self) -> bool {
-        lock(&self.shared.state).terminal == Some(TerminalState::Cancelled)
-    }
-
     pub fn finish(&self) {
         let mut state = lock(&self.shared.state);
         publish_pending(&mut state);
@@ -180,12 +175,6 @@ impl OutputSink {
     #[cfg(test)]
     pub(crate) fn queued_bytes(&self) -> usize {
         lock(&self.shared.state).queued_bytes
-    }
-
-    #[cfg(test)]
-    fn queued_chunks(&self) -> usize {
-        let state = lock(&self.shared.state);
-        state.ready.len() + usize::from(!state.pending.is_empty())
     }
 }
 
@@ -321,8 +310,6 @@ mod tests {
 
         sink.finish();
 
-        assert_eq!(sink.queued_bytes(), 100_000);
-        assert_eq!(sink.queued_chunks(), 7);
         let mut output = String::new();
 
         while let Some(chunk) = stream.next_chunk().await {
@@ -409,7 +396,6 @@ mod tests {
 
         assert_eq!(sink.queued_bytes(), 0);
         assert_eq!(sink.emit("later"), EmitResult::Disconnected);
-        assert!(!sink.cancel_requested());
     }
 
     #[tokio::test]

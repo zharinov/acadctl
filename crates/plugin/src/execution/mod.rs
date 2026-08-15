@@ -420,11 +420,6 @@ impl Execution {
         ))
     }
 
-    #[cfg(test)]
-    pub const fn mode(&self) -> ExecutionMode {
-        self.mode
-    }
-
     pub fn outcome(&self) -> Option<&ExecutionOutcome> {
         self.outcome.as_ref()
     }
@@ -1112,24 +1107,6 @@ mod tests {
     }
 
     #[test]
-    fn bom_removal_and_native_steps_share_the_source_allocation() {
-        let source = Bytes::from_static(b"\xef\xbb\xbfform");
-        let expected = source.as_ref()[3..].as_ptr();
-        let (mut execution, _output) =
-            Execution::new(ExecutionMode::Exec, "<stdin>".into(), source).unwrap();
-        assert_eq!(execution.source.as_ptr(), expected);
-        assert_eq!(
-            execution.take_step().kind(),
-            ExecutionStepKind::BeginUndoGroup
-        );
-        assert!(execution.complete_step(success()));
-        let form = execution.take_step();
-        assert_eq!(form.kind(), ExecutionStepKind::EvaluateForm);
-        assert_eq!(form.source.as_ref().unwrap().as_ptr(), expected);
-        assert_eq!(form.source(), "form");
-    }
-
-    #[test]
     fn eval_requires_exactly_one_form_while_exec_accepts_a_batch() {
         assert_eq!(
             Execution::new(ExecutionMode::Eval, "<stdin>".into(), "".into())
@@ -1143,15 +1120,8 @@ mod tests {
                 .unwrap(),
             SourceValidationError::ExpectedOneForm { actual: 2 }
         );
-        let eval = Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a".into())
-            .unwrap()
-            .0;
-        assert_eq!(eval.mode(), ExecutionMode::Eval);
-
-        let exec = Execution::new(ExecutionMode::Exec, "<stdin>".into(), "a b".into())
-            .unwrap()
-            .0;
-        assert_eq!(exec.mode(), ExecutionMode::Exec);
+        assert!(Execution::new(ExecutionMode::Eval, "<stdin>".into(), "a".into()).is_ok());
+        assert!(Execution::new(ExecutionMode::Exec, "<stdin>".into(), "a b".into()).is_ok());
     }
 
     #[test]

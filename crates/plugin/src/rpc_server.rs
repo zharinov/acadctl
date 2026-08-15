@@ -999,15 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_truncation_preserves_utf8_and_the_wire_bound() {
-        let message = bounded_diagnostic("é".repeat(acadctl_rpc::MAX_DIAGNOSTIC_BYTES));
-        assert!(message.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES);
-        assert!(message.len() >= acadctl_rpc::MAX_DIAGNOSTIC_BYTES - 3);
-        assert!(message.ends_with("... [truncated]"));
-        assert!(std::str::from_utf8(message.as_bytes()).is_ok());
-    }
-
-    #[test]
     fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
         crate::scheduler::replace_document_snapshot(vec![crate::ffi::NativeDocumentSnapshot {

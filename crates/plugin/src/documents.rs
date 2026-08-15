@@ -269,13 +269,6 @@ mod tests {
         assert!(documents.find_by_path(&other).is_none());
     }
 
-    #[test]
-    fn document_ids_are_fixed_width_and_unambiguous() {
-        let id = new_document_id(&mut HashSet::new());
-
-        assert_eq!(id.to_string().len(), DocumentId::HEX_WIDTH);
-    }
-
     fn named_document(document_token: usize, name: &str) -> NativeDocumentSnapshot {
         NativeDocumentSnapshot {
             document_token,

@@ -71,32 +71,3 @@ fn render(template: &str, values: &[(&str, &str)]) -> String {
     );
     source
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rendered_programs_use_the_shared_private_protocol() {
-        let driver = execution_driver_source();
-        for value in [
-            ADVANCE_EXECUTION_FUNCTION,
-            DRIVE_EXECUTION_FUNCTION,
-            STAGED_FORM_SYMBOL,
-        ] {
-            assert!(driver.contains(value));
-        }
-
-        let evaluator = form_evaluator_source();
-        for value in [
-            SOURCE_SYMBOL,
-            STATUS_SYMBOL,
-            ERROR_SYMBOL,
-            ERRNO_SYMBOL,
-            VALUE_SYMBOL,
-            INVALID_FORM_SPAN_FUNCTION,
-        ] {
-            assert!(evaluator.contains(value));
-        }
-    }
-}

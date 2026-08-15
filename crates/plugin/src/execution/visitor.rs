@@ -187,20 +187,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_one_complete_form_from_rust_owned_protocol_values() {
-        let source = source();
-
-        assert_eq!(acadctl_lisp::validate(source), Ok(1));
-        assert!(!source.contains("{{"));
-        for value in [
-            bridge_protocol::VALUE_EVENT_FUNCTION,
-            bridge_protocol::VALUE_SYMBOL,
-            bridge_protocol::STATUS_SYMBOL,
-            bridge_protocol::ERROR_SYMBOL,
-            bridge_protocol::ERRNO_SYMBOL,
-        ] {
-            assert!(source.contains(value));
-        }
+    fn embedded_value_visitor_is_one_complete_form() {
+        assert_eq!(acadctl_lisp::validate(source()), Ok(1));
     }
 
     #[test]

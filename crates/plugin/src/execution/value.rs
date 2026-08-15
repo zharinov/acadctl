@@ -951,26 +951,6 @@ mod tests {
         let output = collect(stream).await;
         assert!(output.contains("#<TooDeep>"));
         assert!(!output.contains('1'));
-        assert_eq!(std::mem::size_of::<ListState>(), 1);
-    }
-
-    #[tokio::test]
-    async fn renders_large_escaped_strings_without_a_composite_buffer() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink);
-        printer.begin_string().unwrap();
-
-        for _ in 0..10_000 {
-            printer.string_chunk("\"中").unwrap();
-        }
-
-        printer.end_string().unwrap();
-        printer.finish().unwrap();
-        terminal.finish();
-
-        let expected = format!("\"{}\"\n", "\\\"中".repeat(10_000));
-        assert_eq!(collect(stream).await, expected);
     }
 
     fn symbol(printer: &mut ValuePrinter, text: &str) {

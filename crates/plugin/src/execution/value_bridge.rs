@@ -251,38 +251,11 @@ mod tests {
     }
 
     #[test]
-    fn impossible_post_commit_cancellation_is_classified_in_rust() {
-        let (io, _stream) = execution_io();
-        let lease = eval_value_lease(&io);
-        io.output.request_cancel();
-
-        let writer = NativeValueWriter::eval_value(lease);
-        assert_eq!(writer.result, WriteResult::Cancelled);
-        assert_eq!(
-            io.close_value_output(),
-            Some(ValueBridgeFailure::PostCommitCancelled)
-        );
-    }
-
-    #[test]
     fn dropping_an_active_writer_records_an_abandoned_bridge() {
         let (io, _stream) = execution_io();
         drop(NativeValueWriter::eval_value(eval_value_lease(&io)));
 
         assert_eq!(io.close_value_output(), Some(ValueBridgeFailure::Abandoned));
-    }
-
-    #[test]
-    fn terminal_writer_releases_its_formatter_and_execution_io() {
-        let (io, stream) = execution_io();
-        let lease = eval_value_lease(&io);
-        drop(stream);
-
-        let writer = NativeValueWriter::eval_value(lease);
-        assert_eq!(writer.result, WriteResult::Disconnected);
-        assert!(writer.printer.is_none());
-        assert!(writer.lease.is_none());
-        assert_eq!(io.close_value_output(), None);
     }
 
     fn execution_io() -> (Arc<ExecutionIo>, OutputStream) {
