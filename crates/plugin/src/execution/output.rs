@@ -8,6 +8,8 @@ use std::{
 
 use tokio::sync::Notify;
 
+pub use crate::ffi::NativeValueWriteResult as EmitResult;
+
 pub const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 pub const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -17,15 +19,6 @@ pub struct OutputSink {
 
 pub struct OutputStream {
     shared: Arc<Shared>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EmitResult {
-    Written,
-    Disconnected,
-    Cancelled,
-    Stopped,
-    Finished,
 }
 
 struct Shared {
@@ -85,7 +78,7 @@ impl OutputSink {
             loop {
                 let result = emit_result(&state);
 
-                if result != EmitResult::Written {
+                if result != EmitResult::Continue {
                     return result;
                 }
 
@@ -118,14 +111,14 @@ impl OutputSink {
             }
         }
 
-        EmitResult::Written
+        EmitResult::Continue
     }
 
     pub fn flush(&self) -> EmitResult {
         let mut state = lock(&self.shared.state);
         let result = emit_result(&state);
 
-        if result == EmitResult::Written {
+        if result == EmitResult::Continue {
             publish_pending(&mut state);
         }
 
@@ -190,7 +183,7 @@ impl Drop for OutputSink {
 
         let mut state = lock(&self.shared.state);
 
-        if emit_result(&state) != EmitResult::Written {
+        if emit_result(&state) != EmitResult::Continue {
             return;
         }
 
@@ -286,7 +279,7 @@ fn emit_result(state: &State) -> EmitResult {
     } else if state.finished {
         EmitResult::Finished
     } else {
-        EmitResult::Written
+        EmitResult::Continue
     }
 }
 
@@ -313,7 +306,7 @@ mod tests {
         let (sink, mut stream) = channel();
 
         for _ in 0..100_000 {
-            assert_eq!(sink.emit("x"), EmitResult::Written);
+            assert_eq!(sink.emit("x"), EmitResult::Continue);
         }
 
         sink.finish();
@@ -334,7 +327,7 @@ mod tests {
     async fn splits_only_at_utf8_boundaries() {
         let (sink, mut stream) = channel();
         let text = "界".repeat(OUTPUT_CHUNK_BYTES);
-        assert_eq!(sink.emit(&text), EmitResult::Written);
+        assert_eq!(sink.emit(&text), EmitResult::Continue);
         sink.finish();
 
         let mut output = String::new();
@@ -352,7 +345,7 @@ mod tests {
         let (sink, mut stream) = channel();
         assert_eq!(
             sink.emit(&"x".repeat(OUTPUT_BUFFER_BYTES)),
-            EmitResult::Written
+            EmitResult::Continue
         );
 
         let (completed, completion) = mpsc::channel();
@@ -369,7 +362,7 @@ mod tests {
         assert!(runtime.block_on(stream.next_chunk()).is_some());
         assert_eq!(
             completion.recv_timeout(Duration::from_secs(1)).unwrap(),
-            EmitResult::Written
+            EmitResult::Continue
         );
         writer.join().unwrap();
     }
@@ -379,7 +372,7 @@ mod tests {
         let (sink, _stream) = channel();
         assert_eq!(
             sink.emit(&"x".repeat(OUTPUT_BUFFER_BYTES)),
-            EmitResult::Written
+            EmitResult::Continue
         );
 
         let (completed, completion) = mpsc::channel();
@@ -401,7 +394,7 @@ mod tests {
     #[test]
     fn disconnect_discards_queued_and_future_output_without_cancelling() {
         let (sink, stream) = channel();
-        assert_eq!(sink.emit("pending"), EmitResult::Written);
+        assert_eq!(sink.emit("pending"), EmitResult::Continue);
         drop(stream);
 
         assert_eq!(sink.queued_bytes(), 0);
@@ -417,8 +410,8 @@ mod tests {
             _ = tokio::task::yield_now() => {}
         }
 
-        assert_eq!(sink.emit("still here"), EmitResult::Written);
-        assert_eq!(sink.flush(), EmitResult::Written);
+        assert_eq!(sink.emit("still here"), EmitResult::Continue);
+        assert_eq!(sink.flush(), EmitResult::Continue);
         assert_eq!(stream.next_chunk().await.as_deref(), Some("still here"));
     }
 
@@ -427,7 +420,7 @@ mod tests {
         let (sink, mut stream) = channel();
 
         for _ in 0..1_000 {
-            assert_eq!(sink.emit("x"), EmitResult::Written);
+            assert_eq!(sink.emit("x"), EmitResult::Continue);
         }
 
         assert!(
@@ -436,7 +429,7 @@ mod tests {
                 .is_err()
         );
 
-        assert_eq!(sink.flush(), EmitResult::Written);
+        assert_eq!(sink.flush(), EmitResult::Continue);
         assert_eq!(stream.next_chunk().await, Some("x".repeat(1_000)));
     }
 
@@ -453,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_drains_published_output_then_ends_the_stream() {
         let (sink, mut stream) = channel();
-        assert_eq!(sink.emit("before cancel"), EmitResult::Written);
+        assert_eq!(sink.emit("before cancel"), EmitResult::Continue);
         sink.request_cancel();
 
         assert_eq!(stream.next_chunk().await.as_deref(), Some("before cancel"));
@@ -463,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_last_producer_stops_an_unfinished_stream() {
         let (sink, mut stream) = channel();
-        assert_eq!(sink.emit("discarded"), EmitResult::Written);
+        assert_eq!(sink.emit("discarded"), EmitResult::Continue);
         drop(sink);
 
         assert_eq!(stream.next_chunk().await, None);
@@ -475,7 +468,7 @@ mod tests {
         let remaining = sink.clone();
         drop(sink);
 
-        assert_eq!(remaining.emit("kept"), EmitResult::Written);
+        assert_eq!(remaining.emit("kept"), EmitResult::Continue);
         remaining.finish();
         assert_eq!(stream.next_chunk().await.as_deref(), Some("kept"));
         assert_eq!(stream.next_chunk().await, None);
@@ -484,7 +477,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_finished_producer_preserves_published_output() {
         let (sink, mut stream) = channel();
-        assert_eq!(sink.emit("kept"), EmitResult::Written);
+        assert_eq!(sink.emit("kept"), EmitResult::Continue);
         sink.finish();
         drop(sink);
 

@@ -271,7 +271,7 @@ mod scheduler;
 
 use execution::NativeExecutionStep;
 use execution::native_bridge::{LispObservation, LispStatus, NativeDiagnostic};
-use execution::value_bridge::{NativeValueWriter, ValueEvent, WriteResult};
+use execution::value_bridge::{NativeValueWriter, ValueEvent};
 
 fn start_rpc_server() -> String {
     rpc_server::start().err().unwrap_or_default()
@@ -449,7 +449,7 @@ fn write_lisp_value_event(
     };
 
     let value = execution::visitor::value_event(event.code, payload);
-    native_value_write_result(writer.write(value))
+    writer.write(value)
 }
 
 #[allow(
@@ -457,20 +457,7 @@ fn write_lisp_value_event(
     reason = "CXX transfers exclusive ownership so finish can validate and close the writer"
 )]
 fn finish_value_writer(writer: Box<NativeValueWriter>) -> ffi::NativeValueWriteResult {
-    native_value_write_result((*writer).finish())
-}
-
-fn native_value_write_result(result: WriteResult) -> ffi::NativeValueWriteResult {
-    match result {
-        WriteResult::Continue => ffi::NativeValueWriteResult::Continue,
-        WriteResult::Inactive => ffi::NativeValueWriteResult::Inactive,
-        WriteResult::Disconnected => ffi::NativeValueWriteResult::Disconnected,
-        WriteResult::Cancelled => ffi::NativeValueWriteResult::Cancelled,
-        WriteResult::Stopped => ffi::NativeValueWriteResult::Stopped,
-        WriteResult::Finished => ffi::NativeValueWriteResult::Finished,
-        WriteResult::InvalidSequence => ffi::NativeValueWriteResult::InvalidSequence,
-        WriteResult::LimitExceeded => ffi::NativeValueWriteResult::LimitExceeded,
-    }
+    (*writer).finish()
 }
 
 fn stop_rpc_server() {

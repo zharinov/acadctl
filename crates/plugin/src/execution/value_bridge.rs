@@ -1,18 +1,7 @@
-use super::output::EmitResult;
 use super::value::{PrintError, PrintMode, ValuePrinter};
 use super::{ValueBridgeFailure, ValueOutputLease};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteResult {
-    Continue,
-    Inactive,
-    Disconnected,
-    Cancelled,
-    Stopped,
-    Finished,
-    InvalidSequence,
-    LimitExceeded,
-}
+pub use crate::ffi::NativeValueWriteResult as WriteResult;
 
 pub enum ValueEvent<'a> {
     Invalid,
@@ -74,18 +63,16 @@ impl NativeValueWriter {
 
     fn new(lease: ValueOutputLease, mode: PrintMode, policy: WriterPolicy) -> Self {
         let sink = lease.output_sink();
-        let status = sink.emit("");
-        let result = emit_result(status);
+        let result = sink.emit("");
         let mut writer = Self {
-            printer: (status == EmitResult::Written).then(|| ValuePrinter::new(sink, mode)),
+            printer: (result == WriteResult::Continue).then(|| ValuePrinter::new(sink, mode)),
             lease: Some(lease),
             policy,
             result,
         };
 
-        if status != EmitResult::Written {
-            let failure = output_failure(policy, status);
-            writer.retire(failure, result);
+        if result != WriteResult::Continue {
+            writer.retire(result);
         }
 
         writer
@@ -102,16 +89,13 @@ impl NativeValueWriter {
         }
 
         if !self.lease.as_ref().is_some_and(ValueOutputLease::is_open) {
-            self.retire(None, WriteResult::Inactive);
+            self.retire(WriteResult::Inactive);
 
             return self.result;
         }
 
         let Some(printer) = self.printer.as_mut() else {
-            return self.fail(
-                ValueBridgeFailure::InvalidSequence,
-                WriteResult::InvalidSequence,
-            );
+            return self.fail(WriteResult::InvalidSequence);
         };
 
         let result = match event {
@@ -149,28 +133,22 @@ impl NativeValueWriter {
         }
 
         if !self.lease.as_ref().is_some_and(ValueOutputLease::is_open) {
-            self.retire(None, WriteResult::Inactive);
+            self.retire(WriteResult::Inactive);
 
             return self.result;
         }
 
         let Some(printer) = self.printer.take() else {
-            return self.fail(
-                ValueBridgeFailure::InvalidSequence,
-                WriteResult::InvalidSequence,
-            );
+            return self.fail(WriteResult::InvalidSequence);
         };
 
         if self.policy != WriterPolicy::Inactive && printer.root_values() != 1 {
-            return self.fail(
-                ValueBridgeFailure::InvalidSequence,
-                WriteResult::InvalidSequence,
-            );
+            return self.fail(WriteResult::InvalidSequence);
         }
 
         match printer.finish() {
             Ok(()) => {
-                self.retire(None, WriteResult::Continue);
+                self.retire(WriteResult::Continue);
                 self.result
             }
             result => self.handle(result),
@@ -180,51 +158,37 @@ impl NativeValueWriter {
     fn handle(&mut self, result: Result<(), PrintError>) -> WriteResult {
         match result {
             Ok(()) => WriteResult::Continue,
-            Err(PrintError::InvalidSequence) => self.fail(
-                ValueBridgeFailure::InvalidSequence,
-                WriteResult::InvalidSequence,
-            ),
-            Err(PrintError::LimitExceeded) => self.fail(
-                ValueBridgeFailure::LimitExceeded,
-                WriteResult::LimitExceeded,
-            ),
+            Err(PrintError::InvalidSequence) => self.fail(WriteResult::InvalidSequence),
+            Err(PrintError::LimitExceeded) => self.fail(WriteResult::LimitExceeded),
             Err(PrintError::Output(result)) => {
-                self.retire(output_failure(self.policy, result), emit_result(result));
+                self.retire(result);
                 self.result
             }
         }
     }
 
-    fn fail(&mut self, failure: ValueBridgeFailure, result: WriteResult) -> WriteResult {
-        self.retire(Some(failure), result);
+    fn fail(&mut self, result: WriteResult) -> WriteResult {
+        self.retire(result);
         self.result
     }
 
-    fn retire(&mut self, failure: Option<ValueBridgeFailure>, result: WriteResult) {
+    fn retire(&mut self, result: WriteResult) {
         self.printer = None;
 
         if let Some(lease) = self.lease.take() {
-            lease.release(failure);
+            lease.release(write_failure(self.policy, result));
         }
 
         self.result = result;
     }
 }
 
-const fn emit_result(result: EmitResult) -> WriteResult {
-    match result {
-        EmitResult::Written => WriteResult::Continue,
-        EmitResult::Disconnected => WriteResult::Disconnected,
-        EmitResult::Cancelled => WriteResult::Cancelled,
-        EmitResult::Stopped => WriteResult::Stopped,
-        EmitResult::Finished => WriteResult::Finished,
-    }
-}
-
-const fn output_failure(policy: WriterPolicy, result: EmitResult) -> Option<ValueBridgeFailure> {
+const fn write_failure(policy: WriterPolicy, result: WriteResult) -> Option<ValueBridgeFailure> {
     match (policy, result) {
-        (_, EmitResult::Finished) => Some(ValueBridgeFailure::OutputFinished),
-        (WriterPolicy::EvalValue, EmitResult::Cancelled) => {
+        (_, WriteResult::InvalidSequence) => Some(ValueBridgeFailure::InvalidSequence),
+        (_, WriteResult::LimitExceeded) => Some(ValueBridgeFailure::LimitExceeded),
+        (_, WriteResult::Finished) => Some(ValueBridgeFailure::OutputFinished),
+        (WriterPolicy::EvalValue, WriteResult::Cancelled) => {
             Some(ValueBridgeFailure::PostCommitCancelled)
         }
         _ => None,

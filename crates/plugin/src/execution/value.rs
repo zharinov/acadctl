@@ -391,7 +391,7 @@ impl ValuePrinter {
         self.write("\n")?;
 
         match self.sink.flush() {
-            EmitResult::Written => Ok(()),
+            EmitResult::Continue => Ok(()),
             result => Err(PrintError::Output(result)),
         }
     }
@@ -464,7 +464,7 @@ impl ValuePrinter {
 
     fn write(&self, text: &str) -> Result<(), PrintError> {
         match self.sink.emit(text) {
-            EmitResult::Written => Ok(()),
+            EmitResult::Continue => Ok(()),
             result => Err(PrintError::Output(result)),
         }
     }
