@@ -13,7 +13,13 @@ use crate::execution::value_bridge::NativeValueWriter;
 use crate::execution::{
     Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep, bound_diagnostic,
 };
-use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
+use crate::ffi::{
+    NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind,
+    NativeExecutionFinalizationObservation,
+};
+
+#[cfg(test)]
+type ExecutionFinalizationObservation = NativeExecutionFinalizationObservation;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -30,17 +36,8 @@ pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const BUSY_RETRY_MAX: Duration = Duration::from_millis(500);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ExecutionFinalizationObservation {
-    pub(crate) undo_group_may_be_open: bool,
-    pub(crate) bridge_symbols_may_be_retained: bool,
-    pub(crate) staged_form_may_be_retained: bool,
-    pub(crate) value_writer_active: bool,
-    pub(crate) terminal_cleanup_failed: bool,
-}
-
-impl ExecutionFinalizationObservation {
-    fn native_state_unproved(self) -> bool {
+impl NativeExecutionFinalizationObservation {
+    fn native_state_unproved(&self) -> bool {
         self.undo_group_may_be_open
             || self.bridge_symbols_may_be_retained
             || self.staged_form_may_be_retained
@@ -48,7 +45,7 @@ impl ExecutionFinalizationObservation {
             || self.terminal_cleanup_failed
     }
 
-    fn only_symbol_cleanup_unproved(self) -> bool {
+    fn only_symbol_cleanup_unproved(&self) -> bool {
         (self.bridge_symbols_may_be_retained || self.terminal_cleanup_failed)
             && !self.undo_group_may_be_open
             && !self.staged_form_may_be_retained
@@ -799,7 +796,7 @@ fn complete_native_action_with_quarantine(
 pub(crate) fn complete_execution_native_action(
     job_id: MutationJobId,
     result: NativeActionResult,
-    observation: ExecutionFinalizationObservation,
+    observation: NativeExecutionFinalizationObservation,
 ) {
     let decision = classify_execution_finalization(result, observation);
     complete_native_action_with_quarantine(job_id, decision.result, decision.quarantine);
@@ -812,7 +809,7 @@ struct ExecutionFinalizationDecision {
 
 fn classify_execution_finalization(
     mut result: NativeActionResult,
-    observation: ExecutionFinalizationObservation,
+    observation: NativeExecutionFinalizationObservation,
 ) -> ExecutionFinalizationDecision {
     let native_state_unproved = observation.native_state_unproved();
     let quarantine = native_state_unproved || native_result_requires_quarantine(result.kind);

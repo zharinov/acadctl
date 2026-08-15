@@ -169,6 +169,7 @@ mod ffi {
         bridge_symbols_may_be_retained: bool,
     }
 
+    #[derive(Default)]
     struct NativeExecutionFinalizationObservation {
         undo_group_may_be_open: bool,
         bridge_symbols_may_be_retained: bool,
@@ -293,17 +294,7 @@ fn complete_execution_native_action(
     result: ffi::NativeActionResult,
     observation: ffi::NativeExecutionFinalizationObservation,
 ) {
-    scheduler::complete_execution_native_action(
-        job_id,
-        result,
-        scheduler::ExecutionFinalizationObservation {
-            undo_group_may_be_open: observation.undo_group_may_be_open,
-            bridge_symbols_may_be_retained: observation.bridge_symbols_may_be_retained,
-            staged_form_may_be_retained: observation.staged_form_may_be_retained,
-            value_writer_active: observation.value_writer_active,
-            terminal_cleanup_failed: observation.terminal_cleanup_failed,
-        },
-    );
+    scheduler::complete_execution_native_action(job_id, result, observation);
 }
 
 fn try_claim_native_action_wake() -> bool {
@@ -437,7 +428,7 @@ fn complete_bridge_cleanup(
             retain_value: plan.retain_value,
         },
         cleanup_status,
-            fallback_cleanup_status,
+        fallback_cleanup_status,
     );
 
     ffi::NativeBridgeStepResult {
