@@ -11,17 +11,29 @@ pub enum Direction {
 }
 
 pub async fn run(id: String, direction: Direction) -> ExitCode {
-    let process_id = match super::target::resolve_process_id(&id).await {
-        Ok(process_id) => process_id,
+    let target = match super::target::resolve(&id) {
+        Ok(target) => target,
         Err(error) => return fail(error),
     };
-    let mut client = match super::connect_documents(process_id).await {
+    let mut client = match super::connect_documents(target.process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
     let response = match direction {
-        Direction::Undo => client.undo(HistoryRequest { id }).await,
-        Direction::Redo => client.redo(HistoryRequest { id }).await,
+        Direction::Undo => {
+            client
+                .undo(HistoryRequest {
+                    id: target.document_id,
+                })
+                .await
+        }
+        Direction::Redo => {
+            client
+                .redo(HistoryRequest {
+                    id: target.document_id,
+                })
+                .await
+        }
     };
     let response = match response {
         Ok(response) => response.into_inner(),

@@ -30,13 +30,13 @@ pub async fn run(id: String, file: Option<PathBuf>, mode: ExecutionMode) -> Exit
             return ExitCode::FAILURE;
         }
     };
-    let process_id = match super::target::resolve_process_id(&id).await {
-        Ok(process_id) => process_id,
+    let target = match super::target::resolve(&id) {
+        Ok(target) => target,
         Err(error) => return fail(error),
     };
     let mut client = match tokio::time::timeout(
         EXECUTION_CONNECT_TIMEOUT,
-        crate::instances::connect_execution(process_id),
+        crate::instances::connect_execution(target.process_id),
     )
     .await
     {
@@ -49,7 +49,7 @@ pub async fn run(id: String, file: Option<PathBuf>, mode: ExecutionMode) -> Exit
     let request = ExecutionClientMessage {
         message: Some(execution_client_message::Message::Request(
             ExecutionRequest {
-                document_id: id,
+                document_id: target.document_id,
                 mode: mode as i32,
                 source_name: source.name,
                 source: source.bytes,

@@ -607,6 +607,8 @@ pub fn stop() {
 }
 
 fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), String>>) {
+    let process_id =
+        acadctl_rpc::ProcessId::new(std::process::id()).expect("the current process ID is nonzero");
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -619,11 +621,11 @@ fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), Str
         }
     };
 
-    runtime.block_on(serve(std::process::id(), stop, startup))
+    runtime.block_on(serve(process_id, stop, startup))
 }
 
 async fn serve(
-    process_id: u32,
+    process_id: acadctl_rpc::ProcessId,
     stop: oneshot::Receiver<()>,
     startup: std_mpsc::SyncSender<Result<(), String>>,
 ) {
@@ -633,7 +635,7 @@ async fn serve(
 }
 
 async fn serve_until_stopped(
-    process_id: u32,
+    process_id: acadctl_rpc::ProcessId,
     mut stop: oneshot::Receiver<()>,
     startup: std_mpsc::SyncSender<Result<(), String>>,
 ) {
@@ -720,18 +722,25 @@ mod tests {
             },
         ]);
         start().unwrap();
+        assert!(
+            acadctl_rpc::discover()
+                .unwrap()
+                .contains(&acadctl_rpc::ProcessId::new(std::process::id()).unwrap())
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         let client = runtime.block_on(async {
-            let mut client = acadctl_rpc::connect_documents(std::process::id())
-                .await
-                .unwrap();
+            let mut client = acadctl_rpc::connect_documents(
+                acadctl_rpc::ProcessId::new(std::process::id()).unwrap(),
+            )
+            .await
+            .unwrap();
             let listed = client.list(ListRequest {}).await.unwrap().into_inner();
             assert_eq!(listed.documents.len(), 2);
-            assert_eq!(listed.documents[0].id.len(), 6);
+            assert_eq!(listed.documents[0].id.len(), 4);
             assert_eq!(listed.documents[0].display_name, "house.dwg");
             assert_eq!(
                 listed.documents[0].file_path.as_deref(),
@@ -739,7 +748,7 @@ mod tests {
             );
             assert!(!listed.documents[0].modified);
             assert!(!listed.documents[0].read_only);
-            assert_eq!(listed.documents[1].id.len(), 6);
+            assert_eq!(listed.documents[1].id.len(), 4);
             assert_ne!(listed.documents[0].id, listed.documents[1].id);
             assert_eq!(listed.documents[1].display_name, "site.dwg");
             assert_eq!(
@@ -908,9 +917,11 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut client = acadctl_rpc::connect_execution(std::process::id())
-                .await
-                .unwrap();
+            let mut client = acadctl_rpc::connect_execution(
+                acadctl_rpc::ProcessId::new(std::process::id()).unwrap(),
+            )
+            .await
+            .unwrap();
             execute_and_cancel(
                 &mut client,
                 &document_id,
@@ -980,9 +991,11 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut client = acadctl_rpc::connect_execution(std::process::id())
-                .await
-                .unwrap();
+            let mut client = acadctl_rpc::connect_execution(
+                acadctl_rpc::ProcessId::new(std::process::id()).unwrap(),
+            )
+            .await
+            .unwrap();
             let (sender, receiver) = mpsc::channel(1);
             sender
                 .send(execution_request(&document_id, Bytes::from_static(b"form")))

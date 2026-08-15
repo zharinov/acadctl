@@ -1,3 +1,4 @@
+mod process_id;
 mod transport;
 
 use std::time::Duration;
@@ -6,6 +7,7 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
+pub use process_id::{ParseProcessIdError, ProcessId};
 pub use protocol::document_service_client::DocumentServiceClient;
 pub use protocol::document_service_server::{DocumentService, DocumentServiceServer};
 pub use protocol::execution_service_client::ExecutionServiceClient;
@@ -19,7 +21,7 @@ pub use protocol::{
     SaveRequest, SaveResponse, SourceLocation, execution_client_message, execution_outcome,
     execution_server_event,
 };
-pub use transport::{Incoming, incoming};
+pub use transport::{Incoming, discover, incoming};
 
 mod protocol {
     tonic::include_proto!("acadctl");
@@ -39,7 +41,7 @@ pub const MAX_SERVER_CONNECTIONS: usize = 9;
 pub const MAX_STREAMS_PER_CONNECTION: u32 = 1;
 
 pub async fn connect_documents(
-    process_id: u32,
+    process_id: ProcessId,
 ) -> Result<DocumentServiceClient<Channel>, tonic::transport::Error> {
     Ok(
         DocumentServiceClient::new(connect_channel(process_id).await?)
@@ -49,7 +51,7 @@ pub async fn connect_documents(
 }
 
 pub async fn connect_execution(
-    process_id: u32,
+    process_id: ProcessId,
 ) -> Result<ExecutionServiceClient<Channel>, tonic::transport::Error> {
     Ok(
         ExecutionServiceClient::new(connect_channel(process_id).await?)
@@ -58,7 +60,7 @@ pub async fn connect_execution(
     )
 }
 
-async fn connect_channel(process_id: u32) -> Result<Channel, tonic::transport::Error> {
+async fn connect_channel(process_id: ProcessId) -> Result<Channel, tonic::transport::Error> {
     let channel = Endpoint::from_static("http://acadctl")
         .connect_timeout(CONNECT_TIMEOUT)
         .connect_with_connector(service_fn(move |_| async move {

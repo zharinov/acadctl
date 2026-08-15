@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-use acadctl_rpc::{Document, DocumentServiceClient, ExecutionServiceClient, ListRequest};
-use tokio::task::JoinSet;
+use acadctl_rpc::{
+    Document, DocumentServiceClient, ExecutionServiceClient, ListRequest, ProcessId,
+};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
 use tonic::Code;
 use tonic::transport::Channel;
@@ -9,12 +11,8 @@ use tonic::transport::Channel;
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Instance {
-    pub process_id: u32,
+    pub process_id: ProcessId,
     pub documents: Result<Vec<Document>, QueryError>,
-}
-
-pub struct ListReport {
-    pub instances: Vec<Instance>,
 }
 
 pub enum QueryError {
@@ -24,39 +22,40 @@ pub enum QueryError {
     RequestFailed(String),
 }
 
-pub enum ListError {
-    QueryTaskFailed,
-}
-
-pub async fn list() -> Result<ListReport, ListError> {
-    let process_ids = autocad_process_ids();
-    let mut pending = JoinSet::new();
-    for process_id in process_ids {
-        pending.spawn(query(process_id));
-    }
+pub async fn list() -> std::io::Result<Vec<Instance>> {
+    let mut pending = acadctl_rpc::discover()?
+        .into_iter()
+        .map(query)
+        .collect::<FuturesUnordered<_>>();
 
     let mut instances = Vec::new();
-    while let Some(result) = pending.join_next().await {
-        instances.push(result.map_err(|_| ListError::QueryTaskFailed)?);
+    while let Some(result) = pending.next().await {
+        if let Some(instance) = result {
+            instances.push(instance);
+        }
     }
     instances.sort_unstable_by_key(|instance| instance.process_id);
 
-    Ok(ListReport { instances })
+    Ok(instances)
 }
 
-async fn query(process_id: u32) -> Instance {
+async fn query(process_id: ProcessId) -> Option<Instance> {
     let documents = match timeout(LIST_TIMEOUT, query_documents(process_id)).await {
         Ok(result) => result,
         Err(_) => Err(QueryError::TimedOut),
     };
 
-    Instance {
+    if matches!(documents, Err(QueryError::CannotConnect)) {
+        return None;
+    }
+
+    Some(Instance {
         process_id,
         documents,
-    }
+    })
 }
 
-async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
+async fn query_documents(process_id: ProcessId) -> Result<Vec<Document>, QueryError> {
     let mut client = connect_documents(process_id).await?;
     let listed = client
         .list(ListRequest {})
@@ -73,7 +72,7 @@ async fn query_documents(process_id: u32) -> Result<Vec<Document>, QueryError> {
 }
 
 pub async fn connect_documents(
-    process_id: u32,
+    process_id: ProcessId,
 ) -> Result<DocumentServiceClient<Channel>, QueryError> {
     acadctl_rpc::connect_documents(process_id)
         .await
@@ -81,43 +80,43 @@ pub async fn connect_documents(
 }
 
 pub async fn connect_execution(
-    process_id: u32,
+    process_id: ProcessId,
 ) -> Result<ExecutionServiceClient<Channel>, QueryError> {
     acadctl_rpc::connect_execution(process_id)
         .await
         .map_err(|_| QueryError::CannotConnect)
 }
 
-pub fn autocad_process_ids() -> Vec<u32> {
-    autocad_processes()
-        .iter()
-        .map(AutoCadProcess::process_id)
-        .collect()
-}
-
 #[cfg(target_os = "macos")]
 pub struct AutoCadProcess {
-    process_id: u32,
+    process_id: ProcessId,
     application: objc2::rc::Retained<objc2_app_kit::NSRunningApplication>,
 }
 
 #[cfg(target_os = "macos")]
 impl AutoCadProcess {
-    pub fn process_id(&self) -> u32 {
+    pub fn process_id(&self) -> ProcessId {
         self.process_id
+    }
+
+    fn native_process_id(&self) -> libc::pid_t {
+        self.process_id
+            .get()
+            .try_into()
+            .expect("macOS process IDs fit pid_t")
     }
 
     pub fn request_termination(&self, force: bool) -> bool {
         if force {
+            let process_id = self.native_process_id();
             let Some(current) =
                 objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(
-                    self.process_id as i32,
+                    process_id,
                 )
             else {
                 return false;
             };
-            current == self.application
-                && unsafe { libc::kill(self.process_id as i32, libc::SIGKILL) == 0 }
+            current == self.application && unsafe { libc::kill(process_id, libc::SIGKILL) == 0 }
         } else {
             self.application.terminate()
         }
@@ -127,8 +126,10 @@ impl AutoCadProcess {
         use objc2_app_kit::NSRunningApplication;
 
         self.application.isTerminated()
-            || NSRunningApplication::runningApplicationWithProcessIdentifier(self.process_id as i32)
-                .is_none_or(|current| current != self.application)
+            || NSRunningApplication::runningApplicationWithProcessIdentifier(
+                self.native_process_id(),
+            )
+            .is_none_or(|current| current != self.application)
     }
 }
 
@@ -139,8 +140,11 @@ pub fn autocad_processes() -> Vec<AutoCadProcess> {
     let system = sysinfo::System::new_all();
     let mut processes = Vec::new();
     for process in system.processes().values() {
-        let process_id = process.pid().as_u32();
-        let Ok(native_process_id) = i32::try_from(process_id) else {
+        let raw_process_id = process.pid().as_u32();
+        let Ok(native_process_id) = i32::try_from(raw_process_id) else {
+            continue;
+        };
+        let Some(process_id) = ProcessId::new(raw_process_id) else {
             continue;
         };
         let Some(application) =
@@ -174,13 +178,13 @@ fn is_autocad_bundle_identifier(identifier: &str) -> bool {
 
 #[cfg(windows)]
 pub struct AutoCadProcess {
-    process_id: u32,
+    process_id: ProcessId,
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
 impl AutoCadProcess {
-    pub fn process_id(&self) -> u32 {
+    pub fn process_id(&self) -> ProcessId {
         self.process_id
     }
 
@@ -194,7 +198,7 @@ impl AutoCadProcess {
                 OpenProcess(
                     PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
                     0,
-                    self.process_id,
+                    self.process_id.get(),
                 )
             };
             if termination.is_null() {
@@ -264,12 +268,14 @@ pub fn autocad_processes() -> Vec<AutoCadProcess> {
     let system = sysinfo::System::new_all();
     let mut processes = Vec::new();
     for process in system.processes().values() {
-        let process_id = process.pid().as_u32();
+        let Some(process_id) = ProcessId::new(process.pid().as_u32()) else {
+            continue;
+        };
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                 0,
-                process_id,
+                process_id.get(),
             )
         };
         if handle.is_null() {
@@ -296,7 +302,7 @@ pub fn autocad_processes() -> Vec<AutoCadProcess> {
 
 #[cfg(windows)]
 fn request_windows_close(
-    process_id: u32,
+    process_id: ProcessId,
     original: windows_sys::Win32::Foundation::HANDLE,
 ) -> bool {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
@@ -331,7 +337,7 @@ fn request_windows_close(
     }
 
     let mut request = CloseRequest {
-        process_id,
+        process_id: process_id.get(),
         original,
         sent: false,
     };
@@ -349,7 +355,7 @@ pub struct AutoCadProcess;
 
 #[cfg(not(any(target_os = "macos", windows)))]
 impl AutoCadProcess {
-    pub fn process_id(&self) -> u32 {
+    pub fn process_id(&self) -> ProcessId {
         unreachable!("AutoCAD process discovery is unsupported on this platform")
     }
 

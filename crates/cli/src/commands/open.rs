@@ -1,30 +1,25 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use acadctl_rpc::OpenRequest;
+use acadctl_rpc::{OpenRequest, ProcessId};
 
-use crate::instances::{ListReport, autocad_process_ids};
+use crate::instances::Instance;
 
 use super::{fail, query_error_message, request_error_message};
 
-pub async fn run(path: PathBuf, process_id: Option<u32>) -> ExitCode {
+pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
     let path = match drawing_path(&path) {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
     let process_id = match process_id {
-        Some(process_id) => {
-            if !autocad_process_ids().contains(&process_id) {
-                return fail(format!("AutoCAD process {process_id} is not running."));
-            }
-            process_id
-        }
+        Some(process_id) => process_id,
         None => {
-            let report = match crate::instances::list().await {
-                Ok(report) => report,
+            let instances = match crate::instances::list().await {
+                Ok(instances) => instances,
                 Err(_) => return fail("Could not inspect running AutoCAD instances.".into()),
             };
-            match select_instance(&report) {
+            match select_instance(&instances) {
                 Ok(process_id) => process_id,
                 Err(error) => return fail(error),
             }
@@ -41,7 +36,7 @@ pub async fn run(path: PathBuf, process_id: Option<u32>) -> ExitCode {
     let Some(document) = opened.document else {
         return fail("AutoCAD did not identify the opened document.".into());
     };
-    println!("{}", document.id);
+    println!("{process_id}:{}", document.id);
     ExitCode::SUCCESS
 }
 
@@ -66,17 +61,15 @@ fn drawing_path(path: &Path) -> Result<String, String> {
     })
 }
 
-fn select_instance(report: &ListReport) -> Result<u32, String> {
-    let available = report
-        .instances
+fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {
+    let available = instances
         .iter()
         .filter(|instance| instance.documents.is_ok())
         .collect::<Vec<_>>();
     match available.as_slice() {
         [instance] => Ok(instance.process_id),
-        [] if report.instances.is_empty() => Err("AutoCAD is not running.".into()),
-        [] => Err(report
-            .instances
+        [] if instances.is_empty() => Err("AutoCAD is not running.".into()),
+        [] => Err(instances
             .iter()
             .find_map(|instance| instance.documents.as_ref().err())
             .map(query_error_message)
@@ -101,40 +94,39 @@ mod tests {
 
     #[test]
     fn selects_the_only_available_instance() {
-        let report = ListReport {
-            instances: vec![
-                Instance {
-                    process_id: 123,
-                    documents: Err(QueryError::CannotConnect),
-                },
-                Instance {
-                    process_id: 456,
-                    documents: Ok(vec![]),
-                },
-            ],
-        };
+        let instances = vec![
+            Instance {
+                process_id: ProcessId::new(123).unwrap(),
+                documents: Err(QueryError::CannotConnect),
+            },
+            Instance {
+                process_id: ProcessId::new(456).unwrap(),
+                documents: Ok(vec![]),
+            },
+        ];
 
-        assert_eq!(select_instance(&report).unwrap(), 456);
+        assert_eq!(
+            select_instance(&instances).unwrap(),
+            ProcessId::new(456).unwrap()
+        );
     }
 
     #[test]
     fn requires_a_pid_when_multiple_instances_are_available() {
-        let report = ListReport {
-            instances: vec![
-                Instance {
-                    process_id: 123,
-                    documents: Ok(vec![]),
-                },
-                Instance {
-                    process_id: 456,
-                    documents: Ok(vec![]),
-                },
-            ],
-        };
+        let instances = vec![
+            Instance {
+                process_id: ProcessId::new(123).unwrap(),
+                documents: Ok(vec![]),
+            },
+            Instance {
+                process_id: ProcessId::new(456).unwrap(),
+                documents: Ok(vec![]),
+            },
+        ];
 
         assert_eq!(
-            select_instance(&report).unwrap_err(),
-            "More than one acadctl-enabled AutoCAD instance is running (123, 456). Use `acadctl open <path> --pid <pid>`."
+            select_instance(&instances).unwrap_err(),
+            "More than one acadctl-enabled AutoCAD instance is running (007B, 01C8). Use `acadctl open <path> --pid <pid>`."
         );
     }
 }

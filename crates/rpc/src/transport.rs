@@ -8,14 +8,16 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::server::Connected;
 
+use crate::ProcessId;
+
 pub type ClientStream = platform::ClientStream;
 pub type Incoming = Pin<Box<dyn Stream<Item = io::Result<ServerStream>> + Send>>;
 
-pub async fn connect(process_id: u32) -> io::Result<ClientStream> {
+pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
     platform::connect(process_id).await
 }
 
-pub fn incoming(process_id: u32) -> io::Result<Incoming> {
+pub fn incoming(process_id: ProcessId) -> io::Result<Incoming> {
     let listener = platform::Listener::bind(process_id)?;
     let permits = Arc::new(Semaphore::new(super::MAX_SERVER_CONNECTIONS));
     let connections = futures_util::stream::try_unfold(
@@ -36,6 +38,10 @@ pub fn incoming(process_id: u32) -> io::Result<Incoming> {
         },
     );
     Ok(Box::pin(connections))
+}
+
+pub fn discover() -> io::Result<Vec<ProcessId>> {
+    platform::discover()
 }
 
 pub struct ServerStream {
@@ -87,7 +93,7 @@ mod platform {
     use objc2_foundation::NSTemporaryDirectory;
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::io;
+    use super::{ProcessId, io};
 
     pub type ClientStream = UnixStream;
     pub type ServerStream = UnixStream;
@@ -98,7 +104,7 @@ mod platform {
     }
 
     impl Listener {
-        pub fn bind(process_id: u32) -> io::Result<Self> {
+        pub fn bind(process_id: ProcessId) -> io::Result<Self> {
             let path = endpoint(process_id);
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -121,11 +127,35 @@ mod platform {
         }
     }
 
-    pub async fn connect(process_id: u32) -> io::Result<ClientStream> {
+    pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
         UnixStream::connect(endpoint(process_id)).await
     }
 
-    fn endpoint(process_id: u32) -> PathBuf {
+    pub fn discover() -> io::Result<Vec<ProcessId>> {
+        let entries = match std::fs::read_dir(user_temp_dir()) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut process_ids = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| process_id_from_file_name(entry.file_name().to_str()?))
+            .collect::<Vec<_>>();
+        process_ids.sort_unstable();
+        process_ids.dedup();
+        Ok(process_ids)
+    }
+
+    fn process_id_from_file_name(file_name: &str) -> Option<ProcessId> {
+        let process_id = file_name
+            .strip_prefix("acadctl-")?
+            .strip_suffix(".sock")?
+            .parse()
+            .ok()?;
+        (file_name == format!("acadctl-{process_id}.sock")).then_some(process_id)
+    }
+
+    fn endpoint(process_id: ProcessId) -> PathBuf {
         user_temp_dir().join(format!("acadctl-{process_id}.sock"))
     }
 
@@ -139,9 +169,22 @@ mod platform {
 
         #[test]
         fn endpoint_uses_the_system_user_temp_directory() {
-            let endpoint = endpoint(123);
+            let endpoint = endpoint(ProcessId::new(123).unwrap());
             assert_eq!(endpoint.parent(), Some(user_temp_dir().as_path()));
-            assert_eq!(endpoint.file_name().unwrap(), "acadctl-123.sock");
+            assert_eq!(endpoint.file_name().unwrap(), "acadctl-007B.sock");
+        }
+
+        #[test]
+        fn recognizes_only_canonical_socket_names() {
+            assert_eq!(
+                process_id_from_file_name("acadctl-0FA5.sock"),
+                ProcessId::new(0xFA5)
+            );
+            assert_eq!(process_id_from_file_name("acadctl-0fa5.sock"), None);
+            assert_eq!(process_id_from_file_name("acadctl-00FA5.sock"), None);
+            assert_eq!(process_id_from_file_name("acadctl-123.sock"), None);
+            assert_eq!(process_id_from_file_name("acadctl-0FA5"), None);
+            assert_eq!(process_id_from_file_name("other-0FA5.sock"), None);
         }
     }
 }
@@ -154,7 +197,7 @@ mod platform {
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
 
-    use super::io;
+    use super::{ProcessId, io};
 
     const ERROR_PIPE_BUSY: i32 = 231;
 
@@ -167,7 +210,7 @@ mod platform {
     }
 
     impl Listener {
-        pub fn bind(process_id: u32) -> io::Result<Self> {
+        pub fn bind(process_id: ProcessId) -> io::Result<Self> {
             let name = endpoint(process_id);
             let next = server_options(true).create(&name)?;
             Ok(Self { name, next })
@@ -180,7 +223,7 @@ mod platform {
         }
     }
 
-    pub async fn connect(process_id: u32) -> io::Result<ClientStream> {
+    pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
         let name = endpoint(process_id);
         loop {
             match ClientOptions::new().open(&name) {
@@ -193,7 +236,14 @@ mod platform {
         }
     }
 
-    fn endpoint(process_id: u32) -> String {
+    pub fn discover() -> io::Result<Vec<ProcessId>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows named-pipe discovery is not implemented",
+        ))
+    }
+
+    fn endpoint(process_id: ProcessId) -> String {
         format!(r"\\.\pipe\acadctl-{process_id}")
     }
 

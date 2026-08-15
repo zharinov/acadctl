@@ -1,6 +1,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use acadctl_rpc::ProcessId;
 use tokio::time::{Instant, sleep};
 
 use super::fail;
@@ -9,7 +10,7 @@ use crate::instances::{AutoCadProcess, autocad_processes};
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-pub async fn run(requested_process_id: Option<u32>, force: bool) -> ExitCode {
+pub async fn run(requested_process_id: Option<ProcessId>, force: bool) -> ExitCode {
     let processes = autocad_processes();
     let process_ids = processes
         .iter()
@@ -45,9 +46,9 @@ pub async fn run(requested_process_id: Option<u32>, force: bool) -> ExitCode {
 }
 
 fn select_process_id(
-    process_ids: &[u32],
-    requested_process_id: Option<u32>,
-) -> Result<u32, String> {
+    process_ids: &[ProcessId],
+    requested_process_id: Option<ProcessId>,
+) -> Result<ProcessId, String> {
     match requested_process_id {
         Some(process_id) if process_ids.contains(&process_id) => Ok(process_id),
         Some(process_id) => Err(format!("AutoCAD process {process_id} is not running.")),
@@ -58,7 +59,7 @@ fn select_process_id(
                 "More than one AutoCAD instance is running ({}). Use `acadctl kill <pid>`.",
                 process_ids
                     .iter()
-                    .map(u32::to_string)
+                    .map(ProcessId::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
@@ -85,23 +86,30 @@ mod tests {
 
     #[test]
     fn selects_the_only_autocad_process() {
-        assert_eq!(select_process_id(&[123], None).unwrap(), 123);
-        assert_eq!(select_process_id(&[123, 456], Some(456)).unwrap(), 456);
+        let first = ProcessId::new(123).unwrap();
+        let second = ProcessId::new(456).unwrap();
+        assert_eq!(select_process_id(&[first], None).unwrap(), first);
+        assert_eq!(
+            select_process_id(&[first, second], Some(second)).unwrap(),
+            second
+        );
     }
 
     #[test]
     fn requires_an_exact_process_when_selection_is_ambiguous() {
+        let first = ProcessId::new(123).unwrap();
+        let second = ProcessId::new(456).unwrap();
         assert_eq!(
             select_process_id(&[], None).unwrap_err(),
             "AutoCAD is not running."
         );
         assert_eq!(
-            select_process_id(&[123, 456], None).unwrap_err(),
-            "More than one AutoCAD instance is running (123, 456). Use `acadctl kill <pid>`."
+            select_process_id(&[first, second], None).unwrap_err(),
+            "More than one AutoCAD instance is running (007B, 01C8). Use `acadctl kill <pid>`."
         );
         assert_eq!(
-            select_process_id(&[123], Some(456)).unwrap_err(),
-            "AutoCAD process 456 is not running."
+            select_process_id(&[first], Some(second)).unwrap_err(),
+            "AutoCAD process 01C8 is not running."
         );
     }
 }

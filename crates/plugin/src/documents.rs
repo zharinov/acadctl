@@ -4,10 +4,9 @@ use acadctl_rpc::Document;
 
 use crate::ffi::NativeDocumentSnapshot;
 
-const DOCUMENT_ID_LENGTH: usize = 6;
-const DOCUMENT_ID_ALPHABET: [char; 31] = [
-    '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm',
-    'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+const DOCUMENT_ID_LENGTH: usize = 4;
+const DOCUMENT_ID_ALPHABET: [char; 16] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
 ];
 
 pub(crate) fn valid_document_id(id: &str) -> bool {
@@ -170,12 +169,12 @@ mod tests {
 
     #[test]
     fn validates_public_document_ids_exactly() {
-        assert!(valid_document_id("2az789"));
+        assert!(valid_document_id("2A79"));
         assert!(!valid_document_id(""));
-        assert!(!valid_document_id("2az78"));
-        assert!(!valid_document_id("2az7890"));
-        assert!(!valid_document_id("2az7i9"));
-        assert!(!valid_document_id("2AZ789"));
+        assert!(!valid_document_id("2a7"));
+        assert!(!valid_document_id("2a790"));
+        assert!(!valid_document_id("2A7G"));
+        assert!(!valid_document_id("2a79"));
     }
 
     #[test]
