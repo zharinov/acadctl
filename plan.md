@@ -224,18 +224,18 @@ Normal values and explicit output go to stdout. Diagnostics, cancellation notice
 
 An AutoCAD process behaves as one serialized main-thread event loop. Documents are contexts within that process, not independent execution loops.
 
-- Each AutoCAD process has one FIFO for all `acadctl` native actions across all of its documents.
+- Each AutoCAD process has one Rust-owned FIFO for all `acadctl` mutation jobs across all of its documents.
 - Different AutoCAD processes can execute independently.
 - One request targets exactly one document ID.
-- Execution temporarily makes the target document current when required, acquires its write lock without prompts, and restores the previously active document afterward.
+- Execution queues one fixed AutoLISP driver in the target document, activates that document when required, and restores the previously active document afterward.
 - No user command, Lisp expression, script, modal operation, or other busy host activity is cancelled to admit an acadctl request.
 
 Admission requires all of the following:
 
-- AutoCAD can service the application-context callback.
+- AutoCAD can service the application-context dispatch callback.
 - The target document still exists.
 - The target document is quiescent.
-- The target can become current and be write-locked without prompting.
+- The target can become active and accept the fixed document-context driver without prompting.
 - AutoCAD can open the required undo group with undo recording enabled.
 
 The pre-execution deadline is five seconds from server acceptance. It includes time behind earlier acadctl jobs and time waiting for AutoCAD or the document to become ready. The deadline is managed off the AutoCAD main thread; the main loop is never put to sleep for polling. Expiry removes the queued job and guarantees that none of its forms started.
@@ -417,7 +417,7 @@ Rust owns the load-bearing behavior:
 The ObjectARX C++ surface remains bridge boilerplate:
 
 - Register and unregister lifecycle callbacks and `acadctl:println`.
-- Schedule Rust-owned native actions in application context.
+- Schedule Rust-selected native work in application context.
 - Resolve, establish, and restore document context as directed by Rust; lock only native database work that requires an explicit application-context lock.
 - Enter the target document's AutoLISP driver and exchange one staged form or value event per registered callback.
 - Open, close, and roll back the current execution's native undo group as directed by Rust.
@@ -1004,3 +1004,13 @@ This entry supersedes the native mechanics in I-002, I-013, and I-019 while pres
 The outer driver repeatedly calls one registered bridge function. Each call either stages one Rust-selected evaluator or value-visitor form and returns `T`, or returns `nil` after Rust reaches a terminal step. Rust owns form order, execution state, cancellation, outcomes, and output. C++ owns only the physical AutoCAD context, undo-group state, bounded symbol transfer, and callback correlation. No application-context callback, explicit document lock, or old synchronous C++ step loop is retained across the batch.
 
 The bridge records outer-driver start, nested Lisp depth, driver end, callback activity, and terminal readiness as separate facts. Entry into the registered execution callback also establishes the outer-driver correlation if AutoCAD's undocumented `lispWillStart` text normalization prevented an exact match. The action finalizes only after the terminal callback and outer Lisp return both occur. Premature termination or any internal bridge failure with an unproved undo group, staged program, value writer, or reserved evaluator state becomes `ExecutionCleanupFailed`, which quarantines later mutation until AutoCAD restarts. The application-context finalizer then restores and verifies the previous active document, refreshes snapshots, completes the same Rust job, and only afterward wakes the next FIFO item.
+
+### 2026-08-14 — I-071: post-implementation names separate Rust ownership from native dispatch
+
+The post-commit naming sweep keeps `MutationScheduler`, `MutationJob`, `MutationJobId`, and `NativeAction`. The first three name Rust-owned state. `NativeAction` names one bounded instruction that Rust hands to the native bridge; it does not imply a second C++ scheduler. `RunExecution` is replaced by `QueueExecutionDriver` because the native handoff queues the document driver and leaves execution ownership in Rust. The Rust function that admits an operation is `submit_operation`, so “dispatch” remains available for the C++ callback lifecycle.
+
+C++ uses `PendingDocumentDispatch` for the one queued or finalizing document-context handoff. Its registered ARX command and callbacks name `HistoryCommand`; execution names `ExecutionDriver`, `advance`, and `StagedFormKind`. The reserved symbol is `acadctl:*staged-form*`, not a generic program. `acadctl:_drive-execution` owns only the Lisp loop, while `acadctl:_advance-execution` requests the next Rust-selected stage. These names expose the boundary: C++ and Lisp move bounded physical data and lifecycle facts, while Rust selects steps and outcomes.
+
+Failure names state which safety proof failed: `DocumentContextFailed`, `DocumentContextRestoreFailed`, `ExecutionBridgeFinalizationFailed`, `EvaluatorSymbolsClearFailed`, and `NativeMutationStateUnknown`. Document publication is `publish_document_snapshot` at FFI, `replace_document_snapshot` in the scheduler, and `replace_snapshot` in `DocumentRegistry`; none suggests that Rust replaces live AutoCAD documents. The embedded files are `form-evaluator.lsp` and `eval-value-visitor.lsp`, avoiding a future collision between the private evaluator and a public `acadctl.lsp` standard library.
+
+The sweep retains `CommitUndoGroup`, `AwaitingCommitUndoGroup`, `PostCommitCancelled`, and `DrawingOutcome::Committed`. In Rust these names mark the semantic cancellation and outcome boundary reached when `_UNDO End` succeeds; renaming them to the literal command would obscure that role. It also retains the concise `HistoryRequest`, `HistoryResponse`, `Operation::History`, and `HistoryDirection`: each public invocation already means exactly one fixed drawing-wide step, so adding `Step` everywhere would not resolve an ambiguity. This entry supersedes the implementation names listed in I-054 and any remaining provenance-oriented naming rationale in I-003 and I-004; I-068 already supersedes that product architecture.

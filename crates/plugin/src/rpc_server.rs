@@ -445,12 +445,12 @@ fn failure(message: impl Into<String>) -> ExecutionFailure {
 
 fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
     let drawing_outcome = match &error {
-        SchedulerError::ContextCleanupFailed(_)
-        | SchedulerError::ExecutionCleanupFailed(_)
-        | SchedulerError::EvaluatorStateCleanupFailed(_)
+        SchedulerError::DocumentContextRestoreFailed(_)
+        | SchedulerError::ExecutionBridgeFinalizationFailed(_)
+        | SchedulerError::EvaluatorSymbolsClearFailed(_)
         | SchedulerError::ExecutionBridgeFailed(_)
         | SchedulerError::ExecutionNotFinished
-        | SchedulerError::NativeStateUnknown
+        | SchedulerError::NativeMutationStateUnknown
         | SchedulerError::Stopped
         | SchedulerError::UnknownResult(_) => DrawingOutcome::Unknown,
         SchedulerError::StateUnavailable
@@ -473,7 +473,7 @@ fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
         | SchedulerError::CloseNotPublished
         | SchedulerError::NotQuiescent
         | SchedulerError::UndoDisabled
-        | SchedulerError::ContextFailed(_)
+        | SchedulerError::DocumentContextFailed(_)
         | SchedulerError::MutationCapacity
         | SchedulerError::ExecutionCapacity => DrawingOutcome::NotStarted,
     };
@@ -606,10 +606,6 @@ pub fn stop() {
     }
 }
 
-pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
-    crate::scheduler::replace_documents(documents);
-}
-
 fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), String>>) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -705,7 +701,7 @@ mod tests {
     #[test]
     fn reports_documents_and_stops_promptly() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-        replace_documents(vec![
+        crate::scheduler::replace_document_snapshot(vec![
             crate::ffi::NativeDocumentSnapshot {
                 document_token: 1,
                 database_token: 101,
@@ -782,7 +778,7 @@ mod tests {
                 tokio::spawn(async move { undo_client.undo(HistoryRequest { id: undo_id }).await });
             let undo_action = next_native_action().await;
             assert_eq!(undo_action.kind, crate::ffi::NativeActionKind::Undo);
-            replace_documents(vec![
+            crate::scheduler::replace_document_snapshot(vec![
                 crate::ffi::NativeDocumentSnapshot {
                     document_token: 1,
                     database_token: 101,
@@ -824,7 +820,7 @@ mod tests {
                 tokio::spawn(async move { redo_client.redo(HistoryRequest { id: redo_id }).await });
             let redo_action = next_native_action().await;
             assert_eq!(redo_action.kind, crate::ffi::NativeActionKind::Redo);
-            replace_documents(vec![
+            crate::scheduler::replace_document_snapshot(vec![
                 crate::ffi::NativeDocumentSnapshot {
                     document_token: 1,
                     database_token: 101,
@@ -896,7 +892,7 @@ mod tests {
     #[test]
     fn execute_transport_preserves_the_four_mib_source_boundary() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-        replace_documents(vec![crate::ffi::NativeDocumentSnapshot {
+        crate::scheduler::replace_document_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
             document_token: 1,
             database_token: 101,
             name: "/tmp/house.dwg".into(),
@@ -968,7 +964,7 @@ mod tests {
     #[test]
     fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-        replace_documents(vec![crate::ffi::NativeDocumentSnapshot {
+        crate::scheduler::replace_document_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
             document_token: 1,
             database_token: 101,
             name: "/tmp/house.dwg".into(),
@@ -1005,7 +1001,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             let action = crate::scheduler::take_native_action();
-            assert_eq!(action.kind, crate::ffi::NativeActionKind::RunExecution);
+            assert_eq!(
+                action.kind,
+                crate::ffi::NativeActionKind::QueueExecutionDriver
+            );
             assert_eq!(
                 crate::scheduler::take_execution_step(action.job_id).kind(),
                 crate::execution::ExecutionStepKind::BeginUndoGroup
@@ -1136,7 +1135,7 @@ mod tests {
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            evaluator_state_cleanup_status: 0,
+            evaluator_symbols_clear_status: 0,
         }
     }
 }

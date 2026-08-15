@@ -18,7 +18,7 @@ mod ffi {
         Close,
         Undo,
         Redo,
-        RunExecution,
+        QueueExecutionDriver,
     }
 
     #[derive(Debug)]
@@ -37,10 +37,10 @@ mod ffi {
         HistoryFailed,
         NotQuiescent,
         UndoDisabled,
-        ContextFailed,
-        ContextCleanupFailed,
-        ExecutionCleanupFailed,
-        EvaluatorStateCleanupFailed,
+        DocumentContextFailed,
+        DocumentContextRestoreFailed,
+        ExecutionBridgeFinalizationFailed,
+        EvaluatorSymbolsClearFailed,
         ExecutionBridgeFailed,
     }
 
@@ -140,7 +140,7 @@ mod ffi {
         native_status: i32,
         lisp_errno: i32,
         detail: String,
-        evaluator_state_cleanup_status: i32,
+        evaluator_symbols_clear_status: i32,
     }
 
     struct NativeValueEvent {
@@ -169,7 +169,7 @@ mod ffi {
 
         fn start_rpc_server() -> String;
 
-        fn replace_documents(documents: Vec<NativeDocumentSnapshot>);
+        fn publish_document_snapshot(documents: Vec<NativeDocumentSnapshot>);
 
         fn take_native_action() -> NativeAction;
 
@@ -189,9 +189,9 @@ mod ffi {
 
         fn execution_step_retain_value(step: &NativeExecutionStep) -> bool;
 
-        fn execution_evaluator_source() -> &'static str;
+        fn form_evaluator_source() -> &'static str;
 
-        fn execution_value_source() -> &'static str;
+        fn eval_value_visitor_source() -> &'static str;
 
         fn native_diagnostic_capture_units() -> usize;
 
@@ -239,8 +239,8 @@ fn start_rpc_server() -> String {
     rpc_server::start().err().unwrap_or_default()
 }
 
-fn replace_documents(documents: Vec<ffi::NativeDocumentSnapshot>) {
-    rpc_server::replace_documents(documents);
+fn publish_document_snapshot(documents: Vec<ffi::NativeDocumentSnapshot>) {
+    scheduler::replace_document_snapshot(documents);
 }
 
 fn take_native_action() -> ffi::NativeAction {
@@ -299,11 +299,11 @@ fn execution_step_retain_value(step: &NativeExecutionStep) -> bool {
     step.retain_value()
 }
 
-fn execution_evaluator_source() -> &'static str {
-    execution::EVALUATOR_SOURCE
+fn form_evaluator_source() -> &'static str {
+    execution::FORM_EVALUATOR_SOURCE
 }
 
-fn execution_value_source() -> &'static str {
+fn eval_value_visitor_source() -> &'static str {
     execution::visitor::source()
 }
 
@@ -439,7 +439,7 @@ fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::E
         native_status: result.native_status,
         lisp_errno: result.lisp_errno,
         detail: result.detail,
-        evaluator_state_cleanup_status: result.evaluator_state_cleanup_status,
+        evaluator_symbols_clear_status: result.evaluator_symbols_clear_status,
     }
 }
 

@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use super::value_bridge::ValueEvent;
 
-const TEMPLATE: &str = include_str!("../../lisp/eval-value.lsp");
+const TEMPLATE: &str = include_str!("../../lisp/eval-value-visitor.lsp");
 const CALLBACK_NAME: &str = "acadctl:_value-event";
 pub(crate) const MAX_DEPTH: usize = 4096;
 pub(crate) const CHUNK_CHARACTERS: usize = 2048;

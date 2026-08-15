@@ -143,7 +143,7 @@ async fn receive_response(
                         return diagnostic_failure(
                             interrupts,
                             format!(
-                                "Could not start the stdout writer: {error}. The accepted AutoCAD job may still be running; do not retry it blindly."
+                                "Could not start the stdout writer: {error}. The accepted execution request may still be running; do not retry it blindly."
                             ),
                         )
                         .await;
@@ -162,7 +162,7 @@ async fn receive_response(
                         return diagnostic_failure(
                             interrupts,
                             format!(
-                                "Could not write stdout: {error}. The accepted AutoCAD job may still be running; do not retry it blindly."
+                                "Could not write stdout: {error}. The accepted execution request may still be running; do not retry it blindly."
                             ),
                         )
                         .await;
@@ -328,7 +328,7 @@ fn response_start_error(status: tonic::Status) -> String {
 async fn lost_response(interrupts: &mut Interrupts, accepted: bool, detail: &str) -> ExitCode {
     let message = if accepted {
         format!(
-            "{detail} before a result was returned. The accepted AutoCAD job may still be running; do not retry it blindly."
+            "{detail} before a result was returned. The accepted execution request may still be running; do not retry it blindly."
         )
     } else {
         format!(
@@ -359,7 +359,7 @@ fn confirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
 
 fn unconfirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
     interrupts.notice(
-        "acadctl: detached without cancellation confirmation; the accepted AutoCAD job may still be running.",
+        "acadctl: detached without cancellation confirmation; the accepted execution request may still be running.",
     );
     cancelled_exit()
 }

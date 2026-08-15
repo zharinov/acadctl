@@ -9,7 +9,7 @@ pub mod value;
 pub mod value_bridge;
 pub(crate) mod visitor;
 
-pub const EVALUATOR_SOURCE: &str = include_str!("../../lisp/acadctl.lsp");
+pub const FORM_EVALUATOR_SOURCE: &str = include_str!("../../lisp/form-evaluator.lsp");
 
 pub(crate) fn bound_diagnostic(message: &mut String) {
     const SUFFIX: &str = "... [truncated]";
@@ -165,7 +165,7 @@ pub struct ExecutionStepResult {
     pub native_status: i32,
     pub lisp_errno: i32,
     pub detail: String,
-    pub evaluator_state_cleanup_status: i32,
+    pub evaluator_symbols_clear_status: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -677,7 +677,7 @@ impl Execution {
                     }));
                 } else if let Some(failure) = bridge_failure {
                     let mut message = failure.message().to_owned();
-                    if let Some(cleanup) = result.evaluator_state_cleanup_message() {
+                    if let Some(cleanup) = result.evaluator_symbols_clear_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
                     self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
@@ -738,7 +738,7 @@ impl Execution {
                     Some(result.into_message("could not emit the eval result"))
                 } else if let Some(bridge_failure) = bridge_failure {
                     let mut message = bridge_failure.message().to_owned();
-                    if let Some(cleanup) = result.evaluator_state_cleanup_message() {
+                    if let Some(cleanup) = result.evaluator_symbols_clear_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
                     Some(message)
@@ -864,7 +864,7 @@ impl Execution {
         }
     }
 
-    pub fn record_terminal_failure(&mut self, result: ExecutionStepResult) -> bool {
+    pub fn record_bridge_finalization_failure(&mut self, result: ExecutionStepResult) -> bool {
         let cleanup = result.into_message("the native execution lease could not be released");
         let Some(outcome) = self.outcome.take() else {
             return false;
@@ -1004,24 +1004,24 @@ impl NativeExecutionStep {
 
 impl ExecutionStepResult {
     fn succeeded(&self) -> bool {
-        self.kind == ExecutionStepResultKind::Success && self.evaluator_state_cleanup_status == 0
+        self.kind == ExecutionStepResultKind::Success && self.evaluator_symbols_clear_status == 0
     }
 
     fn primary_failed(&self) -> bool {
         self.kind != ExecutionStepResultKind::Success
     }
 
-    fn evaluator_state_cleanup_message(&self) -> Option<String> {
-        (self.evaluator_state_cleanup_status != 0).then(|| {
+    fn evaluator_symbols_clear_message(&self) -> Option<String> {
+        (self.evaluator_symbols_clear_status != 0).then(|| {
             format!(
                 "could not clear the reserved AutoLISP evaluator state (native status {})",
-                self.evaluator_state_cleanup_status
+                self.evaluator_symbols_clear_status
             )
         })
     }
 
     fn into_message(self, fallback: &str) -> String {
-        let cleanup = self.evaluator_state_cleanup_message();
+        let cleanup = self.evaluator_symbols_clear_message();
         let primary = if self.kind == ExecutionStepResultKind::Success {
             None
         } else if !self.detail.is_empty() {
@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     fn embedded_evaluator_is_one_complete_form() {
-        assert_eq!(acadctl_lisp::validate(EVALUATOR_SOURCE), Ok(1));
+        assert_eq!(acadctl_lisp::validate(FORM_EVALUATOR_SOURCE), Ok(1));
     }
 
     #[test]
@@ -1569,7 +1569,7 @@ mod tests {
     #[test]
     fn cleanup_failure_overrides_success_with_an_unknown_drawing_outcome() {
         let mut execution = successful_execution();
-        assert!(execution.record_terminal_failure(native_error("unlock failed", 42)));
+        assert!(execution.record_bridge_finalization_failure(native_error("unlock failed", 42)));
         assert_eq!(
             execution.outcome(),
             Some(&ExecutionOutcome::Failure(ExecutionFailure {
@@ -1599,7 +1599,7 @@ mod tests {
         assert!(execution.complete_step(success()));
         assert_eq!(execution.take_step().kind(), ExecutionStepKind::Done);
 
-        assert!(execution.record_terminal_failure(native_error("restore failed", 43)));
+        assert!(execution.record_bridge_finalization_failure(native_error("restore failed", 43)));
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
@@ -1944,7 +1944,7 @@ mod tests {
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            evaluator_state_cleanup_status: 0,
+            evaluator_symbols_clear_status: 0,
         }
     }
 
@@ -1954,7 +1954,7 @@ mod tests {
             native_status: 0,
             lisp_errno,
             detail: detail.into(),
-            evaluator_state_cleanup_status: 0,
+            evaluator_symbols_clear_status: 0,
         }
     }
 
@@ -1964,15 +1964,15 @@ mod tests {
             native_status,
             lisp_errno: 0,
             detail: detail.into(),
-            evaluator_state_cleanup_status: 0,
+            evaluator_symbols_clear_status: 0,
         }
     }
 
     fn with_cleanup(
         mut result: ExecutionStepResult,
-        evaluator_state_cleanup_status: i32,
+        evaluator_symbols_clear_status: i32,
     ) -> ExecutionStepResult {
-        result.evaluator_state_cleanup_status = evaluator_state_cleanup_status;
+        result.evaluator_symbols_clear_status = evaluator_symbols_clear_status;
         result
     }
 }

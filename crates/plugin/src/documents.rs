@@ -45,7 +45,7 @@ impl DocumentRegistry {
         }
     }
 
-    pub fn replace(&mut self, native_documents: Vec<NativeDocumentSnapshot>) {
+    pub fn replace_snapshot(&mut self, native_documents: Vec<NativeDocumentSnapshot>) {
         let mut reserved_ids = self
             .documents
             .iter()
@@ -181,10 +181,10 @@ mod tests {
     #[test]
     fn preserves_identity_while_replacing_native_state() {
         let mut documents = DocumentRegistry::new();
-        documents.replace(vec![named_document(1, "/tmp/house.dwg")]);
+        documents.replace_snapshot(vec![named_document(1, "/tmp/house.dwg")]);
         let original_id = documents.list()[0].id.clone();
 
-        documents.replace(vec![NativeDocumentSnapshot {
+        documents.replace_snapshot(vec![NativeDocumentSnapshot {
             database_token: 99,
             modified: true,
             read_only: true,
@@ -211,13 +211,13 @@ mod tests {
     #[test]
     fn follows_native_order_and_removes_closed_documents() {
         let mut documents = DocumentRegistry::new();
-        documents.replace(vec![
+        documents.replace_snapshot(vec![
             named_document(1, "/tmp/house.dwg"),
             named_document(2, "/tmp/site.dwg"),
         ]);
         let original = documents.list();
 
-        documents.replace(vec![
+        documents.replace_snapshot(vec![
             named_document(2, "/tmp/site.dwg"),
             unnamed_document(3, "Drawing1.dwg"),
         ]);
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn finds_documents_by_id_and_named_path() {
         let mut documents = DocumentRegistry::new();
-        documents.replace(vec![
+        documents.replace_snapshot(vec![
             named_document(1, "/tmp/house.dwg"),
             unnamed_document(2, "Drawing1.dwg"),
         ]);
