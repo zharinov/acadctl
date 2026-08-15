@@ -11,7 +11,8 @@ use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
 use crate::execution::output::{OutputSink, OutputStream};
 use crate::execution::value_bridge::NativeValueWriter;
 use crate::execution::{
-    Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep, bound_diagnostic,
+    DrawingOutcome, Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep,
+    bound_diagnostic,
 };
 use crate::ffi::{
     NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind,
@@ -326,6 +327,24 @@ impl Error {
                 | Self::ExecutionNotFinished
                 | Self::NativeMutationStateUnknown
         )
+    }
+
+    pub const fn drawing_outcome(&self) -> DrawingOutcome {
+        if matches!(
+            self,
+            Self::DocumentContextRestoreFailed(_)
+                | Self::ExecutionBridgeFinalizationFailed(_)
+                | Self::ExecutionBridgeSymbolsClearFailed(_)
+                | Self::ExecutionBridgeFailed(_)
+                | Self::ExecutionNotFinished
+                | Self::NativeMutationStateUnknown
+                | Self::Stopped
+                | Self::UnknownResult(_)
+        ) {
+            DrawingOutcome::Unknown
+        } else {
+            DrawingOutcome::NotStarted
+        }
     }
 }
 
@@ -1643,6 +1662,15 @@ mod tests {
             NativeActionResultKind::ExecutionBridgeFinalizationFailed
         );
         assert!(symbols_and_undo.quarantine);
+    }
+
+    #[test]
+    fn scheduler_errors_own_drawing_outcome_classification() {
+        assert_eq!(
+            Error::NotQuiescent.drawing_outcome(),
+            DrawingOutcome::NotStarted
+        );
+        assert_eq!(Error::Stopped.drawing_outcome(), DrawingOutcome::Unknown);
     }
 
     #[test]

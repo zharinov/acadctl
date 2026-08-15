@@ -459,39 +459,7 @@ fn failure(message: impl Into<String>) -> ExecutionFailure {
 }
 
 fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
-    let drawing_outcome = match &error {
-        SchedulerError::DocumentContextRestoreFailed(_)
-        | SchedulerError::ExecutionBridgeFinalizationFailed(_)
-        | SchedulerError::ExecutionBridgeSymbolsClearFailed(_)
-        | SchedulerError::ExecutionBridgeFailed(_)
-        | SchedulerError::ExecutionNotFinished
-        | SchedulerError::NativeMutationStateUnknown
-        | SchedulerError::Stopped
-        | SchedulerError::UnknownResult(_) => DrawingOutcome::Unknown,
-        SchedulerError::SchedulerStateUnavailable
-        | SchedulerError::ScheduleFailed(_)
-        | SchedulerError::PluginStopping
-        | SchedulerError::DocumentNotFound(_)
-        | SchedulerError::DocumentGone
-        | SchedulerError::DocumentGenerationChanged
-        | SchedulerError::Unnamed(_)
-        | SchedulerError::ReadOnly(_)
-        | SchedulerError::Dirty(_)
-        | SchedulerError::NotDwg
-        | SchedulerError::OpenFailed(_)
-        | SchedulerError::LockFailed(_)
-        | SchedulerError::SaveFailed(_)
-        | SchedulerError::CloseFailed(_)
-        | SchedulerError::HistoryFailed { .. }
-        | SchedulerError::OpenNotPublished
-        | SchedulerError::SaveNotPublished
-        | SchedulerError::CloseNotPublished
-        | SchedulerError::NotQuiescent
-        | SchedulerError::UndoDisabled
-        | SchedulerError::DocumentContextFailed(_)
-        | SchedulerError::MutationCapacity
-        | SchedulerError::ExecutionCapacity => DrawingOutcome::NotStarted,
-    };
+    let drawing_outcome = error.drawing_outcome();
 
     ExecutionFailure {
         message: bounded_diagnostic(error.to_string()),
