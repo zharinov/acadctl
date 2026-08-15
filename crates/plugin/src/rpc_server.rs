@@ -5,15 +5,16 @@ use std::thread::{self, JoinHandle as ThreadJoinHandle};
 use std::time::Duration;
 
 use acadctl_rpc::{
-    CloseRequest, CloseResponse, DocumentId, DocumentService, DocumentServiceServer,
-    DrawingOutcome as RpcDrawingOutcome, DrawingPathError, ExecutionAccepted,
-    ExecutionCancelAcknowledgement, ExecutionCancelDisposition, ExecutionCancelled,
-    ExecutionClientMessage, ExecutionFailure as RpcExecutionFailure, ExecutionFinished,
-    ExecutionMode as RpcExecutionMode, ExecutionOutcome as RpcExecutionOutcome, ExecutionOutput,
-    ExecutionRequest, ExecutionServerEvent, ExecutionService, ExecutionServiceServer,
-    ExecutionSuccess, HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest,
-    OpenResponse, SaveRequest, SaveResponse, SourceLocation as RpcSourceLocation,
-    execution_client_message, execution_outcome, execution_server_event,
+    CloseRequest, CloseResponse, Document as RpcDocument, DocumentId, DocumentService,
+    DocumentServiceServer, DrawingOutcome as RpcDrawingOutcome, DrawingPathError,
+    ExecutionAccepted, ExecutionCancelAcknowledgement, ExecutionCancelDisposition,
+    ExecutionCancelled, ExecutionClientMessage, ExecutionFailure as RpcExecutionFailure,
+    ExecutionFinished, ExecutionMode as RpcExecutionMode, ExecutionOutcome as RpcExecutionOutcome,
+    ExecutionOutput, ExecutionRequest, ExecutionServerEvent, ExecutionService,
+    ExecutionServiceServer, ExecutionSuccess, HistoryRequest, HistoryResponse, ListRequest,
+    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse,
+    SourceLocation as RpcSourceLocation, execution_client_message, execution_outcome,
+    execution_server_event,
 };
 use futures_util::{Stream, stream};
 use tokio::sync::{mpsc, oneshot};
@@ -519,6 +520,18 @@ fn rpc_failure(failure: ExecutionFailure) -> RpcExecutionFailure {
             column: location.column as u64,
         }),
         drawing_outcome: drawing_outcome as i32,
+    }
+}
+
+impl From<crate::documents::Document> for RpcDocument {
+    fn from(document: crate::documents::Document) -> Self {
+        Self {
+            id: document.id.to_string(),
+            display_name: document.display_name,
+            file_path: document.file_path,
+            modified: document.modified,
+            read_only: document.read_only,
+        }
     }
 }
 

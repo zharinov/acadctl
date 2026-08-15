@@ -22,18 +22,6 @@ pub struct Document {
     pub read_only: bool,
 }
 
-impl From<Document> for acadctl_rpc::Document {
-    fn from(document: Document) -> Self {
-        Self {
-            id: document.id.to_string(),
-            display_name: document.display_name,
-            file_path: document.file_path,
-            modified: document.modified,
-            read_only: document.read_only,
-        }
-    }
-}
-
 struct TrackedDocument {
     native_key: NativeDocumentKey,
     document: Document,
