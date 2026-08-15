@@ -60,14 +60,18 @@ type CompletionFuture =
 
 struct ExecuteResponseState {
     output: crate::execution::output::OutputStream,
-    output_done: bool,
     completion: CompletionFuture,
-    control: mpsc::Receiver<Result<ExecutionCancelDisposition, Status>>,
-    control_open: bool,
+    control: Option<mpsc::Receiver<Result<ExecutionCancelDisposition, Status>>>,
     control_task: TokioJoinHandle<()>,
-    accepted_sent: bool,
-    finished: bool,
+    phase: ExecuteResponsePhase,
     _reservation: crate::scheduler::ExecutionReservation,
+}
+
+enum ExecuteResponsePhase {
+    SendAccepted,
+    RelayOutput,
+    AwaitCompletion,
+    Done,
 }
 
 #[tonic::async_trait]
@@ -221,13 +225,10 @@ impl ExecutionService for ExecutionRpc {
         let (control, control_task) = spawn_control_reader(inbound, job_id);
         let state = ExecuteResponseState {
             output,
-            output_done: false,
             completion: Box::pin(completion.wait()),
-            control,
-            control_open: true,
+            control: Some(control),
             control_task,
-            accepted_sent: false,
-            finished: false,
+            phase: ExecuteResponsePhase::SendAccepted,
             _reservation: reservation,
         };
 
@@ -246,72 +247,73 @@ fn execution_response(state: ExecuteResponseState) -> ExecuteResponse {
 
 impl ExecuteResponseState {
     async fn next_event(&mut self) -> Result<Option<ExecutionServerEvent>, Status> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        if !self.accepted_sent {
-            self.accepted_sent = true;
-
-            return Ok(Some(server_event(execution_server_event::Event::Accepted(
-                ExecutionAccepted {},
-            ))));
-        }
-
-        while !self.output_done {
-            if self.control_open {
-                tokio::select! {
-                    biased;
-                    control = self.control.recv() => {
-                        if let Some(event) = self.handle_control(control)? {
-                            return Ok(Some(event));
-                        }
-                    }
-                    output = self.output.next_chunk() => {
-                        match output {
-                            Some(chunk) => return Ok(Some(server_event(
-                                execution_server_event::Event::Output(ExecutionOutput { chunk }),
-                            ))),
-                            None => self.output_done = true,
-                        }
-                    }
-                }
-            } else {
-                match self.output.next_chunk().await {
-                    Some(chunk) => {
-                        return Ok(Some(server_event(execution_server_event::Event::Output(
-                            ExecutionOutput { chunk },
-                        ))));
-                    }
-                    None => self.output_done = true,
-                }
-            }
-        }
-
         loop {
-            let outcome = if self.control_open {
-                tokio::select! {
-                    biased;
-                    control = self.control.recv() => {
-                        if let Some(event) = self.handle_control(control)? {
-                            return Ok(Some(event));
-                        }
+            match self.phase {
+                ExecuteResponsePhase::SendAccepted => {
+                    self.phase = ExecuteResponsePhase::RelayOutput;
 
-                        continue;
-                    }
-                    outcome = self.completion.as_mut() => outcome,
+                    return Ok(Some(server_event(execution_server_event::Event::Accepted(
+                        ExecutionAccepted {},
+                    ))));
                 }
-            } else {
-                self.completion.as_mut().await
-            };
+                ExecuteResponsePhase::RelayOutput => {
+                    if let Some(control) = self.control.as_mut() {
+                        tokio::select! {
+                            biased;
+                            control = control.recv() => {
+                                if let Some(event) = self.handle_control(control)? {
+                                    return Ok(Some(event));
+                                }
+                            }
+                            output = self.output.next_chunk() => {
+                                match output {
+                                    Some(chunk) => return Ok(Some(server_event(
+                                        execution_server_event::Event::Output(ExecutionOutput { chunk }),
+                                    ))),
+                                    None => self.phase = ExecuteResponsePhase::AwaitCompletion,
+                                }
+                            }
+                        }
+                    } else {
+                        match self.output.next_chunk().await {
+                            Some(chunk) => {
+                                return Ok(Some(server_event(
+                                    execution_server_event::Event::Output(ExecutionOutput {
+                                        chunk,
+                                    }),
+                                )));
+                            }
+                            None => self.phase = ExecuteResponsePhase::AwaitCompletion,
+                        }
+                    }
+                }
+                ExecuteResponsePhase::AwaitCompletion => {
+                    let outcome = if let Some(control) = self.control.as_mut() {
+                        tokio::select! {
+                            biased;
+                            control = control.recv() => {
+                                if let Some(event) = self.handle_control(control)? {
+                                    return Ok(Some(event));
+                                }
 
-            self.control_task.abort();
-            self.finished = true;
+                                continue;
+                            }
+                            outcome = self.completion.as_mut() => outcome,
+                        }
+                    } else {
+                        self.completion.as_mut().await
+                    };
 
-            return Ok(Some(finished_event(match outcome {
-                Ok(outcome) => outcome,
-                Err(error) => ExecutionOutcome::Failure(scheduler_failure(error)),
-            })));
+                    self.control_task.abort();
+                    self.phase = ExecuteResponsePhase::Done;
+
+                    return Ok(Some(finished_event(match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => ExecutionOutcome::Failure(scheduler_failure(error)),
+                    })));
+                }
+                ExecuteResponsePhase::Done => return Ok(None),
+            }
         }
     }
 
@@ -329,7 +331,7 @@ impl ExecuteResponseState {
             ))),
             Some(Err(status)) => Err(status),
             None => {
-                self.control_open = false;
+                self.control = None;
                 Ok(None)
             }
         }

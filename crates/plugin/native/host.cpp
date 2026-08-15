@@ -214,12 +214,22 @@ private:
 
   void failExecutionDriver();
 
-  void finishAdvanceCallback(bool evaluateStagedForm);
+  enum class AdvanceCompletion { EvaluateStagedForm, ExitReady, ExitFailed };
+
+  void finishAdvanceCallback(AdvanceCompletion completion);
 
   struct DocumentContextDispatch {
     enum class Phase { Queued, Running, Finalizing };
     enum class Kind { Undo, Redo, ExecutionDriver };
     enum class StagedFormKind { None, Evaluator, ValueVisitor };
+    enum class ExecutionDriverLifecycle {
+      AwaitingStart,
+      Running,
+      InCallback,
+      EndedDuringCallback,
+      AwaitingEnd,
+      Finalizing,
+    };
 
     std::uint64_t jobId;
     std::size_t documentToken;
@@ -235,11 +245,9 @@ private:
     StagedFormKind stagedFormKind = StagedFormKind::None;
     bool retainValue = false;
     bool bridgeSymbolsMayBeRetained = false;
-    bool driverExitReady = false;
-    bool driverStarted = false;
-    bool driverEnded = false;
-    bool advanceCallbackActive = false;
     bool terminalCleanupFailed = false;
+    ExecutionDriverLifecycle driverLifecycle =
+        ExecutionDriverLifecycle::AwaitingStart;
     std::uint32_t lispDepth = 0;
     std::optional<rust::Box<acadctl::NativeValueWriter>> valueWriter;
   };
@@ -1562,7 +1570,15 @@ void ObjectArxBridge::queuedExecutionDriverStarted(const ACHAR *firstLine) {
 
   DocumentContextDispatch &dispatch = *documentContextDispatch_;
 
-  if (dispatch.driverStarted) {
+  if (dispatch.driverLifecycle !=
+      DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart) {
+    if (dispatch.driverLifecycle ==
+            DocumentContextDispatch::ExecutionDriverLifecycle::EndedDuringCallback ||
+        dispatch.driverLifecycle ==
+            DocumentContextDispatch::ExecutionDriverLifecycle::Finalizing) {
+      return;
+    }
+
     if (dispatch.lispDepth == std::numeric_limits<std::uint32_t>::max()) {
       failExecutionDriver();
 
@@ -1587,7 +1603,8 @@ void ObjectArxBridge::queuedExecutionDriverStarted(const ACHAR *firstLine) {
     return;
   }
 
-  dispatch.driverStarted = true;
+  dispatch.driverLifecycle =
+      DocumentContextDispatch::ExecutionDriverLifecycle::Running;
   dispatch.lispDepth = 1;
 }
 
@@ -1671,10 +1688,8 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
   }
 
   dispatch.phase = DocumentContextDispatch::Phase::Queued;
-  dispatch.driverExitReady = false;
-  dispatch.driverStarted = false;
-  dispatch.driverEnded = false;
-  dispatch.advanceCallbackActive = false;
+  dispatch.driverLifecycle =
+      DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart;
   dispatch.lispDepth = 0;
   const Acad::ErrorStatus scheduleStatus = acDocManager->sendStringToExecute(
       target, bridgeProtocol().executionDriverInvocation.kACharPtr(), true,
@@ -1694,6 +1709,8 @@ void ObjectArxBridge::scheduleExecutionDispatchFinalizer() {
     return;
   }
 
+  documentContextDispatch_->driverLifecycle =
+      DocumentContextDispatch::ExecutionDriverLifecycle::Finalizing;
   scheduleDocumentContextFinalizer();
 }
 
@@ -1704,7 +1721,10 @@ void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
        documentContextDispatch_->phase !=
            DocumentContextDispatch::Phase::Running) ||
       documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
-      !documentContextDispatch_->driverStarted) {
+      documentContextDispatch_->driverLifecycle ==
+          DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart ||
+      documentContextDispatch_->driverLifecycle ==
+          DocumentContextDispatch::ExecutionDriverLifecycle::Finalizing) {
     return;
   }
 
@@ -1723,17 +1743,20 @@ void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
   }
 
   dispatch.lispDepth = 0;
-  dispatch.driverEnded = true;
 
-  if (dispatch.driverExitReady) {
+  if (dispatch.driverLifecycle ==
+      DocumentContextDispatch::ExecutionDriverLifecycle::InCallback) {
+    dispatch.driverLifecycle =
+        DocumentContextDispatch::ExecutionDriverLifecycle::EndedDuringCallback;
+  } else if (dispatch.driverLifecycle ==
+             DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingEnd) {
     scheduleExecutionDispatchFinalizer();
-  } else if (!dispatch.advanceCallbackActive) {
+  } else {
     failExecutionDriver();
   }
 }
 
-void ObjectArxBridge::finishAdvanceCallback(
-    bool evaluateStagedForm) {
+void ObjectArxBridge::finishAdvanceCallback(AdvanceCompletion completion) {
   if (!documentContextDispatch_ ||
       documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
       documentContextDispatch_->phase ==
@@ -1742,19 +1765,22 @@ void ObjectArxBridge::finishAdvanceCallback(
   }
 
   DocumentContextDispatch &dispatch = *documentContextDispatch_;
-  dispatch.advanceCallbackActive = false;
-
-  if (!dispatch.driverEnded) {
-    return;
+  if (dispatch.driverLifecycle ==
+      DocumentContextDispatch::ExecutionDriverLifecycle::EndedDuringCallback) {
+    if (completion == AdvanceCompletion::ExitReady) {
+      scheduleExecutionDispatchFinalizer();
+    } else {
+      failExecutionDriver();
+    }
+  } else if (dispatch.driverLifecycle ==
+             DocumentContextDispatch::ExecutionDriverLifecycle::InCallback) {
+    dispatch.driverLifecycle =
+        completion == AdvanceCompletion::ExitReady
+            ? DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingEnd
+            : DocumentContextDispatch::ExecutionDriverLifecycle::Running;
+  } else {
+    failExecutionDriver();
   }
-
-  if (!evaluateStagedForm && dispatch.driverExitReady) {
-    scheduleExecutionDispatchFinalizer();
-
-    return;
-  }
-
-  failExecutionDriver();
 }
 
 int acadctlAdvanceExecution() noexcept {
@@ -1773,13 +1799,23 @@ int acadctlAdvanceExecution() noexcept {
   ObjectArxBridge::DocumentContextDispatch &dispatch =
       *bridge->documentContextDispatch_;
 
-  if (!dispatch.driverStarted) {
-    dispatch.driverStarted = true;
+  if (dispatch.driverLifecycle ==
+      ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart) {
+    dispatch.driverLifecycle =
+        ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::Running;
     dispatch.lispDepth = 1;
   }
 
+  if (dispatch.driverLifecycle !=
+      ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::Running) {
+    bridge->failExecutionDriver();
+
+    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+  }
+
   dispatch.phase = ObjectArxBridge::DocumentContextDispatch::Phase::Running;
-  dispatch.advanceCallbackActive = true;
+  dispatch.driverLifecycle =
+      ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::InCallback;
   bool evaluateStagedForm = false;
   try {
     AcApDocument *target = bridge->document(dispatch.documentToken);
@@ -2061,11 +2097,13 @@ int acadctlAdvanceExecution() noexcept {
     finishValueWriter(dispatch.valueWriter, false);
   }
 
-  if (!evaluateStagedForm && returnStatus == RTNORM) {
-    dispatch.driverExitReady = true;
-  }
-
-  bridge->finishAdvanceCallback(evaluateStagedForm);
+  const ObjectArxBridge::AdvanceCompletion completion =
+      evaluateStagedForm
+          ? ObjectArxBridge::AdvanceCompletion::EvaluateStagedForm
+          : returnStatus == RTNORM
+                ? ObjectArxBridge::AdvanceCompletion::ExitReady
+                : ObjectArxBridge::AdvanceCompletion::ExitFailed;
+  bridge->finishAdvanceCallback(completion);
 
   return returnStatus == RTNORM ? RSRSLT : RSERR;
 }

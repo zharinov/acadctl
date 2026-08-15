@@ -33,10 +33,15 @@ struct State {
     ready: VecDeque<String>,
     pending: String,
     queued_bytes: usize,
-    disconnected: bool,
-    cancelled: bool,
-    stopped: bool,
-    finished: bool,
+    terminal: Option<TerminalState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalState {
+    Disconnected,
+    Cancelled,
+    Stopped,
+    Finished,
 }
 
 pub fn channel() -> (OutputSink, OutputStream) {
@@ -130,27 +135,36 @@ impl OutputSink {
     pub fn request_cancel(&self) {
         let mut state = lock(&self.shared.state);
         publish_pending(&mut state);
-        state.cancelled = true;
+        if !matches!(
+            state.terminal,
+            Some(TerminalState::Disconnected | TerminalState::Stopped)
+        ) {
+            state.terminal = Some(TerminalState::Cancelled);
+        }
         drop(state);
         self.wake_all();
     }
 
     #[cfg(test)]
     pub fn cancel_requested(&self) -> bool {
-        lock(&self.shared.state).cancelled
+        lock(&self.shared.state).terminal == Some(TerminalState::Cancelled)
     }
 
     pub fn finish(&self) {
         let mut state = lock(&self.shared.state);
         publish_pending(&mut state);
-        state.finished = true;
+        if state.terminal.is_none() {
+            state.terminal = Some(TerminalState::Finished);
+        }
         drop(state);
         self.wake_all();
     }
 
     pub fn stop(&self) {
         let mut state = lock(&self.shared.state);
-        state.stopped = true;
+        if state.terminal != Some(TerminalState::Disconnected) {
+            state.terminal = Some(TerminalState::Stopped);
+        }
         state.ready.clear();
         state.pending.clear();
         state.queued_bytes = 0;
@@ -187,7 +201,7 @@ impl Drop for OutputSink {
             return;
         }
 
-        state.stopped = true;
+        state.terminal = Some(TerminalState::Stopped);
         state.ready.clear();
         state.pending.clear();
         state.queued_bytes = 0;
@@ -212,7 +226,7 @@ impl OutputStream {
                     return Some(chunk);
                 }
 
-                if state.disconnected || state.cancelled || state.stopped || state.finished {
+                if state.terminal.is_some() {
                     return None;
                 }
             }
@@ -223,7 +237,7 @@ impl OutputStream {
 
     fn disconnect(&self) {
         let mut state = lock(&self.shared.state);
-        state.disconnected = true;
+        state.terminal = Some(TerminalState::Disconnected);
         state.ready.clear();
         state.pending.clear();
         state.queued_bytes = 0;
@@ -270,16 +284,12 @@ fn publish_pending(state: &mut State) {
 }
 
 fn emit_result(state: &State) -> EmitResult {
-    if state.disconnected {
-        EmitResult::Disconnected
-    } else if state.stopped {
-        EmitResult::Stopped
-    } else if state.cancelled {
-        EmitResult::Cancelled
-    } else if state.finished {
-        EmitResult::Finished
-    } else {
-        EmitResult::Continue
+    match state.terminal {
+        Some(TerminalState::Disconnected) => EmitResult::Disconnected,
+        Some(TerminalState::Stopped) => EmitResult::Stopped,
+        Some(TerminalState::Cancelled) => EmitResult::Cancelled,
+        Some(TerminalState::Finished) => EmitResult::Finished,
+        None => EmitResult::Continue,
     }
 }
 
@@ -450,6 +460,29 @@ mod tests {
         sink.request_cancel();
 
         assert_eq!(stream.next_chunk().await.as_deref(), Some("before cancel"));
+        assert_eq!(stream.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn accepted_cancellation_remains_terminal_when_execution_finishes() {
+        let (sink, mut stream) = channel();
+        assert_eq!(sink.emit("before cancel"), EmitResult::Continue);
+        sink.request_cancel();
+        sink.finish();
+
+        assert_eq!(sink.emit("after cancel"), EmitResult::Cancelled);
+        assert_eq!(stream.next_chunk().await.as_deref(), Some("before cancel"));
+        assert_eq!(stream.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn stopping_discards_cancelled_output() {
+        let (sink, mut stream) = channel();
+        assert_eq!(sink.emit("discarded"), EmitResult::Continue);
+        sink.request_cancel();
+        sink.stop();
+
+        assert_eq!(sink.emit("later"), EmitResult::Stopped);
         assert_eq!(stream.next_chunk().await, None);
     }
 

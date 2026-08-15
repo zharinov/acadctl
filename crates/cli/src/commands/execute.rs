@@ -97,37 +97,34 @@ async fn receive_response(
     interrupts: &mut Interrupts,
 ) -> ExitCode {
     let mut accepted = false;
-    let mut cancellation_acknowledged = false;
     let mut stdout = None;
 
     loop {
-        let event =
-            match wait_for_control(response.message(), interrupts, cancellation_acknowledged).await
-            {
-                ControlWait::Ready(Ok(Some(event))) => event,
-                ControlWait::Ready(Ok(None)) => {
-                    if interrupts.force_detach_requested() {
-                        return unconfirmed_detach_exit(interrupts);
-                    }
-
-                    return lost_response(interrupts, accepted, "The execution stream ended").await;
+        let event = match wait_for_control(response.message(), interrupts).await {
+            ControlWait::Ready(Ok(Some(event))) => event,
+            ControlWait::Ready(Ok(None)) => {
+                if interrupts.force_detach_requested() {
+                    return unconfirmed_detach_exit(interrupts);
                 }
-                ControlWait::Ready(Err(status)) => {
-                    if interrupts.force_detach_requested() {
-                        return unconfirmed_detach_exit(interrupts);
-                    }
 
-                    let detail = if status.message().is_empty() {
-                        "The execution connection failed".into()
-                    } else {
-                        format!("The execution connection failed: {}", status.message())
-                    };
-
-                    return lost_response(interrupts, accepted, &detail).await;
+                return lost_response(interrupts, accepted, "The execution stream ended").await;
+            }
+            ControlWait::Ready(Err(status)) => {
+                if interrupts.force_detach_requested() {
+                    return unconfirmed_detach_exit(interrupts);
                 }
-                ControlWait::ConfirmedDetach => return confirmed_detach_exit(interrupts),
-                ControlWait::UnconfirmedDetach => return unconfirmed_detach_exit(interrupts),
-            };
+
+                let detail = if status.message().is_empty() {
+                    "The execution connection failed".into()
+                } else {
+                    format!("The execution connection failed: {}", status.message())
+                };
+
+                return lost_response(interrupts, accepted, &detail).await;
+            }
+            ControlWait::ConfirmedDetach => return confirmed_detach_exit(interrupts),
+            ControlWait::UnconfirmedDetach => return unconfirmed_detach_exit(interrupts),
+        };
 
         match event.event {
             Some(execution_server_event::Event::Accepted(_)) if !accepted => accepted = true,
@@ -158,13 +155,7 @@ async fn receive_response(
                     }
                 };
 
-                match wait_for_stdout(
-                    writer.write(output.chunk),
-                    interrupts,
-                    cancellation_acknowledged,
-                )
-                .await
-                {
+                match wait_for_stdout(writer.write(output.chunk), interrupts).await {
                     StdoutWait::Ready(Ok(())) => {}
                     StdoutWait::Ready(Err(error)) => {
                         drop(response);
@@ -193,11 +184,7 @@ async fn receive_response(
             Some(execution_server_event::Event::CancelAcknowledgement(acknowledgement))
                 if accepted =>
             {
-                match record_cancellation_acknowledgement(
-                    interrupts,
-                    &mut cancellation_acknowledged,
-                    acknowledgement.disposition,
-                ) {
+                match record_cancellation_acknowledgement(interrupts, acknowledgement.disposition) {
                     CancellationReceipt::Continue => {}
                     CancellationReceipt::Detach => return confirmed_detach_exit(interrupts),
                     CancellationReceipt::Duplicate => {
@@ -375,25 +362,32 @@ enum CancellationReceipt {
 }
 
 fn record_cancellation_acknowledgement(
-    interrupts: &Interrupts,
-    acknowledged: &mut bool,
+    interrupts: &mut Interrupts,
     disposition: i32,
 ) -> CancellationReceipt {
-    if *acknowledged {
-        return CancellationReceipt::Duplicate;
-    }
-
-    match ExecutionCancelDisposition::try_from(disposition) {
-        Ok(ExecutionCancelDisposition::Accepted) => {}
-        Ok(ExecutionCancelDisposition::TooLate) => interrupts.notice(
-            "acadctl: cancellation was too late; execution will continue. Press Ctrl+C again to detach.",
-        ),
+    let disposition = match ExecutionCancelDisposition::try_from(disposition) {
+        Ok(ExecutionCancelDisposition::Accepted) => CancellationDisposition::Accepted,
+        Ok(ExecutionCancelDisposition::TooLate) => {
+            interrupts.notice(
+                "acadctl: cancellation was too late; execution will continue. Press Ctrl+C again to detach.",
+            );
+            CancellationDisposition::TooLate
+        }
         Ok(ExecutionCancelDisposition::Unspecified) | Err(_) => {
             return CancellationReceipt::Invalid;
         }
-    }
+    };
 
-    *acknowledged = true;
+    match interrupts.acknowledge_cancellation(disposition) {
+        AcknowledgementResult::Recorded => {}
+        AcknowledgementResult::RecordedBeforeInterrupt => {
+            if disposition == CancellationDisposition::Accepted {
+                interrupts.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
+            }
+        }
+        AcknowledgementResult::Duplicate => return CancellationReceipt::Duplicate,
+        AcknowledgementResult::Invalid => return CancellationReceipt::Invalid,
+    }
 
     if interrupts.detach_requested() {
         CancellationReceipt::Detach
@@ -450,10 +444,30 @@ struct Interrupts {
     receiver: Option<mpsc::Receiver<Interrupt>>,
     task: JoinHandle<()>,
     diagnostics: PipeWriter,
-    cancellation_requested: bool,
-    cancel_queued: bool,
-    detach_requested: bool,
-    force_detach_requested: bool,
+    phase: InterruptPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterruptPhase {
+    Attached,
+    CancelRequested(CancellationDisposition),
+    DetachRequested(CancellationDisposition),
+    ForceDetachRequested(CancellationDisposition),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CancellationDisposition {
+    NotQueued,
+    Queued,
+    Accepted,
+    TooLate,
+}
+
+enum AcknowledgementResult {
+    Recorded,
+    RecordedBeforeInterrupt,
+    Duplicate,
+    Invalid,
 }
 
 impl Interrupts {
@@ -495,10 +509,7 @@ impl Interrupts {
                 receiver: Some(receiver),
                 task,
                 diagnostics,
-                cancellation_requested: false,
-                cancel_queued: false,
-                detach_requested: false,
-                force_detach_requested: false,
+                phase: InterruptPhase::Attached,
             },
             outbound,
         ))
@@ -518,10 +529,14 @@ impl Interrupts {
     }
 
     fn note(&mut self, interrupt: Interrupt) {
-        match interrupt {
-            Interrupt::Cancel { queued } if !self.cancellation_requested => {
-                self.cancellation_requested = true;
-                self.cancel_queued = queued;
+        match (self.phase, interrupt) {
+            (InterruptPhase::Attached, Interrupt::Cancel { queued }) => {
+                let disposition = if queued {
+                    CancellationDisposition::Queued
+                } else {
+                    CancellationDisposition::NotQueued
+                };
+                self.phase = InterruptPhase::CancelRequested(disposition);
 
                 if queued {
                     self.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
@@ -531,10 +546,10 @@ impl Interrupts {
                     );
                 }
             }
-            Interrupt::Detach if !self.detach_requested => {
-                self.detach_requested = true;
+            (InterruptPhase::CancelRequested(disposition), Interrupt::Detach) => {
+                self.phase = InterruptPhase::DetachRequested(disposition);
 
-                if self.cancel_queued {
+                if disposition != CancellationDisposition::NotQueued {
                     self.notice(
                         "acadctl: detach requested; waiting for AutoCAD to acknowledge cancellation. Press Ctrl+C again to detach without confirmation.",
                     );
@@ -544,21 +559,79 @@ impl Interrupts {
                     );
                 }
             }
-            Interrupt::ForceDetach => self.force_detach_requested = true,
-            Interrupt::Cancel { .. } | Interrupt::Detach => {}
+            (InterruptPhase::DetachRequested(disposition), Interrupt::ForceDetach) => {
+                self.phase = InterruptPhase::ForceDetachRequested(disposition);
+            }
+            (InterruptPhase::Attached, Interrupt::Detach | Interrupt::ForceDetach)
+            | (
+                InterruptPhase::CancelRequested(_),
+                Interrupt::Cancel { .. } | Interrupt::ForceDetach,
+            )
+            | (InterruptPhase::DetachRequested(_), Interrupt::Cancel { .. } | Interrupt::Detach)
+            | (InterruptPhase::ForceDetachRequested(_), _) => {}
         }
     }
 
     fn cancellation_requested(&self) -> bool {
-        self.cancellation_requested
+        !matches!(self.phase, InterruptPhase::Attached)
     }
 
     fn detach_requested(&self) -> bool {
-        self.detach_requested
+        matches!(
+            self.phase,
+            InterruptPhase::DetachRequested(_) | InterruptPhase::ForceDetachRequested(_)
+        )
     }
 
     fn force_detach_requested(&self) -> bool {
-        self.force_detach_requested
+        matches!(self.phase, InterruptPhase::ForceDetachRequested(_))
+    }
+
+    fn cancellation_acknowledged(&self) -> bool {
+        matches!(
+            self.cancellation_disposition(),
+            Some(CancellationDisposition::Accepted | CancellationDisposition::TooLate)
+        )
+    }
+
+    fn cancellation_disposition(&self) -> Option<CancellationDisposition> {
+        match self.phase {
+            InterruptPhase::Attached => None,
+            InterruptPhase::CancelRequested(disposition)
+            | InterruptPhase::DetachRequested(disposition)
+            | InterruptPhase::ForceDetachRequested(disposition) => Some(disposition),
+        }
+    }
+
+    fn acknowledge_cancellation(
+        &mut self,
+        disposition: CancellationDisposition,
+    ) -> AcknowledgementResult {
+        let current = match self.cancellation_disposition() {
+            Some(current) => current,
+            None => {
+                self.phase = InterruptPhase::CancelRequested(disposition);
+                return AcknowledgementResult::RecordedBeforeInterrupt;
+            }
+        };
+
+        match current {
+            CancellationDisposition::Queued => {}
+            CancellationDisposition::Accepted | CancellationDisposition::TooLate => {
+                return AcknowledgementResult::Duplicate;
+            }
+            CancellationDisposition::NotQueued => return AcknowledgementResult::Invalid,
+        }
+
+        self.phase = match self.phase {
+            InterruptPhase::CancelRequested(_) => InterruptPhase::CancelRequested(disposition),
+            InterruptPhase::DetachRequested(_) => InterruptPhase::DetachRequested(disposition),
+            InterruptPhase::ForceDetachRequested(_) => {
+                InterruptPhase::ForceDetachRequested(disposition)
+            }
+            InterruptPhase::Attached => return AcknowledgementResult::Invalid,
+        };
+        AcknowledgementResult::Recorded
     }
 
     fn notice(&self, message: &str) {
@@ -579,10 +652,7 @@ impl Interrupts {
                 receiver: Some(receiver),
                 task,
                 diagnostics,
-                cancellation_requested: false,
-                cancel_queued: false,
-                detach_requested: false,
-                force_detach_requested: false,
+                phase: InterruptPhase::Attached,
             },
             sender,
         )
@@ -665,11 +735,7 @@ where
     }
 }
 
-async fn wait_for_control<F>(
-    future: F,
-    interrupts: &mut Interrupts,
-    cancellation_acknowledged: bool,
-) -> ControlWait<F::Output>
+async fn wait_for_control<F>(future: F, interrupts: &mut Interrupts) -> ControlWait<F::Output>
 where
     F: Future,
 {
@@ -685,7 +751,7 @@ where
                     return ControlWait::UnconfirmedDetach;
                 }
 
-                if cancellation_acknowledged && interrupts.detach_requested() {
+                if interrupts.cancellation_acknowledged() && interrupts.detach_requested() {
                     return ControlWait::ConfirmedDetach;
                 }
             }
@@ -701,11 +767,7 @@ enum StdoutWait<T> {
     UnconfirmedDetach,
 }
 
-async fn wait_for_stdout<F>(
-    future: F,
-    interrupts: &mut Interrupts,
-    cancellation_acknowledged: bool,
-) -> StdoutWait<F::Output>
+async fn wait_for_stdout<F>(future: F, interrupts: &mut Interrupts) -> StdoutWait<F::Output>
 where
     F: Future,
 {
@@ -717,7 +779,7 @@ where
 
             if interrupts.force_detach_requested() {
                 StdoutWait::UnconfirmedDetach
-            } else if cancellation_acknowledged && interrupts.detach_requested() {
+            } else if interrupts.cancellation_acknowledged() && interrupts.detach_requested() {
                 StdoutWait::ConfirmedDetach
             } else {
                 StdoutWait::Interrupted
@@ -930,7 +992,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
-                wait_for_control(pending::<()>(), &mut interrupts, false),
+                wait_for_control(pending::<()>(), &mut interrupts),
             )
             .await
             .is_err()
@@ -946,9 +1008,18 @@ mod tests {
             .send(Interrupt::Cancel { queued: true })
             .await
             .unwrap();
+        let interrupt = acknowledged.next().await;
+        acknowledged.note(interrupt);
+        assert_eq!(
+            record_cancellation_acknowledgement(
+                &mut acknowledged,
+                ExecutionCancelDisposition::Accepted as i32,
+            ),
+            CancellationReceipt::Continue
+        );
         acknowledged_sender.send(Interrupt::Detach).await.unwrap();
         assert!(matches!(
-            wait_for_control(pending::<()>(), &mut acknowledged, true).await,
+            wait_for_control(pending::<()>(), &mut acknowledged).await,
             ControlWait::ConfirmedDetach
         ));
 
@@ -960,7 +1031,7 @@ mod tests {
         forced_sender.send(Interrupt::Detach).await.unwrap();
         forced_sender.send(Interrupt::ForceDetach).await.unwrap();
         assert!(matches!(
-            wait_for_control(pending::<()>(), &mut forced, false).await,
+            wait_for_control(pending::<()>(), &mut forced).await,
             ControlWait::UnconfirmedDetach
         ));
     }
@@ -975,23 +1046,43 @@ mod tests {
         let interrupt = interrupts.next().await;
         interrupts.note(interrupt);
 
-        let mut acknowledged = false;
         assert_eq!(
             record_cancellation_acknowledgement(
-                &interrupts,
-                &mut acknowledged,
+                &mut interrupts,
                 ExecutionCancelDisposition::TooLate as i32,
             ),
             CancellationReceipt::Continue
         );
-        assert!(acknowledged);
+        assert!(interrupts.cancellation_acknowledged());
         assert!(!interrupts.detach_requested());
 
         sender.send(Interrupt::Detach).await.unwrap();
         assert!(matches!(
-            wait_for_control(pending::<()>(), &mut interrupts, acknowledged).await,
+            wait_for_control(pending::<()>(), &mut interrupts).await,
             ControlWait::ConfirmedDetach
         ));
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_may_arrive_before_the_local_interrupt_event() {
+        let (mut interrupts, sender) = Interrupts::test_pair();
+        assert_eq!(
+            record_cancellation_acknowledgement(
+                &mut interrupts,
+                ExecutionCancelDisposition::Accepted as i32,
+            ),
+            CancellationReceipt::Continue
+        );
+
+        sender
+            .send(Interrupt::Cancel { queued: true })
+            .await
+            .unwrap();
+        let interrupt = interrupts.next().await;
+        interrupts.note(interrupt);
+
+        assert!(interrupts.cancellation_requested());
+        assert!(interrupts.cancellation_acknowledged());
     }
 
     #[tokio::test]
@@ -1044,10 +1135,7 @@ mod tests {
             receiver: Some(receiver),
             task: tokio::spawn(pending::<()>()),
             diagnostics,
-            cancellation_requested: false,
-            cancel_queued: false,
-            detach_requested: false,
-            force_detach_requested: false,
+            phase: InterruptPhase::Attached,
         };
 
         let diagnostic = tokio::spawn(async move {
@@ -1135,10 +1223,7 @@ mod tests {
             receiver: Some(receiver),
             task,
             diagnostics,
-            cancellation_requested: false,
-            cancel_queued: false,
-            detach_requested: false,
-            force_detach_requested: false,
+            phase: InterruptPhase::Attached,
         };
 
         sender
@@ -1151,7 +1236,7 @@ mod tests {
         assert!(matches!(
             tokio::time::timeout(
                 Duration::from_secs(1),
-                wait_for_control(pending::<()>(), &mut interrupts, false),
+                wait_for_control(pending::<()>(), &mut interrupts),
             )
             .await
             .unwrap(),
