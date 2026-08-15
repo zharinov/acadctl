@@ -136,6 +136,18 @@ pub enum ExecutionOutcome {
     Cancelled,
 }
 
+impl ExecutionOutcome {
+    fn into_unknown_failure(self, message: String) -> ExecutionFailure {
+        if let Self::Failure(mut failure) = self {
+            append_diagnostic(&mut failure.message, &message);
+            failure.drawing_outcome = DrawingOutcome::Unknown;
+            failure
+        } else {
+            ExecutionFailure::unknown_drawing_outcome(message)
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionFailure {
     pub message: String,
@@ -935,17 +947,9 @@ impl Execution {
             return false;
         };
 
-        let failure = match outcome {
-            ExecutionOutcome::Success => ExecutionFailure::unknown_drawing_outcome(cleanup),
-            ExecutionOutcome::Failure(mut failure) => {
-                append_diagnostic(&mut failure.message, &cleanup);
-                failure.drawing_outcome = DrawingOutcome::Unknown;
-                failure
-            }
-            ExecutionOutcome::Cancelled => ExecutionFailure::unknown_drawing_outcome(cleanup),
-        };
-
-        self.outcome = Some(ExecutionOutcome::Failure(failure));
+        self.outcome = Some(ExecutionOutcome::Failure(
+            outcome.into_unknown_failure(cleanup),
+        ));
         true
     }
 
@@ -966,13 +970,7 @@ impl Execution {
             })
         });
         let failure = match existing {
-            Some(ExecutionOutcome::Success) => ExecutionFailure::unknown_drawing_outcome(message),
-            Some(ExecutionOutcome::Failure(mut failure)) => {
-                append_diagnostic(&mut failure.message, &message);
-                failure.drawing_outcome = DrawingOutcome::Unknown;
-                failure
-            }
-            Some(ExecutionOutcome::Cancelled) => ExecutionFailure::unknown_drawing_outcome(message),
+            Some(existing) => existing.into_unknown_failure(message),
             None => {
                 let (form_index, location) = match phase {
                     Phase::AwaitingEvaluateForm {
