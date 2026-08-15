@@ -1,12 +1,11 @@
 use std::fmt::Write;
 use std::sync::LazyLock;
 
+use crate::bridge_protocol;
+
 use super::value_bridge::ValueEvent;
 
 const TEMPLATE: &str = include_str!("../../lisp/eval-value-visitor.lsp");
-const CALLBACK_NAME: &str = "acadctl:_value-event";
-pub(crate) const MAX_DEPTH: usize = 4096;
-pub(crate) const CHUNK_CHARACTERS: usize = 2048;
 static PROGRAM: LazyLock<Program> = LazyLock::new(Program::new);
 
 struct Program {
@@ -51,9 +50,7 @@ pub(crate) enum Payload<'a> {
 
 impl Program {
     fn new() -> Self {
-        Self {
-            source: render(CALLBACK_NAME),
-        }
+        Self { source: render() }
     }
 }
 
@@ -120,7 +117,7 @@ pub(crate) fn value_event<'a>(code: i32, payload: Payload<'a>) -> ValueEvent<'a>
     }
 }
 
-fn render(callback_name: &str) -> String {
+fn render() -> String {
     let mut output = String::with_capacity(TEMPLATE.len());
     let mut remaining = TEMPLATE;
 
@@ -130,7 +127,7 @@ fn render(callback_name: &str) -> String {
         let end = marker
             .find("}}")
             .expect("embedded eval value visitor marker is closed");
-        write_marker(&mut output, &marker[..end], callback_name);
+        write_marker(&mut output, &marker[..end]);
         remaining = &marker[end + 2..];
     }
 
@@ -138,15 +135,25 @@ fn render(callback_name: &str) -> String {
     output
 }
 
-fn write_marker(output: &mut String, marker: &str, callback_name: &str) {
-    let value = match marker {
-        "CALLBACK" => {
-            output.push_str(callback_name);
+fn write_marker(output: &mut String, marker: &str) {
+    let text = match marker {
+        "CALLBACK" => Some(bridge_protocol::VALUE_EVENT_FUNCTION),
+        "VALUE_SYMBOL" => Some(bridge_protocol::VALUE_SYMBOL),
+        "STATUS_SYMBOL" => Some(bridge_protocol::STATUS_SYMBOL),
+        "ERROR_SYMBOL" => Some(bridge_protocol::ERROR_SYMBOL),
+        "ERRNO_SYMBOL" => Some(bridge_protocol::ERRNO_SYMBOL),
+        _ => None,
+    };
 
-            return;
-        }
-        "MAX_DEPTH" => MAX_DEPTH,
-        "CHUNK_CHARS" => CHUNK_CHARACTERS,
+    if let Some(text) = text {
+        output.push_str(text);
+
+        return;
+    }
+
+    let value = match marker {
+        "MAX_DEPTH" => bridge_protocol::VALUE_MAX_DEPTH,
+        "CHUNK_CHARS" => bridge_protocol::VALUE_CHUNK_CHARACTERS,
         "BEGIN_LIST" => EventCode::BeginList as usize,
         "END_LIST" => EventCode::EndList as usize,
         "DOT" => EventCode::Dot as usize,
@@ -185,7 +192,15 @@ mod tests {
 
         assert_eq!(acadctl_lisp::validate(source), Ok(1));
         assert!(!source.contains("{{"));
-        assert!(source.contains(CALLBACK_NAME));
+        for value in [
+            bridge_protocol::VALUE_EVENT_FUNCTION,
+            bridge_protocol::VALUE_SYMBOL,
+            bridge_protocol::STATUS_SYMBOL,
+            bridge_protocol::ERROR_SYMBOL,
+            bridge_protocol::ERRNO_SYMBOL,
+        ] {
+            assert!(source.contains(value));
+        }
     }
 
     #[test]

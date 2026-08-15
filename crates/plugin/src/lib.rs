@@ -90,6 +90,15 @@ mod ffi {
         Entity,
     }
 
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeLispStatusKind {
+        Unavailable,
+        Nil,
+        True,
+        Other,
+    }
+
     struct NativeAction {
         job_id: u64,
         kind: NativeActionKind,
@@ -121,6 +130,53 @@ mod ffi {
         has_text: bool,
     }
 
+    struct NativeBridgeProtocol {
+        execution_driver_expression: String,
+        execution_driver_invocation: String,
+        begin_println_function: String,
+        value_event_function: String,
+        advance_execution_function: String,
+        finish_println_function: String,
+        source_symbol: String,
+        staged_form_symbol: String,
+        status_symbol: String,
+        error_symbol: String,
+        errno_symbol: String,
+        value_symbol: String,
+        pending_status: String,
+        value_chunk_capture_units: usize,
+    }
+
+    struct NativeLispObservation {
+        command_status: i32,
+        status_kind: NativeLispStatusKind,
+        status_read_status: i32,
+        errno_available: bool,
+        lisp_errno: i32,
+        error_available: bool,
+        error_text: String,
+        error_text_truncated: bool,
+        malformed_status: i32,
+    }
+
+    struct NativeBridgeCleanupPlan {
+        result: NativeExecutionStepResult,
+        retain_value: bool,
+    }
+
+    struct NativeBridgeStepResult {
+        result: NativeExecutionStepResult,
+        bridge_symbols_may_be_retained: bool,
+    }
+
+    struct NativeExecutionFinalizationObservation {
+        undo_group_may_be_open: bool,
+        bridge_symbols_may_be_retained: bool,
+        staged_form_may_be_retained: bool,
+        value_writer_active: bool,
+        terminal_cleanup_failed: bool,
+    }
+
     extern "Rust" {
         type NativeExecutionStep;
         type NativeValueWriter;
@@ -132,6 +188,12 @@ mod ffi {
         fn take_native_action() -> NativeAction;
 
         fn complete_native_action(job_id: u64, result: NativeActionResult);
+
+        fn complete_execution_native_action(
+            job_id: u64,
+            result: NativeActionResult,
+            observation: NativeExecutionFinalizationObservation,
+        );
 
         fn try_claim_native_action_wake() -> bool;
 
@@ -157,6 +219,24 @@ mod ffi {
 
         fn abandon_execution(job_id: u64, result: NativeExecutionStepResult) -> bool;
 
+        fn native_bridge_protocol() -> NativeBridgeProtocol;
+
+        fn interpret_lisp_observation(
+            observation: NativeLispObservation,
+            retain_value_on_success: bool,
+        ) -> NativeBridgeCleanupPlan;
+
+        fn prepare_bridge_cleanup(
+            result: NativeExecutionStepResult,
+            retain_value_on_success: bool,
+        ) -> NativeBridgeCleanupPlan;
+
+        fn complete_bridge_cleanup(
+            plan: NativeBridgeCleanupPlan,
+            cleanup_status: i32,
+            fallback_cleanup_status: i32,
+        ) -> NativeBridgeStepResult;
+
         fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter>;
 
         fn begin_eval_value(
@@ -181,12 +261,15 @@ mod ffi {
     }
 }
 
+#[path = "../bridge_protocol.rs"]
+mod bridge_protocol;
 mod documents;
 mod execution;
 mod rpc_server;
 mod scheduler;
 
 use execution::NativeExecutionStep;
+use execution::native_bridge::{BridgeCleanupPlan, LispObservation, LispStatus, NativeDiagnostic};
 use execution::value_bridge::{NativeValueWriter, ValueEvent, WriteResult};
 
 fn start_rpc_server() -> String {
@@ -203,6 +286,24 @@ fn take_native_action() -> ffi::NativeAction {
 
 fn complete_native_action(job_id: u64, result: ffi::NativeActionResult) {
     scheduler::complete_native_action(job_id, result);
+}
+
+fn complete_execution_native_action(
+    job_id: u64,
+    result: ffi::NativeActionResult,
+    observation: ffi::NativeExecutionFinalizationObservation,
+) {
+    scheduler::complete_execution_native_action(
+        job_id,
+        result,
+        scheduler::ExecutionFinalizationObservation {
+            undo_group_may_be_open: observation.undo_group_may_be_open,
+            bridge_symbols_may_be_retained: observation.bridge_symbols_may_be_retained,
+            staged_form_may_be_retained: observation.staged_form_may_be_retained,
+            value_writer_active: observation.value_writer_active,
+            terminal_cleanup_failed: observation.terminal_cleanup_failed,
+        },
+    );
 }
 
 fn try_claim_native_action_wake() -> bool {
@@ -254,7 +355,7 @@ fn execution_step_retain_value(step: &NativeExecutionStep) -> bool {
 }
 
 fn form_evaluator_source() -> &'static str {
-    execution::FORM_EVALUATOR_SOURCE
+    execution::form_evaluator_source()
 }
 
 fn eval_value_visitor_source() -> &'static str {
@@ -263,6 +364,93 @@ fn eval_value_visitor_source() -> &'static str {
 
 fn native_diagnostic_capture_units() -> usize {
     acadctl_rpc::MAX_DIAGNOSTIC_BYTES + 1
+}
+
+fn native_bridge_protocol() -> ffi::NativeBridgeProtocol {
+    ffi::NativeBridgeProtocol {
+        execution_driver_expression: bridge_protocol::execution_driver_expression(),
+        execution_driver_invocation: bridge_protocol::execution_driver_invocation(),
+        begin_println_function: bridge_protocol::BEGIN_PRINTLN_FUNCTION.into(),
+        value_event_function: bridge_protocol::VALUE_EVENT_FUNCTION.into(),
+        advance_execution_function: bridge_protocol::ADVANCE_EXECUTION_FUNCTION.into(),
+        finish_println_function: bridge_protocol::FINISH_PRINTLN_FUNCTION.into(),
+        source_symbol: bridge_protocol::SOURCE_SYMBOL.into(),
+        staged_form_symbol: bridge_protocol::STAGED_FORM_SYMBOL.into(),
+        status_symbol: bridge_protocol::STATUS_SYMBOL.into(),
+        error_symbol: bridge_protocol::ERROR_SYMBOL.into(),
+        errno_symbol: bridge_protocol::ERRNO_SYMBOL.into(),
+        value_symbol: bridge_protocol::VALUE_SYMBOL.into(),
+        pending_status: bridge_protocol::PENDING_STATUS.into(),
+        value_chunk_capture_units: bridge_protocol::NATIVE_VALUE_CHUNK_CAPTURE_UNITS,
+    }
+}
+
+fn interpret_lisp_observation(
+    observation: ffi::NativeLispObservation,
+    retain_value_on_success: bool,
+) -> ffi::NativeBridgeCleanupPlan {
+    let status = match observation.status_kind {
+        ffi::NativeLispStatusKind::Nil => LispStatus::Nil,
+        ffi::NativeLispStatusKind::True => LispStatus::True,
+        ffi::NativeLispStatusKind::Other => LispStatus::Other,
+        _ => LispStatus::Unavailable,
+    };
+    let error = observation.error_available.then_some(NativeDiagnostic {
+        text: observation.error_text,
+        truncated: observation.error_text_truncated,
+    });
+    let plan = execution::native_bridge::interpret_lisp(
+        LispObservation {
+            command_status: observation.command_status,
+            status,
+            status_read_status: observation.status_read_status,
+            errno: observation
+                .errno_available
+                .then_some(observation.lisp_errno),
+            error,
+            malformed_status: observation.malformed_status,
+        },
+        retain_value_on_success,
+    );
+
+    native_bridge_cleanup_plan(plan)
+}
+
+fn prepare_bridge_cleanup(
+    result: ffi::NativeExecutionStepResult,
+    retain_value_on_success: bool,
+) -> ffi::NativeBridgeCleanupPlan {
+    native_bridge_cleanup_plan(execution::native_bridge::prepare_cleanup(
+        execution_step_result(result),
+        retain_value_on_success,
+    ))
+}
+
+fn complete_bridge_cleanup(
+    plan: ffi::NativeBridgeCleanupPlan,
+    cleanup_status: i32,
+    fallback_cleanup_status: i32,
+) -> ffi::NativeBridgeStepResult {
+    let outcome = execution::native_bridge::complete_cleanup(
+        BridgeCleanupPlan {
+            result: execution_step_result(plan.result),
+            retain_value: plan.retain_value,
+        },
+        cleanup_status,
+            fallback_cleanup_status,
+    );
+
+    ffi::NativeBridgeStepResult {
+        result: native_execution_step_result(outcome.result),
+        bridge_symbols_may_be_retained: outcome.bridge_symbols_may_be_retained,
+    }
+}
+
+fn native_bridge_cleanup_plan(plan: BridgeCleanupPlan) -> ffi::NativeBridgeCleanupPlan {
+    ffi::NativeBridgeCleanupPlan {
+        result: native_execution_step_result(plan.result),
+        retain_value: plan.retain_value,
+    }
 }
 
 fn complete_execution_step(job_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
@@ -351,6 +539,28 @@ fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::E
     };
 
     execution::ExecutionStepResult {
+        kind,
+        native_status: result.native_status,
+        lisp_errno: result.lisp_errno,
+        detail: result.detail,
+        bridge_symbols_clear_status: result.bridge_symbols_clear_status,
+    }
+}
+
+fn native_execution_step_result(
+    result: execution::ExecutionStepResult,
+) -> ffi::NativeExecutionStepResult {
+    let kind = match result.kind {
+        execution::ExecutionStepResultKind::Success => ffi::NativeExecutionStepResultKind::Success,
+        execution::ExecutionStepResultKind::LispError => {
+            ffi::NativeExecutionStepResultKind::LispError
+        }
+        execution::ExecutionStepResultKind::NativeError => {
+            ffi::NativeExecutionStepResultKind::NativeError
+        }
+    };
+
+    ffi::NativeExecutionStepResult {
         kind,
         native_status: result.native_status,
         lisp_errno: result.lisp_errno,

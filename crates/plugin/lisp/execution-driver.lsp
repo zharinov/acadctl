@@ -1,17 +1,17 @@
 (defun acadctl:println (acadctl:value / acadctl:visitor)
-  (setq acadctl:*bridge-value* acadctl:value)
+  (setq {{VALUE_SYMBOL}} acadctl:value)
 
-  (if (acadctl:_begin-println)
+  (if ({{BEGIN_PRINTLN_FUNCTION}})
     (progn
-      (setq acadctl:visitor (read acadctl:*bridge-staged-form*))
+      (setq acadctl:visitor (read {{STAGED_FORM_SYMBOL}}))
       (eval acadctl:visitor)
-      (acadctl:_finish-println))
+      ({{FINISH_PRINTLN_FUNCTION}}))
     nil))
 
-(defun acadctl:_drive-execution (/ acadctl:continue acadctl:staged-form)
-  (while (setq acadctl:continue (acadctl:_advance-execution))
-    (setq acadctl:staged-form (read acadctl:*bridge-staged-form*))
+(defun {{DRIVE_EXECUTION_FUNCTION}} (/ acadctl:continue acadctl:staged-form)
+  (while (setq acadctl:continue ({{ADVANCE_EXECUTION_FUNCTION}}))
+    (setq acadctl:staged-form (read {{STAGED_FORM_SYMBOL}}))
     (eval acadctl:staged-form))
 
-  (setq acadctl:*bridge-staged-form* nil)
+  (setq {{STAGED_FORM_SYMBOL}} nil)
   (princ))

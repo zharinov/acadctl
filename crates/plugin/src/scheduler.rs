@@ -30,6 +30,32 @@ pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(50);
 const BUSY_RETRY_MAX: Duration = Duration::from_millis(500);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExecutionFinalizationObservation {
+    pub(crate) undo_group_may_be_open: bool,
+    pub(crate) bridge_symbols_may_be_retained: bool,
+    pub(crate) staged_form_may_be_retained: bool,
+    pub(crate) value_writer_active: bool,
+    pub(crate) terminal_cleanup_failed: bool,
+}
+
+impl ExecutionFinalizationObservation {
+    fn native_state_unproved(self) -> bool {
+        self.undo_group_may_be_open
+            || self.bridge_symbols_may_be_retained
+            || self.staged_form_may_be_retained
+            || self.value_writer_active
+            || self.terminal_cleanup_failed
+    }
+
+    fn only_symbol_cleanup_unproved(self) -> bool {
+        (self.bridge_symbols_may_be_retained || self.terminal_cleanup_failed)
+            && !self.undo_group_may_be_open
+            && !self.staged_form_may_be_retained
+            && !self.value_writer_active
+    }
+}
+
 #[cfg(test)]
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -673,14 +699,26 @@ pub fn take_native_action() -> NativeAction {
     }
 }
 
-pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionResult) {
-    bound_diagnostic(&mut result.native_detail);
-    let quarantine = matches!(
-        result.kind,
+pub fn complete_native_action(job_id: MutationJobId, result: NativeActionResult) {
+    let quarantine = native_result_requires_quarantine(result.kind);
+    complete_native_action_with_quarantine(job_id, result, quarantine);
+}
+
+fn native_result_requires_quarantine(kind: NativeActionResultKind) -> bool {
+    matches!(
+        kind,
         NativeActionResultKind::DocumentContextRestoreFailed
             | NativeActionResultKind::ExecutionBridgeFinalizationFailed
             | NativeActionResultKind::ExecutionBridgeSymbolsClearFailed
-    );
+    )
+}
+
+fn complete_native_action_with_quarantine(
+    job_id: MutationJobId,
+    mut result: NativeActionResult,
+    quarantine: bool,
+) {
+    bound_diagnostic(&mut result.native_detail);
     let (completion, pending) = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
             return;
@@ -756,6 +794,40 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
 
         let _ = completion.send(Err(Error::NativeMutationStateUnknown));
     }
+}
+
+pub(crate) fn complete_execution_native_action(
+    job_id: MutationJobId,
+    result: NativeActionResult,
+    observation: ExecutionFinalizationObservation,
+) {
+    let decision = classify_execution_finalization(result, observation);
+    complete_native_action_with_quarantine(job_id, decision.result, decision.quarantine);
+}
+
+struct ExecutionFinalizationDecision {
+    result: NativeActionResult,
+    quarantine: bool,
+}
+
+fn classify_execution_finalization(
+    mut result: NativeActionResult,
+    observation: ExecutionFinalizationObservation,
+) -> ExecutionFinalizationDecision {
+    let native_state_unproved = observation.native_state_unproved();
+    let quarantine = native_state_unproved || native_result_requires_quarantine(result.kind);
+    let preserve_symbol_failure = result.kind
+        == NativeActionResultKind::ExecutionBridgeSymbolsClearFailed
+        && observation.only_symbol_cleanup_unproved();
+
+    if native_state_unproved
+        && result.kind != NativeActionResultKind::DocumentContextRestoreFailed
+        && !preserve_symbol_failure
+    {
+        result.kind = NativeActionResultKind::ExecutionBridgeFinalizationFailed;
+    }
+
+    ExecutionFinalizationDecision { result, quarantine }
 }
 
 pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
@@ -1492,6 +1564,89 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionMode;
     use crate::execution::value_bridge::{ValueEvent, WriteResult};
+
+    #[test]
+    fn execution_finalization_classification_uses_native_facts_in_rust() {
+        let clean = classify_execution_finalization(
+            result(NativeActionResultKind::Success),
+            ExecutionFinalizationObservation::default(),
+        );
+        assert_eq!(clean.result.kind, NativeActionResultKind::Success);
+        assert!(!clean.quarantine);
+
+        for observation in [
+            ExecutionFinalizationObservation {
+                undo_group_may_be_open: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+            ExecutionFinalizationObservation {
+                bridge_symbols_may_be_retained: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+            ExecutionFinalizationObservation {
+                staged_form_may_be_retained: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+            ExecutionFinalizationObservation {
+                value_writer_active: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+            ExecutionFinalizationObservation {
+                terminal_cleanup_failed: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+        ] {
+            let retained = classify_execution_finalization(
+                result(NativeActionResultKind::ExecutionBridgeFailed),
+                observation,
+            );
+            assert_eq!(
+                retained.result.kind,
+                NativeActionResultKind::ExecutionBridgeFinalizationFailed
+            );
+            assert!(retained.quarantine);
+        }
+
+        let restore = classify_execution_finalization(
+            result(NativeActionResultKind::DocumentContextRestoreFailed),
+            ExecutionFinalizationObservation {
+                undo_group_may_be_open: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+        );
+        assert_eq!(
+            restore.result.kind,
+            NativeActionResultKind::DocumentContextRestoreFailed
+        );
+        assert!(restore.quarantine);
+
+        let retained_symbols = classify_execution_finalization(
+            result(NativeActionResultKind::ExecutionBridgeSymbolsClearFailed),
+            ExecutionFinalizationObservation {
+                bridge_symbols_may_be_retained: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+        );
+        assert_eq!(
+            retained_symbols.result.kind,
+            NativeActionResultKind::ExecutionBridgeSymbolsClearFailed
+        );
+        assert!(retained_symbols.quarantine);
+
+        let symbols_and_undo = classify_execution_finalization(
+            result(NativeActionResultKind::ExecutionBridgeSymbolsClearFailed),
+            ExecutionFinalizationObservation {
+                undo_group_may_be_open: true,
+                bridge_symbols_may_be_retained: true,
+                ..ExecutionFinalizationObservation::default()
+            },
+        );
+        assert_eq!(
+            symbols_and_undo.result.kind,
+            NativeActionResultKind::ExecutionBridgeFinalizationFailed
+        );
+        assert!(symbols_and_undo.quarantine);
+    }
 
     #[test]
     fn preserves_native_guard_outcomes_as_types() {
@@ -2353,12 +2508,17 @@ mod tests {
 
         let blocked = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
-        complete_native_action(
+        complete_execution_native_action(
             action.job_id,
             NativeActionResult {
                 kind: NativeActionResultKind::ExecutionBridgeSymbolsClearFailed,
                 native_status: 42,
                 native_detail: "reserved execution bridge state remains".into(),
+            },
+            ExecutionFinalizationObservation {
+                bridge_symbols_may_be_retained: true,
+                terminal_cleanup_failed: true,
+                ..ExecutionFinalizationObservation::default()
             },
         );
 

@@ -1,37 +1,52 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
 use bytes::Bytes;
 use output::{OutputSink, OutputStream};
 
+pub(crate) mod native_bridge;
 pub mod output;
 pub mod value;
 pub mod value_bridge;
 pub(crate) mod visitor;
 
-pub const FORM_EVALUATOR_SOURCE: &str = include_str!("../../lisp/form-evaluator.lsp");
-#[cfg(test)]
-const EXECUTION_DRIVER_SOURCE: &str = include_str!("../../lisp/execution-driver.lsp");
+static FORM_EVALUATOR_SOURCE: LazyLock<String> =
+    LazyLock::new(crate::bridge_protocol::form_evaluator_source);
+
+pub(crate) fn form_evaluator_source() -> &'static str {
+    &FORM_EVALUATOR_SOURCE
+}
+
+const DIAGNOSTIC_TRUNCATION_SUFFIX: &str = "... [truncated]";
 
 pub(crate) fn bound_diagnostic(message: &mut String) {
-    const SUFFIX: &str = "... [truncated]";
+    bound_diagnostic_with_native_truncation(message, false);
+}
 
-    if message.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES {
+fn bound_diagnostic_with_native_truncation(message: &mut String, native_truncated: bool) {
+    if !native_truncated && message.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES {
         return;
     }
 
-    let mut end = acadctl_rpc::MAX_DIAGNOSTIC_BYTES - SUFFIX.len();
+    let mut end = message
+        .len()
+        .min(acadctl_rpc::MAX_DIAGNOSTIC_BYTES - DIAGNOSTIC_TRUNCATION_SUFFIX.len());
 
     while !message.is_char_boundary(end) {
         end -= 1;
     }
 
     message.truncate(end);
-    message.push_str(SUFFIX);
+    message.push_str(DIAGNOSTIC_TRUNCATION_SUFFIX);
 }
 
 pub(crate) fn bounded_diagnostic(mut message: String) -> String {
     bound_diagnostic(&mut message);
+    message
+}
+
+pub(crate) fn bounded_native_diagnostic(mut message: String, native_truncated: bool) -> String {
+    bound_diagnostic_with_native_truncation(&mut message, native_truncated);
     message
 }
 
@@ -166,6 +181,7 @@ pub enum ExecutionStepResultKind {
     NativeError,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExecutionStepResult {
     pub kind: ExecutionStepResultKind,
     pub native_status: i32,
@@ -1131,6 +1147,13 @@ mod tests {
     }
 
     #[test]
+    fn explicit_native_truncation_is_preserved_without_padding() {
+        let message = bounded_native_diagnostic("short".into(), true);
+
+        assert_eq!(message, "short... [truncated]");
+    }
+
+    #[test]
     fn validates_source_before_native_admission() {
         assert!(
             Execution::new(
@@ -1230,12 +1253,15 @@ mod tests {
 
     #[test]
     fn embedded_evaluator_is_one_complete_form() {
-        assert_eq!(acadctl_lisp::validate(FORM_EVALUATOR_SOURCE), Ok(1));
+        assert_eq!(acadctl_lisp::validate(form_evaluator_source()), Ok(1));
     }
 
     #[test]
     fn embedded_execution_driver_contains_two_complete_definitions() {
-        assert_eq!(acadctl_lisp::validate(EXECUTION_DRIVER_SOURCE), Ok(2));
+        assert_eq!(
+            acadctl_lisp::validate(&crate::bridge_protocol::execution_driver_source()),
+            Ok(2)
+        );
     }
 
     #[test]
