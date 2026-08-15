@@ -356,11 +356,10 @@ fn validation_failure(error: SourceValidationError, source_name: SourceName) -> 
         SourceValidationError::Scan(error) => ExecFailure {
             message: error.kind.message().to_owned(),
             form_index: None,
-            location: Some(crate::exec::SourceLocation {
+            location: Some(crate::exec::SourceLocation::from_scan_error(
                 source_name,
-                line: error.line,
-                column: error.column,
-            }),
+                &error,
+            )),
             drawing_outcome: DrawingOutcome::NotStarted,
         },
     }

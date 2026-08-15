@@ -1,4 +1,4 @@
-use acadctl_lisp::ScanError;
+use acadctl_lisp::{FormSpan, ScanError};
 use acadctl_rpc::SourceName;
 
 use super::diagnostic::append_diagnostic;
@@ -70,6 +70,24 @@ pub struct SourceLocation {
     pub source_name: SourceName,
     pub line: usize,
     pub column: usize,
+}
+
+impl SourceLocation {
+    pub(crate) const fn new(source_name: SourceName, line: usize, column: usize) -> Self {
+        Self {
+            source_name,
+            line,
+            column,
+        }
+    }
+
+    pub(crate) fn from_span(source_name: SourceName, span: &FormSpan) -> Self {
+        Self::new(source_name, span.line, span.column)
+    }
+
+    pub(crate) fn from_scan_error(source_name: SourceName, error: &ScanError) -> Self {
+        Self::new(source_name, error.line, error.column)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

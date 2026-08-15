@@ -286,11 +286,10 @@ impl Exec {
                             };
 
                             if self.mode == ExecMode::Eval {
-                                self.eval_location = Some(SourceLocation {
-                                    source_name: self.source_name.clone(),
-                                    line: span.line,
-                                    column: span.column,
-                                });
+                                self.eval_location = Some(SourceLocation::from_span(
+                                    self.source_name.clone(),
+                                    &span,
+                                ));
                             }
 
                             self.form_handed_off = true;
@@ -305,11 +304,10 @@ impl Exec {
                             self.begin_unwind(UnwindCause::Failure(ExecFailure {
                                 message: error.kind.message().to_owned(),
                                 form_index: None,
-                                location: Some(SourceLocation {
-                                    source_name: self.source_name.clone(),
-                                    line: error.line,
-                                    column: error.column,
-                                }),
+                                location: Some(SourceLocation::from_scan_error(
+                                    self.source_name.clone(),
+                                    &error,
+                                )),
                                 drawing_outcome: DrawingOutcome::Unknown,
                             }));
                         }
@@ -402,11 +400,7 @@ impl Exec {
                     self.begin_unwind(UnwindCause::Failure(ExecFailure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
-                        location: Some(SourceLocation {
-                            source_name: self.source_name.clone(),
-                            line,
-                            column,
-                        }),
+                        location: Some(SourceLocation::new(self.source_name.clone(), line, column)),
                         drawing_outcome: DrawingOutcome::Unknown,
                     }));
                 } else {
@@ -610,11 +604,7 @@ impl Exec {
                         column,
                     } => (
                         Some(index),
-                        Some(SourceLocation {
-                            source_name: self.source_name.clone(),
-                            line,
-                            column,
-                        }),
+                        Some(SourceLocation::new(self.source_name.clone(), line, column)),
                     ),
                     Phase::AwaitingEmitEvalValue => (Some(1), self.eval_location.clone()),
                     _ => (None, None),
