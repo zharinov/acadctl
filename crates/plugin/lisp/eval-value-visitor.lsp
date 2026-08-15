@@ -18,19 +18,23 @@
               acadctl:text-offset)
      (setq acadctl:value acadctl:*bridge-value*)
      (setq acadctl:*bridge-value* nil)
+
      (setq acadctl:outcome
        (vl-catch-all-apply
          '(lambda ()
             (setq acadctl:continue T)
             (setq acadctl:stack (list (list 0 acadctl:value 0)))
+
             (while (and acadctl:continue acadctl:stack)
               (setq acadctl:task (car acadctl:stack))
               (setq acadctl:stack (cdr acadctl:stack))
               (setq acadctl:task-kind (car acadctl:task))
+
               (cond
                 ((= acadctl:task-kind 0)
                   (setq acadctl:current (cadr acadctl:task))
                   (setq acadctl:depth (caddr acadctl:task))
+
                   (cond
                     ((null acadctl:current)
                       (setq acadctl:continue
@@ -76,6 +80,7 @@
                                 (substr acadctl:current
                                         acadctl:text-offset
                                         {{CHUNK_CHARS}}))
+
                               (while
                                 (and acadctl:continue
                                      (/= acadctl:text ""))
@@ -90,6 +95,7 @@
                                     (substr acadctl:current
                                             acadctl:text-offset
                                             {{CHUNK_CHARS}}))))
+
                               (if acadctl:continue
                                 (setq acadctl:continue
                                   ({{CALLBACK}} {{END_STRING}} nil))))))
@@ -105,6 +111,7 @@
                                 (substr acadctl:atom-text
                                         acadctl:text-offset
                                         {{CHUNK_CHARS}}))
+
                               (while
                                 (and acadctl:continue
                                      (/= acadctl:text ""))
@@ -119,6 +126,7 @@
                                     (substr acadctl:atom-text
                                             acadctl:text-offset
                                             {{CHUNK_CHARS}}))))
+
                               (if acadctl:continue
                                 (setq acadctl:continue
                                   ({{CALLBACK}} {{END_SYMBOL}} nil))))))
@@ -149,6 +157,7 @@
                   (setq acadctl:slow (caddr acadctl:task))
                   (setq acadctl:fast (cadddr acadctl:task))
                   (setq acadctl:depth (car (cddddr acadctl:task)))
+
                   (cond
                     ((null acadctl:tail)
                       (setq acadctl:continue
@@ -200,7 +209,9 @@
                   (acadctl:_invalid-value-task)))
             T))
          '()))
+
      (setq acadctl:*bridge-errno* (getvar "ERRNO"))
+
      (if (vl-catch-all-error-p acadctl:outcome)
        (progn
          (setq acadctl:*bridge-status* nil)
@@ -209,5 +220,6 @@
        (progn
          (setq acadctl:*bridge-status* T)
          (setq acadctl:*bridge-error* nil)))))
+
   (setq acadctl:*bridge-value* nil)
   (princ))

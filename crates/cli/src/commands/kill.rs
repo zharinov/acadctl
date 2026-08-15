@@ -20,6 +20,7 @@ pub async fn run(requested_process_id: Option<ProcessId>, force: bool) -> ExitCo
         Ok(process_id) => process_id,
         Err(error) => return fail(error),
     };
+
     let process = processes
         .into_iter()
         .find(|process| process.process_id() == process_id)
@@ -27,6 +28,7 @@ pub async fn run(requested_process_id: Option<ProcessId>, force: bool) -> ExitCo
 
     if !process.request_termination(force) {
         let action = if force { "force" } else { "ask" };
+
         return fail(format!(
             "Could not {action} AutoCAD process {process_id} to quit."
         ));
@@ -69,13 +71,16 @@ fn select_process_id(
 
 async fn wait_until_stopped(process: &AutoCadProcess) -> bool {
     let deadline = Instant::now() + EXIT_TIMEOUT;
+
     loop {
         if process.has_exited() {
             return true;
         }
+
         if Instant::now() >= deadline {
             return false;
         }
+
         sleep(EXIT_POLL_INTERVAL).await;
     }
 }

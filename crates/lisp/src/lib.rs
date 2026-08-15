@@ -94,12 +94,16 @@ impl Iterator for Scanner<'_> {
         if self.finished {
             return None;
         }
+
         if let Err(error) = self.cursor.skip_trivia() {
             self.finished = true;
+
             return Some(Err(error));
         }
+
         if self.cursor.is_end() {
             self.finished = true;
+
             return None;
         }
 
@@ -109,6 +113,7 @@ impl Iterator for Scanner<'_> {
             line: self.cursor.line,
             column: self.cursor.column,
         };
+
         match self.cursor.scan_form() {
             Ok(()) => Some(Ok(FormSpan {
                 byte_end: self.cursor.byte,
@@ -141,6 +146,7 @@ impl<'a> Cursor<'a> {
 
     fn scan_form(&mut self) -> Result<(), ScanError> {
         let mut quote = None;
+
         while self.peek() == Some('\'') {
             quote.get_or_insert((self.line, self.column));
             self.advance();
@@ -149,6 +155,7 @@ impl<'a> Cursor<'a> {
 
         if self.is_end() {
             let (line, column) = quote.expect("only quoted forms reach this branch");
+
             return Err(self.error_at(ScanErrorKind::MissingQuotedForm, line, column));
         }
 
@@ -177,6 +184,7 @@ impl<'a> Cursor<'a> {
                 Some(')') => {
                     depth -= 1;
                     self.advance();
+
                     if depth == 0 {
                         return Ok(());
                     }
@@ -194,14 +202,17 @@ impl<'a> Cursor<'a> {
     fn scan_string(&mut self) -> Result<(), ScanError> {
         let start = (self.line, self.column);
         self.advance();
+
         loop {
             match self.peek() {
                 Some('"') => {
                     self.advance();
+
                     return Ok(());
                 }
                 Some('\\') => {
                     self.advance();
+
                     if self.is_end() {
                         return Err(self.error_at(
                             ScanErrorKind::UnterminatedString,
@@ -209,6 +220,7 @@ impl<'a> Cursor<'a> {
                             start.1,
                         ));
                     }
+
                     self.advance();
                 }
                 Some(_) => self.advance(),
@@ -230,7 +242,9 @@ impl<'a> Cursor<'a> {
             Some(period) if !is_decimal(token) => period,
             _ => token.len(),
         };
+
         let end = self.byte + byte_count;
+
         while self.byte < end {
             self.advance();
         }
@@ -241,9 +255,11 @@ impl<'a> Cursor<'a> {
             while self.peek().is_some_and(char::is_whitespace) {
                 self.advance();
             }
+
             if self.peek() != Some(';') {
                 return Ok(());
             }
+
             self.skip_comment()?;
         }
     }
@@ -253,6 +269,7 @@ impl<'a> Cursor<'a> {
             let start = (self.line, self.column);
             self.advance();
             self.advance();
+
             while !self.remaining().starts_with("|;") {
                 if self.is_end() {
                     return Err(self.error_at(
@@ -261,8 +278,10 @@ impl<'a> Cursor<'a> {
                         start.1,
                     ));
                 }
+
                 self.advance();
             }
+
             self.advance();
             self.advance();
         } else {
@@ -273,6 +292,7 @@ impl<'a> Cursor<'a> {
                 self.advance();
             }
         }
+
         Ok(())
     }
 
@@ -280,9 +300,11 @@ impl<'a> Cursor<'a> {
         match self.peek() {
             Some('\r') => {
                 self.byte += 1;
+
                 if self.peek() == Some('\n') {
                     self.byte += 1;
                 }
+
                 self.line += 1;
                 self.column = 1;
             }
@@ -328,29 +350,39 @@ fn is_decimal(token: &str) -> bool {
     let bytes = token.as_bytes();
     let mut cursor = usize::from(matches!(bytes.first(), Some(b'+') | Some(b'-')));
     let integer_start = cursor;
+
     while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
         cursor += 1;
     }
+
     if cursor == integer_start || bytes.get(cursor) != Some(&b'.') {
         return false;
     }
+
     cursor += 1;
+
     while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
         cursor += 1;
     }
+
     if matches!(bytes.get(cursor), Some(b'e') | Some(b'E')) {
         cursor += 1;
+
         if matches!(bytes.get(cursor), Some(b'+') | Some(b'-')) {
             cursor += 1;
         }
+
         let exponent_start = cursor;
+
         while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
             cursor += 1;
         }
+
         if cursor == exponent_start {
             return false;
         }
     }
+
     cursor == bytes.len()
 }
 

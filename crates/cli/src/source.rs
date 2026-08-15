@@ -47,12 +47,14 @@ impl SourceError {
 
 fn read_stdin(eval: bool) -> Result<SourceInput, SourceError> {
     let stdin = io::stdin();
+
     if stdin.is_terminal() {
         #[cfg(windows)]
         eprintln!("acadctl: reading AutoLISP from stdin; press Ctrl+Z, then Enter, to execute.");
         #[cfg(not(windows))]
         eprintln!("acadctl: reading AutoLISP from stdin; press Ctrl+D to execute.");
     }
+
     let bytes = read_bounded(stdin.lock()).map_err(|error| {
         SourceError::Message(format!("Could not read AutoLISP from stdin: {error}"))
     })?;
@@ -66,11 +68,13 @@ fn read_file(path: &Path, eval: bool) -> Result<SourceInput, SourceError> {
             path.to_string_lossy()
         ))
     })?;
+
     if source_name.len() > acadctl_rpc::MAX_SOURCE_NAME_BYTES {
         return Err(SourceError::Message(
             "The source path exceeds the 4 KiB limit.".into(),
         ));
     }
+
     let file = std::fs::File::open(path).map_err(|error| {
         SourceError::Message(format!("Could not read '{source_name}': {error}"))
     })?;
@@ -83,6 +87,7 @@ fn read_file(path: &Path, eval: bool) -> Result<SourceInput, SourceError> {
 fn read_bounded(mut reader: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut buffer = [0; READ_BUFFER_BYTES];
+
     while bytes.len() < MAX_RAW_SOURCE_BYTES {
         let remaining = MAX_RAW_SOURCE_BYTES - bytes.len();
         let buffer_length = remaining.min(buffer.len());
@@ -92,7 +97,9 @@ fn read_bounded(mut reader: impl Read) -> io::Result<Vec<u8>> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
+
         let needed = bytes.len() + count;
+
         if needed > bytes.capacity() {
             let capacity = if bytes.capacity() == 0 {
                 READ_BUFFER_BYTES
@@ -105,37 +112,46 @@ fn read_bounded(mut reader: impl Read) -> io::Result<Vec<u8>> {
                 .try_reserve_exact(capacity - bytes.len())
                 .map_err(|_| io::Error::other("could not allocate the source buffer"))?;
         }
+
         bytes.extend_from_slice(&buffer[..count]);
     }
+
     Ok(bytes)
 }
 
 fn validate(source_name: String, bytes: Vec<u8>, eval: bool) -> Result<SourceInput, SourceError> {
     let mut bytes = Bytes::from(bytes);
+
     if bytes.starts_with(UTF8_BOM) {
         bytes = bytes.slice(UTF8_BOM.len()..);
     }
+
     if bytes.len() > acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES {
         return Err(SourceError::Message(
             "The source exceeds the 4 MiB limit.".into(),
         ));
     }
+
     let source = std::str::from_utf8(&bytes)
         .map_err(|_| SourceError::Message("The source is not valid UTF-8.".into()))?;
+
     if source.contains('\0') {
         return Err(SourceError::Message(
             "The source contains U+0000, which AutoLISP cannot represent.".into(),
         ));
     }
+
     let form_count = acadctl_lisp::validate(source).map_err(|error| SourceError::Scan {
         source_name: source_name.clone(),
         error,
     })?;
+
     if eval && form_count != 1 {
         return Err(SourceError::Message(format!(
             "eval requires exactly one top-level form; found {form_count}."
         )));
     }
+
     Ok(SourceInput {
         name: source_name,
         bytes,
@@ -215,6 +231,7 @@ mod tests {
                 } else {
                     buffer.len()
                 };
+
                 buffer[..count].fill(b'x');
                 self.reads += 1;
                 Ok(count)

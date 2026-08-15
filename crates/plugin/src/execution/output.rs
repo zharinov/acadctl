@@ -78,10 +78,13 @@ impl OutputSink {
         if text.is_empty() {
             return emit_result(&lock(&self.shared.state));
         }
+
         while !text.is_empty() {
             let mut state = lock(&self.shared.state);
+
             loop {
                 let result = emit_result(&state);
+
                 if result != EmitResult::Written {
                     return result;
                 }
@@ -89,16 +92,19 @@ impl OutputSink {
                 let chunk_space = OUTPUT_CHUNK_BYTES - state.pending.len();
                 let buffer_space = OUTPUT_BUFFER_BYTES.saturating_sub(state.queued_bytes);
                 let byte_count = utf8_prefix_len(text, chunk_space.min(buffer_space));
+
                 if byte_count != 0 {
                     let fragment = &text[..byte_count];
                     state.pending.push_str(fragment);
                     state.queued_bytes += byte_count;
                     text = &text[byte_count..];
+
                     if state.pending.len() == OUTPUT_CHUNK_BYTES {
                         publish_pending(&mut state);
                         drop(state);
                         self.shared.data_available.notify_one();
                     }
+
                     break;
                 }
 
@@ -107,18 +113,22 @@ impl OutputSink {
                     self.shared.data_available.notify_one();
                     continue;
                 }
+
                 state = wait(&self.shared.space_available, state);
             }
         }
+
         EmitResult::Written
     }
 
     pub fn flush(&self) -> EmitResult {
         let mut state = lock(&self.shared.state);
         let result = emit_result(&state);
+
         if result == EmitResult::Written {
             publish_pending(&mut state);
         }
+
         drop(state);
         self.shared.data_available.notify_one();
         result
@@ -179,15 +189,18 @@ impl Drop for OutputSink {
         }
 
         let mut state = lock(&self.shared.state);
-        if emit_result(&state) == EmitResult::Written {
-            state.stopped = true;
-            state.ready.clear();
-            state.pending.clear();
-            state.queued_bytes = 0;
-            drop(state);
-            self.shared.space_available.notify_all();
-            self.shared.data_available.notify_one();
+
+        if emit_result(&state) != EmitResult::Written {
+            return;
         }
+
+        state.stopped = true;
+        state.ready.clear();
+        state.pending.clear();
+        state.queued_bytes = 0;
+        drop(state);
+        self.shared.space_available.notify_all();
+        self.shared.data_available.notify_one();
     }
 }
 
@@ -197,16 +210,20 @@ impl OutputStream {
             let notified = self.shared.data_available.notified();
             {
                 let mut state = lock(&self.shared.state);
+
                 if let Some(chunk) = state.ready.pop_front() {
                     state.queued_bytes -= chunk.len();
                     drop(state);
                     self.shared.space_available.notify_all();
+
                     return Some(chunk);
                 }
+
                 if state.disconnected || state.cancelled || state.stopped || state.finished {
                     return None;
                 }
             }
+
             notified.await;
         }
     }
@@ -231,9 +248,11 @@ impl Drop for OutputStream {
 
 fn utf8_prefix_len(text: &str, limit: usize) -> usize {
     let mut end = limit.min(text.len());
+
     while end != 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
+
     end
 }
 
@@ -244,11 +263,13 @@ fn publish_pending(state: &mut State) {
 
     if let Some(chunk) = state.ready.back_mut() {
         let byte_count = utf8_prefix_len(&state.pending, OUTPUT_CHUNK_BYTES - chunk.len());
+
         if byte_count != 0 {
             chunk.push_str(&state.pending[..byte_count]);
             state.pending.drain(..byte_count);
         }
     }
+
     if !state.pending.is_empty() {
         let chunk = std::mem::take(&mut state.pending);
         state.ready.push_back(chunk);
@@ -290,18 +311,22 @@ mod tests {
     #[tokio::test]
     async fn preserves_bytes_with_bounded_coalesced_chunks() {
         let (sink, mut stream) = channel();
+
         for _ in 0..100_000 {
             assert_eq!(sink.emit("x"), EmitResult::Written);
         }
+
         sink.finish();
 
         assert_eq!(sink.queued_bytes(), 100_000);
         assert_eq!(sink.queued_chunks(), 7);
         let mut output = String::new();
+
         while let Some(chunk) = stream.next_chunk().await {
             assert!(chunk.len() <= OUTPUT_CHUNK_BYTES);
             output.push_str(&chunk);
         }
+
         assert_eq!(output, "x".repeat(100_000));
     }
 
@@ -313,10 +338,12 @@ mod tests {
         sink.finish();
 
         let mut output = String::new();
+
         while let Some(chunk) = stream.next_chunk().await {
             assert!(chunk.len() <= OUTPUT_CHUNK_BYTES);
             output.push_str(&chunk);
         }
+
         assert_eq!(output, text);
     }
 
@@ -398,9 +425,11 @@ mod tests {
     #[tokio::test]
     async fn partial_fragments_are_not_messages_until_flushed() {
         let (sink, mut stream) = channel();
+
         for _ in 0..1_000 {
             assert_eq!(sink.emit("x"), EmitResult::Written);
         }
+
         assert!(
             tokio::time::timeout(Duration::from_millis(20), stream.next_chunk())
                 .await

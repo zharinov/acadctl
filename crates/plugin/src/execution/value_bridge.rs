@@ -82,10 +82,12 @@ impl NativeValueWriter {
             policy,
             result,
         };
+
         if status != EmitResult::Written {
             let failure = output_failure(policy, status);
             writer.retire(failure, result);
         }
+
         writer
     }
 
@@ -98,16 +100,20 @@ impl NativeValueWriter {
         if self.result != WriteResult::Continue {
             return self.result;
         }
+
         if !self.lease.as_ref().is_some_and(ValueOutputLease::is_open) {
             self.retire(None, WriteResult::Inactive);
+
             return self.result;
         }
+
         let Some(printer) = self.printer.as_mut() else {
             return self.fail(
                 ValueBridgeFailure::InvalidSequence,
                 WriteResult::InvalidSequence,
             );
         };
+
         let result = match event {
             ValueEvent::Invalid => Err(PrintError::InvalidSequence),
             ValueEvent::BeginList => printer.begin_list(),
@@ -133,6 +139,7 @@ impl NativeValueWriter {
             ValueEvent::Cycle => printer.cycle(),
             ValueEvent::TooDeep => printer.too_deep(),
         };
+
         self.handle(result)
     }
 
@@ -140,22 +147,27 @@ impl NativeValueWriter {
         if self.result != WriteResult::Continue {
             return self.result;
         }
+
         if !self.lease.as_ref().is_some_and(ValueOutputLease::is_open) {
             self.retire(None, WriteResult::Inactive);
+
             return self.result;
         }
+
         let Some(printer) = self.printer.take() else {
             return self.fail(
                 ValueBridgeFailure::InvalidSequence,
                 WriteResult::InvalidSequence,
             );
         };
+
         if self.policy != WriterPolicy::Inactive && printer.root_values() != 1 {
             return self.fail(
                 ValueBridgeFailure::InvalidSequence,
                 WriteResult::InvalidSequence,
             );
         }
+
         match printer.finish() {
             Ok(()) => {
                 self.retire(None, WriteResult::Continue);
@@ -190,9 +202,11 @@ impl NativeValueWriter {
 
     fn retire(&mut self, failure: Option<ValueBridgeFailure>, result: WriteResult) {
         self.printer = None;
+
         if let Some(lease) = self.lease.take() {
             lease.release(failure);
         }
+
         self.result = result;
     }
 }
@@ -420,9 +434,11 @@ mod tests {
 
     async fn collect(stream: &mut OutputStream) -> String {
         let mut output = String::new();
+
         while let Some(chunk) = stream.next_chunk().await {
             output.push_str(&chunk);
         }
+
         output
     }
 }

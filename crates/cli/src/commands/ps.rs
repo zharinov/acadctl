@@ -11,11 +11,13 @@ pub async fn run(long: bool) -> ExitCode {
         Ok(instances) => instances,
         Err(_) => return fail("Could not inspect registered AutoCAD endpoints.".into()),
     };
+
     match render(&instances, long) {
         Ok(lines) => {
             for line in lines {
                 println!("{line}");
             }
+
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
@@ -29,8 +31,10 @@ fn render(instances: &[Instance], long: bool) -> Result<Vec<String>, String> {
         .max()
         .unwrap_or(acadctl_rpc::ProcessId::MIN_HEX_WIDTH);
     let mut lines = Vec::new();
+
     for instance in instances {
         let documents = instance.documents.as_ref().map_err(query_error_message)?;
+
         for document in documents {
             lines.push(document_line(
                 instance.process_id,
@@ -40,6 +44,7 @@ fn render(instances: &[Instance], long: bool) -> Result<Vec<String>, String> {
             ));
         }
     }
+
     Ok(lines)
 }
 
@@ -59,6 +64,7 @@ fn document_line(
     } else {
         &document.display_name
     };
+
     format!(
         "{process_id:0process_id_width$X}:{}  {modified}  {mode}  {name}",
         document.id

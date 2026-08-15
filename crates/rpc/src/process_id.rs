@@ -21,6 +21,7 @@ impl ProcessId {
 
     pub const fn hex_width(self) -> usize {
         let digits = ((u32::BITS - self.0.leading_zeros()) as usize).div_ceil(4);
+
         if digits < Self::MIN_HEX_WIDTH {
             Self::MIN_HEX_WIDTH
         } else {
@@ -50,6 +51,7 @@ impl FromStr for ProcessId {
         {
             return Err(ParseProcessIdError);
         }
+
         let value = u32::from_str_radix(value, 16).map_err(|_| ParseProcessIdError)?;
         Self::new(value).ok_or(ParseProcessIdError)
     }

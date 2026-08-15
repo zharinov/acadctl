@@ -312,6 +312,7 @@ fn write_lisp_value_event(
         ffi::NativeLispPayloadKind::Entity => Payload::Entity(event.has_text.then_some(text)),
         _ => Payload::Invalid,
     };
+
     let value = execution::visitor::value_event(event.code, payload);
     native_value_write_result(writer.write(value))
 }
@@ -348,6 +349,7 @@ fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::E
         }
         _ => execution::ExecutionStepResultKind::NativeError,
     };
+
     execution::ExecutionStepResult {
         kind,
         native_status: result.native_status,

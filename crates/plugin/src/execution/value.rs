@@ -106,12 +106,16 @@ impl ValuePrinter {
                 .skipped_lists
                 .checked_add(1)
                 .ok_or(PrintError::LimitExceeded)?;
+
             return Ok(());
         }
+
         self.require_no_atom()?;
+
         if self.lists.len() == MAX_VALUE_DEPTH {
             self.too_deep()?;
             self.skipped_lists = 1;
+
             return Ok(());
         }
 
@@ -128,15 +132,19 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             self.poll_output()?;
             self.skipped_lists -= 1;
+
             return Ok(());
         }
+
         self.require_no_atom()?;
         let Some(state) = self.lists.last() else {
             return Err(PrintError::InvalidSequence);
         };
+
         if *state == ListState::AwaitingTail {
             return Err(PrintError::InvalidSequence);
         }
+
         self.lists.pop();
         self.write(")")
     }
@@ -145,13 +153,16 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         self.require_no_atom()?;
         let Some(state) = self.lists.last_mut() else {
             return Err(PrintError::InvalidSequence);
         };
+
         if *state != ListState::Values {
             return Err(PrintError::InvalidSequence);
         }
+
         *state = ListState::AwaitingTail;
         self.write(" . ")
     }
@@ -177,6 +188,7 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         self.require_no_atom()?;
         self.poll_output()?;
         self.atom = AtomState::Symbol(SymbolState::new());
@@ -187,15 +199,18 @@ impl ValuePrinter {
         if text.len() > MAX_VALUE_TEXT_BYTES || !text.chars().all(valid_symbol_character) {
             return Err(PrintError::InvalidSequence);
         }
+
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         match self.atom {
             AtomState::Symbol(_) if text.is_empty() => self.poll_output(),
             AtomState::Symbol(mut state) => {
                 if state.is_empty() {
                     self.before_value()?;
                 }
+
                 state.push(text);
                 self.atom = AtomState::Symbol(state);
                 self.write_symbol_chunk(text)
@@ -208,12 +223,15 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         let AtomState::Symbol(state) = self.atom else {
             return Err(PrintError::InvalidSequence);
         };
+
         if !state.is_valid() {
             return Err(PrintError::InvalidSequence);
         }
+
         self.poll_output()?;
         self.atom = AtomState::None;
         Ok(())
@@ -223,12 +241,15 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         self.require_no_atom()?;
         self.poll_output()?;
         self.before_value()?;
+
         if self.mode == PrintMode::Readable {
             self.write("\"")?;
         }
+
         self.atom = AtomState::String;
         Ok(())
     }
@@ -237,17 +258,21 @@ impl ValuePrinter {
         if text.len() > MAX_VALUE_TEXT_BYTES {
             return Err(PrintError::InvalidSequence);
         }
+
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         if self.atom != AtomState::String {
             return Err(PrintError::InvalidSequence);
         }
+
         if self.mode == PrintMode::Display || !text.chars().any(requires_readable_escape) {
             return self.write(text);
         }
 
         let mut escaped = String::new();
+
         for character in text.chars() {
             match character {
                 '"' => self.append_bounded(&mut escaped, "\\\"")?,
@@ -275,6 +300,7 @@ impl ValuePrinter {
                 }
             }
         }
+
         self.write(&escaped)
     }
 
@@ -282,14 +308,18 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         if self.atom != AtomState::String {
             return Err(PrintError::InvalidSequence);
         }
+
         self.poll_output()?;
         self.atom = AtomState::None;
+
         if self.mode == PrintMode::Readable {
             self.write("\"")?;
         }
+
         Ok(())
     }
 
@@ -304,9 +334,11 @@ impl ValuePrinter {
         let Some(handle) = handle else {
             return self.opaque_value(OpaqueKind::Entity, None);
         };
+
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         self.require_no_atom()?;
         self.before_value()?;
         self.write("(handent \"")?;
@@ -352,9 +384,12 @@ impl ValuePrinter {
     pub fn finish(self) -> Result<(), PrintError> {
         if self.atom != AtomState::None || !self.lists.is_empty() || self.skipped_lists != 0 {
             let _ = self.sink.flush();
+
             return Err(PrintError::InvalidSequence);
         }
+
         self.write("\n")?;
+
         match self.sink.flush() {
             EmitResult::Written => Ok(()),
             result => Err(PrintError::Output(result)),
@@ -365,6 +400,7 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         self.require_no_atom()?;
         self.before_value()?;
         self.write(text)
@@ -374,14 +410,17 @@ impl ValuePrinter {
         if self.skipped_lists != 0 {
             return self.poll_output();
         }
+
         self.require_no_atom()?;
         self.before_value()?;
         self.write("#<")?;
         self.write(kind.name())?;
+
         if let Some(payload) = payload.filter(|payload| !payload.is_empty()) {
             self.write(" ")?;
             self.write(payload)?;
         }
+
         self.write(">")
     }
 
@@ -391,8 +430,10 @@ impl ValuePrinter {
                 .root_values
                 .checked_add(1)
                 .ok_or(PrintError::LimitExceeded)?;
+
             return Ok(());
         };
+
         let write_space = match *state {
             ListState::Empty => {
                 *state = ListState::Values;
@@ -405,9 +446,11 @@ impl ValuePrinter {
             }
             ListState::Complete => return Err(PrintError::InvalidSequence),
         };
+
         if write_space {
             self.write(" ")?;
         }
+
         Ok(())
     }
 
@@ -435,6 +478,7 @@ impl ValuePrinter {
             self.write(buffer)?;
             buffer.clear();
         }
+
         buffer.push_str(text);
         Ok(())
     }
@@ -445,6 +489,7 @@ impl ValuePrinter {
         }
 
         let mut escaped = String::new();
+
         for fragment in text.split_inclusive('\\') {
             if let Some(prefix) = fragment.strip_suffix('\\') {
                 self.append_bounded(&mut escaped, prefix)?;
@@ -453,6 +498,7 @@ impl ValuePrinter {
                 self.append_bounded(&mut escaped, fragment)?;
             }
         }
+
         self.write(&escaped)
     }
 }
@@ -538,6 +584,7 @@ fn format_autolisp_real(value: f64) -> Option<String> {
     if !value.is_finite() {
         return None;
     }
+
     if value == 0.0 {
         return Some("0.0".to_owned());
     }
@@ -555,40 +602,50 @@ fn format_autolisp_real(value: f64) -> Option<String> {
     if (-4..6).contains(&exponent) {
         let decimal = exponent + 1;
         let mut result = String::with_capacity(16);
+
         if negative {
             result.push('-');
         }
+
         if decimal <= 0 {
             result.push_str("0.");
             result.extend(std::iter::repeat_n('0', (-decimal) as usize));
             result.push_str(&digits);
         } else {
             let decimal = decimal as usize;
+
             if decimal >= digits.len() {
                 result.push_str(&digits);
                 result.extend(std::iter::repeat_n('0', decimal - digits.len()));
                 result.push_str(".0");
+
                 return Some(result);
             }
+
             result.push_str(&digits[..decimal]);
             result.push('.');
             result.push_str(&digits[decimal..]);
         }
+
         trim_fraction(&mut result);
         Some(result)
     } else {
         let mut result = mantissa.to_owned();
         trim_fraction(&mut result);
         result.push('e');
+
         if exponent >= 0 {
             result.push('+');
         } else {
             result.push('-');
         }
+
         let magnitude = exponent.unsigned_abs();
+
         if magnitude < 10 {
             result.push('0');
         }
+
         result.push_str(&magnitude.to_string());
         Some(result)
     }
@@ -698,9 +755,11 @@ mod tests {
             let (sink, _stream) = channel();
             let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
             printer.begin_symbol().unwrap();
+
             for chunk in chunks {
                 printer.symbol_chunk(chunk).unwrap();
             }
+
             assert_eq!(printer.end_symbol(), Err(PrintError::InvalidSequence));
         }
 
@@ -714,9 +773,11 @@ mod tests {
             let (sink, _stream) = channel();
             let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
             printer.begin_symbol().unwrap();
+
             for chunk in chunks {
                 printer.symbol_chunk(chunk).unwrap();
             }
+
             printer.end_symbol().unwrap();
         }
     }
@@ -752,9 +813,11 @@ mod tests {
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
         printer.begin_list().unwrap();
+
         for number in [1.0, -0.0, 1.234567890123, 1.0e-12, 1.0e20] {
             printer.real(number).unwrap();
         }
+
         assert_eq!(printer.real(f64::NAN), Err(PrintError::InvalidSequence));
         assert_eq!(
             printer.real(f64::INFINITY),
@@ -795,6 +858,7 @@ mod tests {
                 Some(negative.as_str())
             );
         }
+
         assert_eq!(
             format_autolisp_real(f64::MAX).as_deref(),
             Some("1.79769e+308")
@@ -831,9 +895,11 @@ mod tests {
         let (sink, _stream) = channel();
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+
         for _ in 0..=MAX_VALUE_DEPTH {
             printer.begin_list().unwrap();
         }
+
         terminal.request_cancel();
 
         assert_eq!(
@@ -888,13 +954,17 @@ mod tests {
         let (sink, stream) = channel();
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+
         for _ in 0..=MAX_VALUE_DEPTH {
             printer.begin_list().unwrap();
         }
+
         printer.integer(1).unwrap();
+
         for _ in 0..=MAX_VALUE_DEPTH {
             printer.end_list().unwrap();
         }
+
         printer.finish().unwrap();
         terminal.finish();
 
@@ -910,9 +980,11 @@ mod tests {
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
         printer.begin_string().unwrap();
+
         for _ in 0..10_000 {
             printer.string_chunk("\"中").unwrap();
         }
+
         printer.end_string().unwrap();
         printer.finish().unwrap();
         terminal.finish();
@@ -929,9 +1001,11 @@ mod tests {
 
     async fn collect(mut stream: OutputStream) -> String {
         let mut output = String::new();
+
         while let Some(chunk) = stream.next_chunk().await {
             output.push_str(&chunk);
         }
+
         output
     }
 }

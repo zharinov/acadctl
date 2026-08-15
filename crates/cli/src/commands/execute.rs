@@ -27,13 +27,16 @@ pub async fn run(id: String, file: Option<PathBuf>, mode: ExecutionMode) -> Exit
         Ok(source) => source,
         Err(error) => {
             error.report();
+
             return ExitCode::FAILURE;
         }
     };
+
     let target = match super::target::resolve(&id) {
         Ok(target) => target,
         Err(error) => return fail(error),
     };
+
     let mut client = match tokio::time::timeout(
         EXECUTION_CONNECT_TIMEOUT,
         crate::instances::connect_execution(target.process_id),
@@ -56,14 +59,17 @@ pub async fn run(id: String, file: Option<PathBuf>, mode: ExecutionMode) -> Exit
             },
         )),
     };
+
     let diagnostics = match PipeWriter::stderr() {
         Ok(diagnostics) => diagnostics,
         Err(error) => return fail(format!("Could not start the stderr writer: {error}")),
     };
+
     let (mut interrupts, receiver) = match Interrupts::new(request, diagnostics) {
         Ok(interrupts) => interrupts,
         Err(error) => return fail(format!("Could not install the Ctrl+C handler: {error}")),
     };
+
     let outbound = stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|message| (message, receiver))
     });
@@ -73,6 +79,7 @@ pub async fn run(id: String, file: Option<PathBuf>, mode: ExecutionMode) -> Exit
             if interrupts.force_detach_requested() {
                 return unconfirmed_detach_exit(&interrupts);
             }
+
             return diagnostic_failure(&mut interrupts, response_start_error(status)).await;
         }
         ResponseStartWait::TimedOut => {
@@ -97,6 +104,7 @@ async fn receive_response(
     let mut accepted = false;
     let mut cancellation_acknowledged = false;
     let mut stdout = None;
+
     loop {
         let event =
             match wait_for_control(response.message(), interrupts, cancellation_acknowledged).await
@@ -106,17 +114,20 @@ async fn receive_response(
                     if interrupts.force_detach_requested() {
                         return unconfirmed_detach_exit(interrupts);
                     }
+
                     return lost_response(interrupts, accepted, "The execution stream ended").await;
                 }
                 ControlWait::Ready(Err(status)) => {
                     if interrupts.force_detach_requested() {
                         return unconfirmed_detach_exit(interrupts);
                     }
+
                     let detail = if status.message().is_empty() {
                         "The execution connection failed".into()
                     } else {
                         format!("The execution connection failed: {}", status.message())
                     };
+
                     return lost_response(interrupts, accepted, &detail).await;
                 }
                 ControlWait::ConfirmedDetach => return confirmed_detach_exit(interrupts),
@@ -136,10 +147,12 @@ async fn receive_response(
                 if interrupts.cancellation_requested() {
                     continue;
                 }
+
                 let writer = match stdout.get_or_insert_with(PipeWriter::stdout).as_ref() {
                     Ok(writer) => writer,
                     Err(error) => {
                         drop(response);
+
                         return diagnostic_failure(
                             interrupts,
                             format!(
@@ -149,6 +162,7 @@ async fn receive_response(
                         .await;
                     }
                 };
+
                 match wait_for_stdout(
                     writer.write(output.chunk),
                     interrupts,
@@ -159,6 +173,7 @@ async fn receive_response(
                     StdoutWait::Ready(Ok(())) => {}
                     StdoutWait::Ready(Err(error)) => {
                         drop(response);
+
                         return diagnostic_failure(
                             interrupts,
                             format!(
@@ -179,6 +194,7 @@ async fn receive_response(
                 )
                 .await;
             }
+
             Some(execution_server_event::Event::CancelAcknowledgement(acknowledgement))
                 if accepted =>
             {
@@ -220,6 +236,7 @@ async fn receive_response(
                     )
                     .await;
                 };
+
                 return match outcome {
                     execution_outcome::Outcome::Success(_)
                         if accepted && interrupts.cancellation_requested() =>
@@ -231,6 +248,7 @@ async fn receive_response(
                     execution_outcome::Outcome::Failure(failure) => {
                         report_failure(interrupts, failure, source_name).await
                     }
+
                     execution_outcome::Outcome::Success(_)
                     | execution_outcome::Outcome::Cancelled(_) => {
                         invalid_response(
@@ -256,6 +274,7 @@ async fn report_failure(
 ) -> ExitCode {
     let mut text = failure_lines(&failure, fallback_source_name).join("\n");
     text.push('\n');
+
     match write_diagnostic(interrupts, text).await {
         DiagnosticWait::Complete => ExitCode::FAILURE,
         DiagnosticWait::Interrupted => cancelled_exit(),
@@ -268,6 +287,7 @@ fn failure_lines(failure: &ExecutionFailure, fallback_source_name: &str) -> Vec<
     } else {
         &failure.message
     };
+
     match (&failure.location, failure.form_index) {
         (Some(location), Some(form_index)) => {
             let source_name = if location.source_name.is_empty() {
@@ -275,6 +295,7 @@ fn failure_lines(failure: &ExecutionFailure, fallback_source_name: &str) -> Vec<
             } else {
                 &location.source_name
             };
+
             vec![
                 format!(
                     "Execution error in {source_name}, form {form_index} (line {}).",
@@ -289,6 +310,7 @@ fn failure_lines(failure: &ExecutionFailure, fallback_source_name: &str) -> Vec<
             } else {
                 &location.source_name
             };
+
             vec![
                 format!(
                     "Read error in {source_name} (line {}, column {}).",
@@ -309,11 +331,13 @@ fn response_start_error(status: tonic::Status) -> String {
     if status.code() == Code::Unimplemented {
         return request_error_message("start the AutoLISP execution", status);
     }
+
     let detail = if status.message().is_empty() {
         String::new()
     } else {
         format!(": {}", status.message())
     };
+
     format!(
         "Could not confirm whether AutoCAD accepted the execution{detail}. The request may still have been accepted; do not retry it blindly."
     )
@@ -329,6 +353,7 @@ async fn lost_response(interrupts: &mut Interrupts, accepted: bool, detail: &str
             "{detail} before acceptance was reported. The request may still have been accepted; do not retry it blindly."
         )
     };
+
     diagnostic_failure(interrupts, message).await
 }
 
@@ -362,6 +387,7 @@ fn record_cancellation_acknowledgement(
     if *acknowledged {
         return CancellationReceipt::Duplicate;
     }
+
     match ExecutionCancelDisposition::try_from(disposition) {
         Ok(ExecutionCancelDisposition::Accepted) => {}
         Ok(ExecutionCancelDisposition::TooLate) => interrupts.notice(
@@ -371,7 +397,9 @@ fn record_cancellation_acknowledgement(
             return CancellationReceipt::Invalid;
         }
     }
+
     *acknowledged = true;
+
     if interrupts.detach_requested() {
         CancellationReceipt::Detach
     } else {
@@ -448,18 +476,23 @@ impl Interrupts {
             if signals.recv().await.is_none() {
                 return;
             }
+
             if !publish_cancel(&sender, &event_sender).await {
                 return;
             }
+
             if signals.recv().await.is_none() {
                 return;
             }
+
             if event_sender.send(Interrupt::Detach).await.is_err() {
                 return;
             }
+
             if signals.recv().await.is_none() {
                 return;
             }
+
             let _ = event_sender.send(Interrupt::ForceDetach).await;
         });
         Ok((
@@ -481,6 +514,7 @@ impl Interrupts {
             let Some(receiver) = self.receiver.as_mut() else {
                 return pending().await;
             };
+
             match receiver.recv().await {
                 Some(interrupt) => return interrupt,
                 None => self.receiver = None,
@@ -493,6 +527,7 @@ impl Interrupts {
             Interrupt::Cancel { queued } if !self.cancellation_requested => {
                 self.cancellation_requested = true;
                 self.cancel_queued = queued;
+
                 if queued {
                     self.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
                 } else {
@@ -503,6 +538,7 @@ impl Interrupts {
             }
             Interrupt::Detach if !self.detach_requested => {
                 self.detach_requested = true;
+
                 if self.cancel_queued {
                     self.notice(
                         "acadctl: detach requested; waiting for AutoCAD to acknowledge cancellation. Press Ctrl+C again to detach without confirmation.",
@@ -615,11 +651,13 @@ where
     tokio::pin!(future);
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+
     loop {
         tokio::select! {
             biased;
             interrupt = interrupts.next() => {
                 interrupts.note(interrupt);
+
                 if interrupts.force_detach_requested() {
                     return ResponseStartWait::UnconfirmedDetach;
                 }
@@ -641,14 +679,17 @@ where
     F: Future,
 {
     tokio::pin!(future);
+
     loop {
         tokio::select! {
             biased;
             interrupt = interrupts.next() => {
                 interrupts.note(interrupt);
+
                 if interrupts.force_detach_requested() {
                     return ControlWait::UnconfirmedDetach;
                 }
+
                 if cancellation_acknowledged && interrupts.detach_requested() {
                     return ControlWait::ConfirmedDetach;
                 }
@@ -678,6 +719,7 @@ where
         biased;
         interrupt = interrupts.next() => {
             interrupts.note(interrupt);
+
             if interrupts.force_detach_requested() {
                 StdoutWait::UnconfirmedDetach
             } else if cancellation_acknowledged && interrupts.detach_requested() {
@@ -721,6 +763,7 @@ impl PipeWriter {
                     .and_then(|()| writer.flush());
                 let failed = result.is_err();
                 let _ = write.completion.send(result);
+
                 if failed {
                     return;
                 }
@@ -784,9 +827,11 @@ mod tests {
             self.started.store(true, Ordering::Release);
             let (lock, condition) = &*self.release;
             let mut released = lock.lock().unwrap();
+
             while !*released {
                 released = condition.wait(released).unwrap();
             }
+
             Ok(bytes.len())
         }
 
@@ -822,6 +867,7 @@ mod tests {
             }),
             drawing_outcome: DrawingOutcome::RolledBack as i32,
         };
+
         assert_eq!(
             failure_lines(&runtime, "<stdin>"),
             [
@@ -840,6 +886,7 @@ mod tests {
             }),
             drawing_outcome: DrawingOutcome::NotStarted as i32,
         };
+
         assert_eq!(
             failure_lines(&reader, "<stdin>"),
             [
@@ -1007,6 +1054,7 @@ mod tests {
             detach_requested: false,
             force_detach_requested: false,
         };
+
         let diagnostic = tokio::spawn(async move {
             write_diagnostic(&mut interrupts, "blocked diagnostic".into()).await
         });
@@ -1097,6 +1145,7 @@ mod tests {
             detach_requested: false,
             force_detach_requested: false,
         };
+
         sender
             .send(Interrupt::Cancel { queued: true })
             .await

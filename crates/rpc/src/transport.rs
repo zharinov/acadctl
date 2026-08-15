@@ -106,6 +106,7 @@ mod platform {
     impl Listener {
         pub fn bind(process_id: ProcessId) -> io::Result<Self> {
             let path = endpoint(process_id);
+
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -137,6 +138,7 @@ mod platform {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
+
         let mut process_ids = entries
             .filter_map(Result::ok)
             .filter_map(|entry| process_id_from_file_name(entry.file_name().to_str()?))
@@ -225,6 +227,7 @@ mod platform {
 
     pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
         let name = endpoint(process_id);
+
         loop {
             match ClientOptions::new().open(&name) {
                 Ok(client) => return Ok(client),

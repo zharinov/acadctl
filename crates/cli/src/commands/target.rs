@@ -10,9 +10,11 @@ pub fn resolve(target: &str) -> Result<Target, String> {
         .split_once(':')
         .ok_or_else(|| invalid_target(target))?;
     let process_id = process_id.parse().map_err(|_| invalid_target(target))?;
+
     if document_id.len() != 4 || !document_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(invalid_target(target));
     }
+
     Ok(Target {
         process_id,
         document_id: document_id.to_ascii_uppercase(),

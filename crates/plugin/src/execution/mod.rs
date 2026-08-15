@@ -15,13 +15,17 @@ const EXECUTION_DRIVER_SOURCE: &str = include_str!("../../lisp/execution-driver.
 
 pub(crate) fn bound_diagnostic(message: &mut String) {
     const SUFFIX: &str = "... [truncated]";
+
     if message.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES {
         return;
     }
+
     let mut end = acadctl_rpc::MAX_DIAGNOSTIC_BYTES - SUFFIX.len();
+
     while !message.is_char_boundary(end) {
         end -= 1;
     }
+
     message.truncate(end);
     message.push_str(SUFFIX);
 }
@@ -208,9 +212,11 @@ impl ExecutionIo {
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if state.open_kind.is_some() || state.writer_active {
             state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
         }
+
         state.generation = state.generation.wrapping_add(1).max(1);
         state.open_kind = Some(kind);
         state.writer_active = false;
@@ -222,6 +228,7 @@ impl ExecutionIo {
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if state.open_kind != Some(kind)
             || state.failure.is_some()
             || state.writer_active
@@ -229,6 +236,7 @@ impl ExecutionIo {
         {
             return None;
         }
+
         state.writer_active = true;
         state.writer_claimed = true;
         Some(ValueOutputLease {
@@ -244,21 +252,27 @@ impl ExecutionIo {
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if state.open_kind != Some(kind) {
             state
                 .failure
                 .get_or_insert(ValueBridgeFailure::InvalidSequence);
         }
+
         state.open_kind = None;
+
         if state.writer_active {
             state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
         }
+
         state.writer_active = false;
+
         if kind == ValueOutputKind::EvalValue && !state.writer_claimed {
             state
                 .failure
                 .get_or_insert(ValueBridgeFailure::MissingValue);
         }
+
         state.failure.take()
     }
 
@@ -283,12 +297,15 @@ impl ExecutionIo {
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         if state.generation != generation || state.open_kind != Some(kind) {
             return;
         }
+
         if let Some(failure) = failure {
             state.failure.get_or_insert(failure);
         }
+
         state.writer_active = false;
     }
 
@@ -350,23 +367,29 @@ impl Execution {
         source: Bytes,
     ) -> Result<(Self, OutputStream), SourceValidationError> {
         let mut source = source;
+
         if source.starts_with(&[0xef, 0xbb, 0xbf]) {
             source = source.slice(3..);
         }
+
         if source.len() > acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES {
             return Err(SourceValidationError::SourceTooLarge);
         }
+
         let source_text =
             std::str::from_utf8(&source).map_err(|_| SourceValidationError::InvalidUtf8)?;
+
         if source_text.contains('\0') {
             return Err(SourceValidationError::NullCharacter);
         }
 
         let form_count =
             acadctl_lisp::validate(source_text).map_err(SourceValidationError::Scan)?;
+
         if mode == ExecutionMode::Eval && form_count != 1 {
             return Err(SourceValidationError::ExpectedOneForm { actual: form_count });
         }
+
         let next_scan = acadctl_lisp::scan(source_text).position();
         let empty = form_count == 0;
         let (output, stream) = output::channel();
@@ -374,9 +397,11 @@ impl Execution {
             output,
             bridge: Mutex::new(ValueBridgeState::default()),
         });
+
         if empty {
             io.output.finish();
         }
+
         Ok((
             Self {
                 mode,
@@ -453,9 +478,11 @@ impl Execution {
         if self.cancel_requested {
             return true;
         }
+
         if self.unwind.is_some() {
             return false;
         }
+
         if matches!(
             self.phase,
             Phase::AwaitingCommitUndoGroup
@@ -472,6 +499,7 @@ impl Execution {
         ) {
             return false;
         }
+
         self.cancel_requested = true;
         true
     }
@@ -487,6 +515,7 @@ impl Execution {
             location: None,
             drawing_outcome: DrawingOutcome::NotStarted,
         };
+
         match self.phase {
             Phase::BeginUndoGroup => {
                 self.outcome = Some(ExecutionOutcome::Failure(failure));
@@ -499,6 +528,7 @@ impl Execution {
                 self.unwind = Some(UnwindCause::Failure(failure));
                 self.phase = Phase::CloseEmptyUndoGroup;
             }
+
             Phase::AwaitingEvaluateForm { .. }
             | Phase::AwaitingCommitUndoGroup
             | Phase::EmitEvalValue
@@ -512,6 +542,7 @@ impl Execution {
             | Phase::Terminal
             | Phase::Done => return false,
         }
+
         true
     }
 
@@ -519,6 +550,7 @@ impl Execution {
         if self.outcome.is_some() || !matches!(self.phase, Phase::BeginUndoGroup) {
             return false;
         }
+
         self.cancel_requested = true;
         self.outcome = Some(ExecutionOutcome::Cancelled);
         self.phase = Phase::Terminal;
@@ -534,7 +566,9 @@ impl Execution {
                         self.phase = Phase::Terminal;
                         continue;
                     }
+
                     self.phase = Phase::AwaitingBeginUndoGroup;
+
                     return NativeExecutionStep::new(ExecutionStepKind::BeginUndoGroup);
                 }
                 Phase::BetweenForms => {
@@ -545,11 +579,14 @@ impl Execution {
                             self.unwind = Some(UnwindCause::Cancelled);
                             self.phase = Phase::CloseEmptyUndoGroup;
                         }
+
                         continue;
                     }
+
                     let source = std::str::from_utf8(&self.source)
                         .expect("validated execution source remains UTF-8");
                     let mut scanner = acadctl_lisp::Scanner::resume(source, self.next_scan);
+
                     match scanner.next() {
                         Some(Ok(span)) => {
                             self.next_scan = scanner.position();
@@ -560,6 +597,7 @@ impl Execution {
                                 line: span.line,
                                 column: span.column,
                             };
+
                             if self.mode == ExecutionMode::Eval {
                                 self.eval_location = Some(SourceLocation {
                                     source_name: self.source_name.clone(),
@@ -567,8 +605,10 @@ impl Execution {
                                     column: span.column,
                                 });
                             }
+
                             self.io.begin_value_output(ValueOutputKind::Println);
                             self.form_handed_off = true;
+
                             return NativeExecutionStep::form(
                                 self.source.clone(),
                                 span,
@@ -589,6 +629,7 @@ impl Execution {
                         }
                         None => {
                             self.phase = Phase::AwaitingCommitUndoGroup;
+
                             return NativeExecutionStep::new(ExecutionStepKind::CommitUndoGroup);
                         }
                     }
@@ -596,24 +637,30 @@ impl Execution {
                 Phase::EmitEvalValue => {
                     self.io.begin_value_output(ValueOutputKind::EvalValue);
                     self.phase = Phase::AwaitingEmitEvalValue;
+
                     return NativeExecutionStep::new(ExecutionStepKind::EmitEvalValue);
                 }
                 Phase::ClearRetainedEvalValue => {
                     self.phase = Phase::AwaitingClearRetainedEvalValue;
+
                     return NativeExecutionStep::new(ExecutionStepKind::ClearRetainedEvalValue);
                 }
                 Phase::CloseEmptyUndoGroup => {
                     self.phase = Phase::AwaitingCloseEmptyUndoGroup;
+
                     return NativeExecutionStep::new(ExecutionStepKind::CloseEmptyUndoGroup);
                 }
                 Phase::RollbackUndoGroup => {
                     self.phase = Phase::AwaitingRollbackUndoGroup;
+
                     return NativeExecutionStep::new(ExecutionStepKind::RollbackUndoGroup);
                 }
                 Phase::Terminal => {
                     self.phase = Phase::Done;
+
                     return NativeExecutionStep::new(ExecutionStepKind::Done);
                 }
+
                 Phase::AwaitingBeginUndoGroup
                 | Phase::AwaitingEvaluateForm { .. }
                 | Phase::AwaitingCommitUndoGroup
@@ -642,6 +689,7 @@ impl Execution {
                     let Some(UnwindCause::Failure(mut failure)) = self.unwind.take() else {
                         unreachable!("the unwind cause was just matched")
                     };
+
                     let begin = result.into_message("could not begin the undo group");
                     append_diagnostic(&mut failure.message, &begin);
                     self.outcome = Some(ExecutionOutcome::Failure(failure));
@@ -657,15 +705,18 @@ impl Execution {
                     self.phase = Phase::Terminal;
                 }
             }
+
             Phase::AwaitingEvaluateForm {
                 index,
                 line,
                 column,
             } => {
                 let bridge_failure = self.io.close_value_output(ValueOutputKind::Println);
+
                 if self.mode == ExecutionMode::Eval && result.succeeded() {
                     self.value_retained = true;
                 }
+
                 if result.primary_failed() {
                     self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                         message: result.into_message("form evaluation failed"),
@@ -679,9 +730,11 @@ impl Execution {
                     }));
                 } else if let Some(failure) = bridge_failure {
                     let mut message = failure.message().to_owned();
+
                     if let Some(cleanup) = result.bridge_symbols_clear_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
+
                     self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
                         message,
                         form_index: Some(index),
@@ -740,15 +793,18 @@ impl Execution {
                     Some(result.into_message("could not emit the eval result"))
                 } else if let Some(bridge_failure) = bridge_failure {
                     let mut message = bridge_failure.message().to_owned();
+
                     if let Some(cleanup) = result.bridge_symbols_clear_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
+
                     Some(message)
                 } else if !result.succeeded() {
                     Some(result.into_message("could not emit the eval result"))
                 } else {
                     None
                 };
+
                 if let Some(message) = failure {
                     self.outcome = Some(ExecutionOutcome::Failure(
                         self.eval_failure(message, DrawingOutcome::Committed),
@@ -757,6 +813,7 @@ impl Execution {
                     self.value_retained = false;
                     self.outcome = Some(ExecutionOutcome::Success);
                 }
+
                 self.phase = Phase::Terminal;
             }
             Phase::AwaitingClearRetainedEvalValue => {
@@ -767,12 +824,14 @@ impl Execution {
                         .into_message("could not clear the retained AutoLISP evaluator value");
                     self.record_value_cleanup_failure(cleanup);
                 }
+
                 self.phase = Phase::RollbackUndoGroup;
             }
             Phase::AwaitingCloseEmptyUndoGroup => {
                 let Some(cause) = self.unwind.take() else {
                     return false;
                 };
+
                 self.outcome = Some(match cause {
                     UnwindCause::Cancelled if result.succeeded() => ExecutionOutcome::Cancelled,
                     UnwindCause::Cancelled => ExecutionOutcome::Failure(ExecutionFailure {
@@ -797,6 +856,7 @@ impl Execution {
                 let Some(cause) = self.unwind.take() else {
                     return false;
                 };
+
                 self.outcome = Some(match cause {
                     UnwindCause::Failure(mut failure) => {
                         if result.succeeded() {
@@ -806,6 +866,7 @@ impl Execution {
                             append_diagnostic(&mut failure.message, &unwind);
                             failure.drawing_outcome = DrawingOutcome::Unknown;
                         }
+
                         ExecutionOutcome::Failure(failure)
                     }
                     UnwindCause::Cancelled => {
@@ -823,6 +884,7 @@ impl Execution {
                 });
                 self.phase = Phase::Terminal;
             }
+
             Phase::BeginUndoGroup
             | Phase::BetweenForms
             | Phase::EmitEvalValue
@@ -832,6 +894,7 @@ impl Execution {
             | Phase::Terminal
             | Phase::Done => return false,
         }
+
         true
     }
 
@@ -854,6 +917,7 @@ impl Execution {
                 UnwindCause::Failure(self.eval_failure(cleanup, DrawingOutcome::Unknown))
             }
         };
+
         self.unwind = Some(cause);
     }
 
@@ -871,6 +935,7 @@ impl Execution {
         let Some(outcome) = self.outcome.take() else {
             return false;
         };
+
         let failure = match outcome {
             ExecutionOutcome::Success => ExecutionFailure {
                 message: cleanup,
@@ -890,6 +955,7 @@ impl Execution {
                 drawing_outcome: DrawingOutcome::Unknown,
             },
         };
+
         self.outcome = Some(ExecutionOutcome::Failure(failure));
         true
     }
@@ -897,11 +963,13 @@ impl Execution {
     pub fn abandon(&mut self, result: ExecutionStepResult) -> bool {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
+
         if matches!(phase, Phase::AwaitingEvaluateForm { .. }) {
             let _ = self.io.close_value_output(ValueOutputKind::Println);
         } else if phase == Phase::AwaitingEmitEvalValue {
             let _ = self.io.close_value_output(ValueOutputKind::EvalValue);
         }
+
         let existing = self.outcome.take().or_else(|| {
             self.unwind.take().map(|cause| match cause {
                 UnwindCause::Failure(failure) => ExecutionOutcome::Failure(failure),
@@ -943,6 +1011,7 @@ impl Execution {
                     Phase::AwaitingEmitEvalValue => (Some(1), self.eval_location.clone()),
                     _ => (None, None),
                 };
+
                 ExecutionFailure {
                     message,
                     form_index,
@@ -951,12 +1020,14 @@ impl Execution {
                 }
             }
         };
+
         self.outcome = Some(ExecutionOutcome::Failure(failure));
         self.phase = if phase == Phase::Done {
             Phase::Done
         } else {
             Phase::Terminal
         };
+
         true
     }
 }
@@ -1035,6 +1106,7 @@ impl ExecutionStepResult {
         } else {
             Some(fallback.to_owned())
         };
+
         bounded_diagnostic(match (primary, cleanup) {
             (Some(primary), Some(cleanup)) => format!("{primary}; {cleanup}"),
             (Some(primary), None) => primary,
@@ -1285,6 +1357,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected committed serialization failure");
         };
+
         assert_eq!(failure.message, "value visitor failed");
         assert_eq!(failure.form_index, Some(1));
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
@@ -1305,6 +1378,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected committed serialization failure");
         };
+
         assert_eq!(
             failure.message,
             "value visitor failed; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
@@ -1325,6 +1399,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected committed serialization failure");
         };
+
         assert_eq!(
             failure.message,
             "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
@@ -1385,6 +1460,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected cleanup failure");
         };
+
         assert_eq!(failure.message, "value cleanup failed");
         assert_eq!(failure.form_index, Some(1));
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
@@ -1416,6 +1492,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected evaluation failure");
         };
+
         assert_eq!(
             failure.message,
             "bad argument type; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
@@ -1477,6 +1554,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
+
         assert_eq!(failure.message, "boom; U failed");
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Unknown);
     }
@@ -1546,6 +1624,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected commit failure");
         };
+
         assert_eq!(failure.message, "End failed");
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1610,6 +1689,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
+
         assert_eq!(failure.message, "boom; restore failed");
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Unknown);
     }
@@ -1669,6 +1749,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected failure");
         };
+
         assert_eq!(failure.message, "boom; database replaced");
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Unknown);
     }
@@ -1745,6 +1826,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected the evaluator failure");
         };
+
         assert_eq!(failure.message, "boom");
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1772,6 +1854,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected the evaluator failure");
         };
+
         assert_eq!(failure.message, "boom");
     }
 
@@ -1798,6 +1881,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected bridge failure");
         };
+
         assert_eq!(
             failure.message,
             "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
@@ -1829,6 +1913,7 @@ mod tests {
         let Some(ExecutionOutcome::Failure(failure)) = execution.outcome() else {
             panic!("expected the output bridge failure");
         };
+
         assert_eq!(
             failure.message,
             "the AutoLISP output bridge emitted an invalid value sequence"

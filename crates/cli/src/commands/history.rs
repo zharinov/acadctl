@@ -15,10 +15,12 @@ pub async fn run(id: String, direction: Direction) -> ExitCode {
         Ok(target) => target,
         Err(error) => return fail(error),
     };
+
     let mut client = match super::connect_documents(target.process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
+
     let response = match direction {
         Direction::Undo => {
             client
@@ -35,6 +37,7 @@ pub async fn run(id: String, direction: Direction) -> ExitCode {
                 .await
         }
     };
+
     let response = match response {
         Ok(response) => response.into_inner(),
         Err(status) => {
@@ -42,11 +45,14 @@ pub async fn run(id: String, direction: Direction) -> ExitCode {
                 Direction::Undo => "undo the drawing's last history step",
                 Direction::Redo => "redo the drawing's next history step",
             };
+
             return fail(request_error_message(operation, status));
         }
     };
+
     if response.document.is_none() {
         return fail("AutoCAD did not identify the updated document.".into());
     }
+
     ExitCode::SUCCESS
 }

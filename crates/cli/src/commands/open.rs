@@ -12,6 +12,7 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
         Ok(path) => path,
         Err(error) => return fail(error),
     };
+
     let process_id = match process_id {
         Some(process_id) => process_id,
         None => {
@@ -19,23 +20,28 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
                 Ok(instances) => instances,
                 Err(_) => return fail("Could not inspect running AutoCAD instances.".into()),
             };
+
             match select_instance(&instances) {
                 Ok(process_id) => process_id,
                 Err(error) => return fail(error),
             }
         }
     };
+
     let mut client = match super::connect_documents(process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
+
     let opened = match client.open(OpenRequest { path }).await {
         Ok(response) => response.into_inner(),
         Err(status) => return fail(request_error_message("open the drawing", status)),
     };
+
     let Some(document) = opened.document else {
         return fail("AutoCAD did not identify the opened document.".into());
     };
+
     println!("{process_id}:{}", document.id);
     ExitCode::SUCCESS
 }
@@ -48,9 +54,11 @@ fn drawing_path(path: &Path) -> Result<String, String> {
     {
         return Err("Only DWG drawings can be opened.".into());
     }
+
     if !path.is_file() {
         return Err(format!("Drawing '{}' does not exist.", path.display()));
     }
+
     let path = std::fs::canonicalize(path)
         .map_err(|error| format!("Could not resolve '{}': {error}", path.display()))?;
     path.into_os_string().into_string().map_err(|path| {
@@ -66,6 +74,7 @@ fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {
         .iter()
         .filter(|instance| instance.documents.is_ok())
         .collect::<Vec<_>>();
+
     match available.as_slice() {
         [instance] => Ok(instance.process_id),
         [] if instances.is_empty() => Err("AutoCAD is not running.".into()),

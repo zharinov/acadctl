@@ -161,6 +161,7 @@ impl ExecutionService for ExecutionRpc {
             Ok(request) => request,
             Err(failure) => return Ok(Response::new(terminal_response(reservation, failure))),
         };
+
         let ExecutionRequest {
             document_id,
             mode,
@@ -177,6 +178,7 @@ impl ExecutionService for ExecutionRpc {
                 )));
             }
         };
+
         let validation_source_name = source_name.clone();
         let validated = tokio::task::spawn_blocking(move || {
             (reservation, Execution::new(mode, source_name, source))
@@ -209,6 +211,7 @@ impl ExecutionService for ExecutionRpc {
                 )));
             }
         };
+
         let (job_id, output, completion) = admission.into_parts();
         let (control, control_task) = spawn_control_reader(inbound, job_id);
         let state = ExecuteResponseState {
@@ -222,6 +225,7 @@ impl ExecutionService for ExecutionRpc {
             finished: false,
             _reservation: reservation,
         };
+
         Ok(Response::new(execution_response(state)))
     }
 }
@@ -240,8 +244,10 @@ impl ExecuteResponseState {
         if self.finished {
             return Ok(None);
         }
+
         if !self.accepted_sent {
             self.accepted_sent = true;
+
             return Ok(Some(server_event(execution_server_event::Event::Accepted(
                 ExecutionAccepted {},
             ))));
@@ -285,6 +291,7 @@ impl ExecuteResponseState {
                         if let Some(event) = self.handle_control(control)? {
                             return Ok(Some(event));
                         }
+
                         continue;
                     }
                     outcome = self.completion.as_mut() => outcome,
@@ -292,8 +299,10 @@ impl ExecuteResponseState {
             } else {
                 self.completion.as_mut().await
             };
+
             self.control_task.abort();
             self.finished = true;
+
             return Ok(Some(finished_event(match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => ExecutionOutcome::Failure(scheduler_failure(error)),
@@ -338,15 +347,18 @@ fn spawn_control_reader(
     let (sender, receiver) = mpsc::channel(1);
     let task = tokio::spawn(async move {
         let mut cancel_disposition = None;
+
         loop {
             let message = match inbound.message().await {
                 Ok(Some(message)) => message,
                 Ok(None) => return,
                 Err(status) => {
                     let _ = sender.send(Err(status)).await;
+
                     return;
                 }
             };
+
             if !matches!(
                 message.message,
                 Some(execution_client_message::Message::Cancel(_))
@@ -356,12 +368,14 @@ fn spawn_control_reader(
                         "Only Cancel is valid after the execution request",
                     )))
                     .await;
+
                 return;
             }
 
             if cancel_disposition.is_some() {
                 continue;
             }
+
             let result = match crate::scheduler::cancel_execution(job_id) {
                 CancelResult::Accepted => ExecutionCancelDisposition::Accepted,
                 CancelResult::TooLate | CancelResult::NotFound => {
@@ -373,10 +387,13 @@ fn spawn_control_reader(
                             "Execution cancellation state is unavailable",
                         )))
                         .await;
+
                     return;
                 }
             };
+
             cancel_disposition = Some(result);
+
             if sender.send(Ok(result)).await.is_err() {
                 return;
             }
@@ -402,12 +419,15 @@ fn validate_execution_request(
     if !crate::documents::valid_document_id(&request.document_id) {
         return Err(failure("The document ID is invalid"));
     }
+
     if request.source_name.is_empty() {
         return Err(failure("The source name is required"));
     }
+
     if request.source_name.len() > acadctl_rpc::MAX_SOURCE_NAME_BYTES {
         return Err(failure("The source name exceeds the 4 KiB limit"));
     }
+
     Ok(request)
 }
 
@@ -477,6 +497,7 @@ fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
         | SchedulerError::MutationCapacity
         | SchedulerError::ExecutionCapacity => DrawingOutcome::NotStarted,
     };
+
     ExecutionFailure {
         message: bounded_diagnostic(error.to_string()),
         form_index: None,
@@ -493,6 +514,7 @@ fn finished_event(outcome: ExecutionOutcome) -> ExecutionServerEvent {
             execution_outcome::Outcome::Failure(rpc_failure(failure))
         }
     };
+
     server_event(execution_server_event::Event::Finished(ExecutionFinished {
         outcome: Some(RpcExecutionOutcome {
             outcome: Some(outcome),
@@ -507,6 +529,7 @@ fn rpc_failure(failure: ExecutionFailure) -> RpcExecutionFailure {
         DrawingOutcome::Committed => RpcDrawingOutcome::Committed,
         DrawingOutcome::Unknown => RpcDrawingOutcome::Unknown,
     };
+
     RpcExecutionFailure {
         message: bounded_diagnostic(failure.message),
         form_index: failure.form_index.map(|index| index as u64),
@@ -529,6 +552,7 @@ fn validate_open_path(path: &str) -> Result<(), Status> {
             "The drawing path exceeds the 32 KiB limit",
         ));
     }
+
     let path = std::path::Path::new(path);
 
     if !path.is_absolute() {
@@ -571,9 +595,11 @@ pub fn start() -> Result<(), String> {
     let mut active = SERVER
         .lock()
         .map_err(|_| "server state is unavailable".to_owned())?;
+
     if active.as_ref().is_some_and(Server::is_running) {
         return Ok(());
     }
+
     if let Some(server) = active.take() {
         server.shutdown();
     }
@@ -601,6 +627,7 @@ pub fn start() -> Result<(), String> {
 pub fn stop() {
     crate::scheduler::stop();
     let server = SERVER.lock().ok().and_then(|mut active| active.take());
+
     if let Some(server) = server {
         server.shutdown();
     }
@@ -617,6 +644,7 @@ fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), Str
         Err(error) => {
             let error = format!("could not create the async runtime: {error}");
             let _ = startup.send(Err(error));
+
             return;
         }
     };
@@ -640,21 +668,27 @@ async fn serve_until_stopped(
     startup: std_mpsc::SyncSender<Result<(), String>>,
 ) {
     let mut startup = Some(startup);
+
     loop {
         let connections = match acadctl_rpc::incoming(process_id) {
             Ok(incoming) => incoming,
             Err(error) => {
                 let error = format!("could not create the RPC endpoint: {error}");
+
                 if let Some(startup) = startup.take() {
                     let _ = startup.send(Err(error));
+
                     return;
                 }
+
                 if stopped_during_restart_backoff(&mut stop).await {
                     return;
                 }
+
                 continue;
             }
         };
+
         if startup
             .take()
             .is_some_and(|startup| startup.send(Ok(())).is_err())
@@ -680,6 +714,7 @@ async fn serve_until_stopped(
             _ = &mut serving => {}
             _ = &mut stop => return,
         }
+
         if stopped_during_restart_backoff(&mut stop).await {
             return;
         }
@@ -885,11 +920,14 @@ mod tests {
 
     async fn next_native_action() -> crate::ffi::NativeAction {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
         loop {
             let action = crate::scheduler::take_native_action();
+
             if action.kind != crate::ffi::NativeActionKind::None {
                 return action;
             }
+
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "RPC did not enqueue a native action"
@@ -947,11 +985,13 @@ mod tests {
             let Some(execution_server_event::Event::Finished(finished)) = event.event else {
                 panic!("oversized source must fail before acceptance");
             };
+
             let Some(execution_outcome::Outcome::Failure(failure)) =
                 finished.outcome.unwrap().outcome
             else {
                 panic!("oversized source must produce a structured failure");
             };
+
             assert!(failure.message.contains("4 MiB"));
             assert_eq!(
                 failure.drawing_outcome,
@@ -1102,8 +1142,10 @@ mod tests {
                 .await
                 .unwrap();
         }
+
         let mut cancel_acknowledgement_count = 0;
         let mut finished_seen = false;
+
         while let Some(event) = response.message().await.unwrap() {
             match event.event {
                 Some(execution_server_event::Event::CancelAcknowledgement(acknowledgement)) => {
@@ -1120,11 +1162,13 @@ mod tests {
                     ));
                     finished_seen = true;
                 }
+
                 Some(execution_server_event::Event::Accepted(_))
                 | Some(execution_server_event::Event::Output(_))
                 | None => panic!("unexpected execution event"),
             }
         }
+
         assert_eq!(cancel_acknowledgement_count, 1);
         assert!(finished_seen);
     }

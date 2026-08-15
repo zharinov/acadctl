@@ -54,10 +54,12 @@ impl DocumentRegistry {
         let mut seen_tokens = HashSet::with_capacity(native_documents.len());
 
         self.documents.reserve(native_documents.len());
+
         for native in native_documents {
             if !seen_tokens.insert(native.document_token) {
                 continue;
             }
+
             let id = take_document_id(&mut previous, native.document_token)
                 .unwrap_or_else(|| new_document_id(&mut reserved_ids));
             self.documents.push(TrackedDocument {
@@ -110,6 +112,7 @@ fn public_document(id: String, native: NativeDocumentSnapshot) -> Document {
     } else {
         (name, None)
     };
+
     Document {
         id,
         display_name,
@@ -146,6 +149,7 @@ fn take_document_id(documents: &mut Vec<TrackedDocument>, document_token: usize)
 fn new_document_id(reserved_ids: &mut HashSet<String>) -> String {
     loop {
         let id = nanoid::nanoid!(DOCUMENT_ID_LENGTH, &DOCUMENT_ID_ALPHABET);
+
         if reserved_ids.insert(id.clone()) {
             return id;
         }
@@ -160,6 +164,7 @@ fn document_name(mut name: String, named: bool) -> String {
     {
         name.truncate(name.len() - 4);
     }
+
     name
 }
 

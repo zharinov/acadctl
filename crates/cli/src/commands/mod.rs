@@ -53,6 +53,7 @@ fn request_error_message(operation: &str, status: Status) -> String {
         return "The acadctl plugin is outdated. Install the current version and restart AutoCAD."
             .into();
     }
+
     if status.message().is_empty() {
         format!("AutoCAD could not {operation}.")
     } else {

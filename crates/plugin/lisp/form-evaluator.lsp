@@ -9,7 +9,9 @@
               (list 'acadctl:ok (eval (car acadctl:forms)))
               (acadctl:_invalid-form-span)))
          '()))
+
      (setq acadctl:*bridge-errno* (getvar "ERRNO"))
+
      (if (vl-catch-all-error-p acadctl:outcome)
        (progn
          (setq acadctl:*bridge-status* nil)
@@ -19,5 +21,6 @@
          (setq acadctl:*bridge-value* (cadr acadctl:outcome))
          (setq acadctl:*bridge-status* T)
          (setq acadctl:*bridge-error* nil)))))
+
   (setq acadctl:*bridge-source* nil)
   (princ))

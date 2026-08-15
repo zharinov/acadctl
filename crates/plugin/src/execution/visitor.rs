@@ -123,6 +123,7 @@ pub(crate) fn value_event<'a>(code: i32, payload: Payload<'a>) -> ValueEvent<'a>
 fn render(callback_name: &str) -> String {
     let mut output = String::with_capacity(TEMPLATE.len());
     let mut remaining = TEMPLATE;
+
     while let Some(start) = remaining.find("{{") {
         output.push_str(&remaining[..start]);
         let marker = &remaining[start + 2..];
@@ -132,6 +133,7 @@ fn render(callback_name: &str) -> String {
         write_marker(&mut output, &marker[..end], callback_name);
         remaining = &marker[end + 2..];
     }
+
     output.push_str(remaining);
     output
 }
@@ -140,6 +142,7 @@ fn write_marker(output: &mut String, marker: &str, callback_name: &str) {
     let value = match marker {
         "CALLBACK" => {
             output.push_str(callback_name);
+
             return;
         }
         "MAX_DEPTH" => MAX_DEPTH,
@@ -168,6 +171,7 @@ fn write_marker(output: &mut String, marker: &str, callback_name: &str) {
         "TOO_DEEP" => EventCode::TooDeep as usize,
         _ => panic!("unknown embedded eval value visitor marker: {marker}"),
     };
+
     write!(output, "{value}").expect("writing to a String cannot fail");
 }
 
