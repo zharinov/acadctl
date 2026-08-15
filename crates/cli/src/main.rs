@@ -59,6 +59,15 @@ enum Command {
     Eval(ExecutionArgs),
     /// Execute an AutoLISP batch without implicit value output.
     Exec(ExecutionArgs),
+    /// Terminate an AutoCAD instance.
+    Kill {
+        /// Target AutoCAD process when more than one instance is running.
+        pid: Option<u32>,
+
+        /// Terminate immediately without waiting for AutoCAD to close normally.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Args)]
@@ -99,6 +108,7 @@ async fn main() -> ExitCode {
             )
             .await
         }
+        Command::Kill { pid, force } => commands::kill::run(pid, force).await,
     }
 }
 
@@ -118,9 +128,8 @@ mod tests {
     }
 
     #[test]
-    fn does_not_keep_superseded_or_unimplemented_commands() {
+    fn does_not_keep_superseded_commands() {
         assert!(Cli::try_parse_from(["acadctl", "status"]).is_err());
-        assert!(Cli::try_parse_from(["acadctl", "kill"]).is_err());
     }
 
     #[test]
@@ -170,5 +179,28 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["acadctl", "exec", "k7m2qx", "a.lsp", "b.lsp"]).is_err());
+    }
+
+    #[test]
+    fn parses_process_termination() {
+        let cli = Cli::try_parse_from(["acadctl", "kill"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Kill {
+                pid: None,
+                force: false
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["acadctl", "kill", "123", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Kill {
+                pid: Some(123),
+                force: true
+            }
+        ));
+
+        assert!(Cli::try_parse_from(["acadctl", "kill", "123", "456"]).is_err());
     }
 }

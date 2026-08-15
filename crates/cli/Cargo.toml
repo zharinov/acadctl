@@ -14,3 +14,10 @@ futures-util.workspace = true
 sysinfo.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tonic.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

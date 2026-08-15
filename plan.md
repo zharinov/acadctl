@@ -1,14 +1,14 @@
 # `acadctl eval`, `exec`, and drawing history
 
-Status: implementation and live verification are in progress. The installed private build now runs document-scoped `eval`, `exec`, `acadctl:println`, rollback, undo, and redo in AutoCAD 2027. Public release still depends on the remaining proof gates at the end of this document.
+Status: implementation and live verification are complete for the current macOS and AutoCAD 2027 target. The installed private build runs document-scoped `eval`, `exec`, `acadctl:println`, rollback, drawing-wide undo and redo, and exact process termination. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
 
 ## Current implementation checklist
 
 - [x] Bounded scanner, Rust execution state machine, output/value rendering, RPC, and CLI.
 - [x] Live document-scoped `exec`, `eval`, `acadctl:println`, readable values, Lisp diagnostics, and drawing rollback.
 - [x] Live drawing-wide `undo` and `redo`, including exact inactive-document routing and restoration of the prior active document.
-- [ ] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates.
-- [ ] Final static checks, implementation commit, first-principles naming sweep, and reconciled cleanup commit.
+- [x] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates on macOS and AutoCAD 2027.
+- [x] Final static checks, implementation commit, first-principles naming sweep, and reconciled cleanup commit.
 
 ## Design center
 
@@ -1014,3 +1014,17 @@ C++ uses `PendingDocumentDispatch` for the one queued or finalizing document-con
 Failure names state which safety proof failed: `DocumentContextFailed`, `DocumentContextRestoreFailed`, `ExecutionBridgeFinalizationFailed`, `EvaluatorSymbolsClearFailed`, and `NativeMutationStateUnknown`. Document publication is `publish_document_snapshot` at FFI, `replace_document_snapshot` in the scheduler, and `replace_snapshot` in `DocumentRegistry`; none suggests that Rust replaces live AutoCAD documents. The embedded files are `form-evaluator.lsp` and `eval-value-visitor.lsp`, avoiding a future collision between the private evaluator and a public `acadctl.lsp` standard library.
 
 The sweep retains `CommitUndoGroup`, `AwaitingCommitUndoGroup`, `PostCommitCancelled`, and `DrawingOutcome::Committed`. In Rust these names mark the semantic cancellation and outcome boundary reached when `_UNDO End` succeeds; renaming them to the literal command would obscure that role. It also retains the concise `HistoryRequest`, `HistoryResponse`, `Operation::History`, and `HistoryDirection`: each public invocation already means exactly one fixed drawing-wide step, so adding `Step` everywhere would not resolve an ambiguity. This entry supersedes the implementation names listed in I-054 and any remaining provenance-oriented naming rationale in I-003 and I-004; I-068 already supersedes that product architecture.
+
+### 2026-08-14 — I-072: process termination is an exact CLI-owned OS operation
+
+`acadctl kill [pid] [--force]` is implemented without RPC, plugin state, C++, or Lisp. The CLI enumerates only actual AutoCAD processes, selects the sole instance when no PID is supplied, requires an exact listed PID when several instances exist, and refuses an absent or non-AutoCAD PID. On macOS, graceful termination uses the normal running-application request with an exact-PID Apple-event fallback; forced termination sends the OS kill operation to that exact PID. On Windows, the cross-compiled path posts `WM_CLOSE` only to top-level windows owned by the selected PID and uses `TerminateProcess` only for explicit `--force`.
+
+Both modes wait until the selected PID disappears. Graceful termination waits at most five seconds and never escalates: if AutoCAD remains open, the command fails and tells the user how to issue a separate explicit forced request. The force path is independently selected and still verifies termination. Putting this operation behind the plugin was rejected because it must remain available when RPC or AutoCAD's main loop is unresponsive.
+
+### 2026-08-14 — I-073: the remaining macOS live gates pass
+
+Live AutoCAD 2027 testing closed the remaining current-platform gates. Cancellation during a multi-form batch returned status 130 at the next checkpoint, skipped the later form, and rolled both test entities back. Killing the attached CLI process after admission did not cancel the scheduler-owned job; its later form and both drawing mutations completed and were observed by a new client. With both stdout and stderr directed to one non-reading pipe and enough `acadctl:println` output to saturate every application buffer, Ctrl+C still reached the server, woke the blocked producer, and rolled the drawing back.
+
+A source of exactly 4 MiB crossed the real CLI, RPC, plugin scanner, and evaluator boundary successfully; one byte more was rejected locally with the specified diagnostic. A deliberately single 4 MiB string reached AutoLISP and produced AutoLISP's own `string too long on input` error, confirming that the application source limit is not falsely presented as a guarantee that every host reader form is valid. Busy admission was already proven in I-069: an action issued while AutoCAD was still completing a document command failed without cancelling that work and succeeded after quiescence.
+
+Process testing used disposable drawings. A saved drawing closed through graceful `acadctl kill` in about 2.5 seconds. With unsaved `test.dwg`, graceful kill waited the full five seconds, returned failure, and left the same process alive; only a later explicit `--force` terminated that exact PID. A separate forced request also terminated the prior exact process and subsequent selection refused the now-absent PID. The Windows CLI path compiles with the pinned target, but native Windows runtime and console-signal behavior remain a platform-specific validation task rather than evidence inferred from the macOS run.
