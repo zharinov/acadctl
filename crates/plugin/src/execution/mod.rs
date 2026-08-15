@@ -139,6 +139,26 @@ pub struct ExecutionFailure {
     pub drawing_outcome: DrawingOutcome,
 }
 
+impl ExecutionFailure {
+    pub(crate) fn not_started(message: String) -> Self {
+        Self {
+            message,
+            form_index: None,
+            location: None,
+            drawing_outcome: DrawingOutcome::NotStarted,
+        }
+    }
+
+    fn unknown_drawing_outcome(message: String) -> Self {
+        Self {
+            message,
+            form_index: None,
+            location: None,
+            drawing_outcome: DrawingOutcome::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceLocation {
     pub source_name: String,
@@ -525,12 +545,7 @@ impl Execution {
             return false;
         }
 
-        let failure = ExecutionFailure {
-            message,
-            form_index: None,
-            location: None,
-            drawing_outcome: DrawingOutcome::NotStarted,
-        };
+        let failure = ExecutionFailure::not_started(message);
 
         match self.phase {
             Phase::BeginUndoGroup => {
@@ -712,12 +727,9 @@ impl Execution {
                     self.phase = Phase::Terminal;
                 } else {
                     self.unwind = None;
-                    self.outcome = Some(ExecutionOutcome::Failure(ExecutionFailure {
-                        message: result.into_message("could not begin the undo group"),
-                        form_index: None,
-                        location: None,
-                        drawing_outcome: DrawingOutcome::NotStarted,
-                    }));
+                    self.outcome = Some(ExecutionOutcome::Failure(ExecutionFailure::not_started(
+                        result.into_message("could not begin the undo group"),
+                    )));
                     self.phase = Phase::Terminal;
                 }
             }
@@ -795,12 +807,11 @@ impl Execution {
                         self.phase = Phase::Terminal;
                     }
                 } else {
-                    self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
-                        message: result.into_message("could not finish the undo group"),
-                        form_index: None,
-                        location: None,
-                        drawing_outcome: DrawingOutcome::Unknown,
-                    }));
+                    self.begin_unwind(UnwindCause::Failure(
+                        ExecutionFailure::unknown_drawing_outcome(
+                            result.into_message("could not finish the undo group"),
+                        ),
+                    ));
                 }
             }
             Phase::AwaitingEmitEvalValue => {
@@ -850,12 +861,11 @@ impl Execution {
 
                 self.outcome = Some(match cause {
                     UnwindCause::Cancelled if result.succeeded() => ExecutionOutcome::Cancelled,
-                    UnwindCause::Cancelled => ExecutionOutcome::Failure(ExecutionFailure {
-                        message: result.into_message("could not close the cancelled undo group"),
-                        form_index: None,
-                        location: None,
-                        drawing_outcome: DrawingOutcome::Unknown,
-                    }),
+                    UnwindCause::Cancelled => {
+                        ExecutionOutcome::Failure(ExecutionFailure::unknown_drawing_outcome(
+                            result.into_message("could not close the cancelled undo group"),
+                        ))
+                    }
                     UnwindCause::Failure(failure) if result.succeeded() => {
                         ExecutionOutcome::Failure(failure)
                     }
@@ -889,12 +899,9 @@ impl Execution {
                         if result.succeeded() {
                             ExecutionOutcome::Cancelled
                         } else {
-                            ExecutionOutcome::Failure(ExecutionFailure {
-                                message: result.into_message("drawing unwind failed"),
-                                form_index: None,
-                                location: None,
-                                drawing_outcome: DrawingOutcome::Unknown,
-                            })
+                            ExecutionOutcome::Failure(ExecutionFailure::unknown_drawing_outcome(
+                                result.into_message("drawing unwind failed"),
+                            ))
                         }
                     }
                 });
@@ -953,23 +960,13 @@ impl Execution {
         };
 
         let failure = match outcome {
-            ExecutionOutcome::Success => ExecutionFailure {
-                message: cleanup,
-                form_index: None,
-                location: None,
-                drawing_outcome: DrawingOutcome::Unknown,
-            },
+            ExecutionOutcome::Success => ExecutionFailure::unknown_drawing_outcome(cleanup),
             ExecutionOutcome::Failure(mut failure) => {
                 append_diagnostic(&mut failure.message, &cleanup);
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
-            ExecutionOutcome::Cancelled => ExecutionFailure {
-                message: cleanup,
-                form_index: None,
-                location: None,
-                drawing_outcome: DrawingOutcome::Unknown,
-            },
+            ExecutionOutcome::Cancelled => ExecutionFailure::unknown_drawing_outcome(cleanup),
         };
 
         self.outcome = Some(ExecutionOutcome::Failure(failure));
@@ -993,23 +990,13 @@ impl Execution {
             })
         });
         let failure = match existing {
-            Some(ExecutionOutcome::Success) => ExecutionFailure {
-                message,
-                form_index: None,
-                location: None,
-                drawing_outcome: DrawingOutcome::Unknown,
-            },
+            Some(ExecutionOutcome::Success) => ExecutionFailure::unknown_drawing_outcome(message),
             Some(ExecutionOutcome::Failure(mut failure)) => {
                 append_diagnostic(&mut failure.message, &message);
                 failure.drawing_outcome = DrawingOutcome::Unknown;
                 failure
             }
-            Some(ExecutionOutcome::Cancelled) => ExecutionFailure {
-                message,
-                form_index: None,
-                location: None,
-                drawing_outcome: DrawingOutcome::Unknown,
-            },
+            Some(ExecutionOutcome::Cancelled) => ExecutionFailure::unknown_drawing_outcome(message),
             None => {
                 let (form_index, location) = match phase {
                     Phase::AwaitingEvaluateForm {

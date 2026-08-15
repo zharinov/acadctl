@@ -455,12 +455,7 @@ fn validation_failure(error: SourceValidationError, source_name: String) -> Exec
 }
 
 fn failure(message: impl Into<String>) -> ExecutionFailure {
-    ExecutionFailure {
-        message: bounded_diagnostic(message.into()),
-        form_index: None,
-        location: None,
-        drawing_outcome: DrawingOutcome::NotStarted,
-    }
+    ExecutionFailure::not_started(bounded_diagnostic(message.into()))
 }
 
 fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
