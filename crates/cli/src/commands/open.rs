@@ -5,7 +5,7 @@ use acadctl_rpc::{DrawingPath, OpenRequest, ProcessId};
 
 use crate::instance::Instance;
 
-use super::{fail, query_error_message, request_error_message};
+use super::{fail, parse_document_id, query_error_message, request_error_message};
 
 pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
     let path = match DrawingPath::canonicalize(&path) {
@@ -41,8 +41,12 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
     let Some(document) = opened.document else {
         return fail("AutoCAD did not identify the opened document.".into());
     };
+    let document_id = match parse_document_id(document.id) {
+        Ok(id) => id,
+        Err(error) => return fail(error),
+    };
 
-    println!("{process_id}:{}", document.id);
+    println!("{process_id}:{document_id}");
     ExitCode::SUCCESS
 }
 

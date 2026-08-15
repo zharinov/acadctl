@@ -1,4 +1,5 @@
 use acadctl_lisp::ScanError;
+use acadctl_rpc::SourceName;
 
 use super::diagnostic::append_diagnostic;
 
@@ -66,7 +67,7 @@ impl ExecFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceLocation {
-    pub source_name: String,
+    pub source_name: SourceName,
     pub line: usize,
     pub column: usize,
 }

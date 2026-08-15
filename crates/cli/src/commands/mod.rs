@@ -5,7 +5,7 @@ pub mod kill;
 pub mod open;
 pub mod ps;
 pub mod save;
-mod target;
+pub(crate) mod target;
 
 use std::process::ExitCode;
 
@@ -59,4 +59,9 @@ fn request_error_message(operation: &str, status: Status) -> String {
     } else {
         status.message().to_owned()
     }
+}
+
+fn parse_document_id(id: u32) -> Result<acadctl_rpc::DocId, String> {
+    id.try_into()
+        .map_err(|_| "AutoCAD returned an invalid document ID.".to_owned())
 }

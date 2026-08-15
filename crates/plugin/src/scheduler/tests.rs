@@ -3,6 +3,10 @@ use super::*;
 use crate::exec::ExecMode;
 use crate::exec::value::writer::{ValueEvent, WriteResult};
 
+fn source_name(value: &str) -> acadctl_rpc::SourceName {
+    acadctl_rpc::SourceName::new(value).unwrap()
+}
+
 #[test]
 fn execution_finalization_classification_uses_native_facts_in_rust() {
     let clean = classify_execution_finalization(
@@ -248,7 +252,7 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
-        Exec::new(ExecMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -311,7 +315,8 @@ async fn queued_cancellation_removes_only_that_execution() {
     let save_action = take_native_action();
     assert_eq!(save_action.kind, NativeActionKind::Save);
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
     let job_id = SCHEDULER
@@ -344,7 +349,8 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
     let save_action = take_native_action();
     assert_eq!(save_action.kind, NativeActionKind::Save);
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, queued) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
     let job_id = SCHEDULER
@@ -377,7 +383,8 @@ async fn wake_failure_stops_a_pending_execution_output_stream() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -394,7 +401,8 @@ async fn active_cancellation_rolls_back_after_the_current_form() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -434,7 +442,8 @@ async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group()
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -466,7 +475,8 @@ async fn cancellation_after_commit_handoff_does_not_cancel_output() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -504,7 +514,8 @@ async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -540,7 +551,8 @@ async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let (mut output, executing) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -592,7 +604,8 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "ok".into()).unwrap();
     let (_output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -678,7 +691,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
-        Exec::new(ExecMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
     let (_output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
@@ -744,7 +757,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
             message: "could not clear the retained AutoLISP value".into(),
             form_index: Some(1),
             location: Some(crate::exec::SourceLocation {
-                source_name: "inspect.lsp".into(),
+                source_name: source_name("inspect.lsp"),
                 line: 1,
                 column: 1,
             }),
@@ -770,7 +783,8 @@ async fn queued_execution_expires_without_starting_a_form() {
     let save_action = take_native_action();
     assert_eq!(save_action.kind, NativeActionKind::Save);
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, mut output, completion) = admission.into_parts();
     {
@@ -808,7 +822,8 @@ async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
 
@@ -836,7 +851,8 @@ async fn deadline_wins_while_the_busy_probe_is_in_flight() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
     let action = take_native_action();
@@ -866,7 +882,8 @@ async fn deadline_winner_survives_a_native_preflight_failure() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
     assert_eq!(take_native_action().kind, NativeActionKind::QueueExecDriver);
@@ -896,7 +913,8 @@ async fn deadline_winner_survives_a_failing_begin_step() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
     assert_eq!(take_native_action().kind, NativeActionKind::QueueExecDriver);
@@ -953,11 +971,12 @@ async fn execution_count_capacity_is_released_by_queued_cancellation() {
 
     for _ in 0..MAX_ADMITTED_EXECUTIONS {
         let (execution, output) =
-            Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+            Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
         admissions.push(admit_test_execution(id, execution, output).unwrap());
     }
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     assert!(matches!(
         admit_test_execution(id, execution, output),
         Err(Error::ExecCapacity)
@@ -969,7 +988,8 @@ async fn execution_count_capacity_is_released_by_queued_cancellation() {
         assert_eq!(completion.wait().await.unwrap(), ExecOutcome::Cancelled);
     }
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let replacement = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = replacement.into_parts();
     assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
@@ -983,7 +1003,8 @@ async fn detached_execution_retains_its_shared_admission_reservation() {
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let response_reservation = try_reserve_execution().unwrap();
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_execution(id, execution, output, response_reservation.clone()).unwrap();
     let (job_id, output, completion) = admission.into_parts();
     drop(output);
@@ -1008,7 +1029,8 @@ async fn queued_cancel_and_deadline_have_one_serialized_winner() {
     reset(vec![document(1, 101, false)]);
     let id = list().unwrap()[0].id;
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (expired_id, _output, expired_completion) = admission.into_parts();
     {
@@ -1031,7 +1053,8 @@ async fn queued_cancel_and_deadline_have_one_serialized_winner() {
         })
     ));
 
-    let (execution, output) = Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (cancelled_id, _output, cancelled_completion) = admission.into_parts();
     assert_eq!(cancel_execution(cancelled_id), CancelResult::Accepted);

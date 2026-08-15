@@ -12,6 +12,7 @@ crate-type = ["staticlib"]
 acadctl-lisp = { path = "../lisp" }
 acadctl-rpc = { path = "../rpc" }
 bytes.workspace = true
+camino.workspace = true
 cxx.workspace = true
 futures-util.workspace = true
 nanoid.workspace = true

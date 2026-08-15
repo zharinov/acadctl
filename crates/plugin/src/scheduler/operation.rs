@@ -42,20 +42,22 @@ pub(super) enum OperationOutcome {
 
 pub(super) enum Prepared {
     Immediate(Result<OperationOutcome, Error>),
-    Native(NativeAction),
+    Native(NativeRequest),
+}
+
+pub(super) enum NativeRequest {
+    Open(DrawingPath),
+    Save(NativeDocKey),
+    Close { target: NativeDocKey, discard: bool },
+    Undo(NativeDocKey),
+    Redo(NativeDocKey),
+    QueueExecDriver(NativeDocKey),
 }
 
 pub(super) fn prepare(operation: &Operation, documents: &DocRegistry) -> Prepared {
     match operation {
         Operation::Open { path } => documents.find_by_path(path).map_or_else(
-            || {
-                Prepared::Native(native_action(
-                    NativeActionKind::Open,
-                    None,
-                    path.as_str().to_owned(),
-                    false,
-                ))
-            },
+            || Prepared::Native(NativeRequest::Open(path.clone())),
             |target| Prepared::Immediate(Ok(OperationOutcome::Doc(target.document))),
         ),
         Operation::Save { id } => match documents.find_by_id(*id) {
@@ -66,24 +68,17 @@ pub(super) fn prepare(operation: &Operation, documents: &DocRegistry) -> Prepare
             Some(target) if target.document.modified && !discard => {
                 Prepared::Immediate(Err(Error::Dirty(*id)))
             }
-            Some(target) => Prepared::Native(native_action(
-                NativeActionKind::Close,
-                Some(target.native_key),
-                String::new(),
-                *discard,
-            )),
+            Some(target) => Prepared::Native(NativeRequest::Close {
+                target: target.native_key,
+                discard: *discard,
+            }),
             None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
         },
         Operation::History { id, direction } => match documents.find_by_id(*id) {
-            Some(target) => Prepared::Native(native_action(
-                match direction {
-                    HistoryDirection::Undo => NativeActionKind::Undo,
-                    HistoryDirection::Redo => NativeActionKind::Redo,
-                },
-                Some(target.native_key),
-                String::new(),
-                false,
-            )),
+            Some(target) => Prepared::Native(match direction {
+                HistoryDirection::Undo => NativeRequest::Undo(target.native_key),
+                HistoryDirection::Redo => NativeRequest::Redo(target.native_key),
+            }),
             None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
         },
         Operation::Execute { id, execution } => match documents.find_by_id(*id) {
@@ -95,12 +90,7 @@ pub(super) fn prepare(operation: &Operation, documents: &DocRegistry) -> Prepare
                         .clone(),
                 )))
             }
-            Some(target) => Prepared::Native(native_action(
-                NativeActionKind::QueueExecDriver,
-                Some(target.native_key),
-                String::new(),
-                false,
-            )),
+            Some(target) => Prepared::Native(NativeRequest::QueueExecDriver(target.native_key)),
             None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
         },
     }
@@ -111,7 +101,7 @@ pub(super) fn prepare_save(id: DocId, target: DocTarget) -> Prepared {
         return Prepared::Immediate(Err(Error::ReadOnly(id)));
     }
 
-    let Some(file_path) = target.document.file_path.as_deref() else {
+    let Some(file_path) = target.document.file_path() else {
         return Prepared::Immediate(Err(Error::Unnamed(id)));
     };
 
@@ -123,12 +113,7 @@ pub(super) fn prepare_save(id: DocId, target: DocTarget) -> Prepared {
         return Prepared::Immediate(Ok(OperationOutcome::Doc(target.document)));
     }
 
-    Prepared::Native(native_action(
-        NativeActionKind::Save,
-        Some(target.native_key),
-        String::new(),
-        false,
-    ))
+    Prepared::Native(NativeRequest::Save(target.native_key))
 }
 
 pub(super) fn finalize(
@@ -223,23 +208,42 @@ pub(super) fn complete_operation(
     finalize(operation, documents, native_target)
 }
 
-pub(super) fn native_action(
-    kind: NativeActionKind,
-    target: Option<NativeDocKey>,
-    path: String,
-    discard: bool,
-) -> NativeAction {
-    let target = target.unwrap_or(NativeDocKey {
-        document_token: 0,
-        database_token: 0,
-    });
-    NativeAction {
-        job_id: 0,
-        kind,
-        document_token: target.document_token,
-        database_token: target.database_token,
-        path,
-        discard,
+impl NativeRequest {
+    pub(super) fn into_action(self, job_id: u64) -> (NativeAction, Option<NativeDocKey>) {
+        let (kind, target, path, discard) = match self {
+            Self::Open(path) => (NativeActionKind::Open, None, path.into_string(), false),
+            Self::Save(target) => (NativeActionKind::Save, Some(target), String::new(), false),
+            Self::Close { target, discard } => (
+                NativeActionKind::Close,
+                Some(target),
+                String::new(),
+                discard,
+            ),
+            Self::Undo(target) => (NativeActionKind::Undo, Some(target), String::new(), false),
+            Self::Redo(target) => (NativeActionKind::Redo, Some(target), String::new(), false),
+            Self::QueueExecDriver(target) => (
+                NativeActionKind::QueueExecDriver,
+                Some(target),
+                String::new(),
+                false,
+            ),
+        };
+        let native_target = target.unwrap_or(NativeDocKey {
+            document_token: 0,
+            database_token: 0,
+        });
+
+        (
+            NativeAction {
+                job_id,
+                kind,
+                document_token: native_target.document_token,
+                database_token: native_target.database_token,
+                path,
+                discard,
+            },
+            target,
+        )
     }
 }
 

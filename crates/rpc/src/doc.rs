@@ -1,8 +1,9 @@
 use std::fmt;
+use std::num::NonZeroU16;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DocId(u16);
+pub struct DocId(NonZeroU16);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseDocIdError;
@@ -10,18 +11,36 @@ pub struct ParseDocIdError;
 impl DocId {
     pub const HEX_WIDTH: usize = 4;
 
-    pub const fn new(value: u16) -> Self {
-        Self(value)
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
     }
 
     pub const fn get(self) -> u16 {
-        self.0
+        self.0.get()
+    }
+}
+
+impl From<DocId> for u32 {
+    fn from(value: DocId) -> Self {
+        value.get().into()
+    }
+}
+
+impl TryFrom<u32> for DocId {
+    type Error = ParseDocIdError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        let value = u16::try_from(value).map_err(|_| ParseDocIdError)?;
+        Self::new(value).ok_or(ParseDocIdError)
     }
 }
 
 impl fmt::Display for DocId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:04X}", self.0)
+        write!(formatter, "{:04X}", self.get())
     }
 }
 
@@ -33,15 +52,14 @@ impl FromStr for DocId {
             return Err(ParseDocIdError);
         }
 
-        u16::from_str_radix(value, 16)
-            .map(Self)
-            .map_err(|_| ParseDocIdError)
+        let value = u16::from_str_radix(value, 16).map_err(|_| ParseDocIdError)?;
+        Self::new(value).ok_or(ParseDocIdError)
     }
 }
 
 impl fmt::Display for ParseDocIdError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected a document ID of exactly 4 hexadecimal digits")
+        formatter.write_str("expected a nonzero document ID of exactly 4 hexadecimal digits")
     }
 }
 
@@ -53,21 +71,29 @@ mod tests {
 
     #[test]
     fn formats_as_four_uppercase_hexadecimal_digits() {
-        assert_eq!(DocId::new(0).to_string(), "0000");
-        assert_eq!(DocId::new(0x2A79).to_string(), "2A79");
-        assert_eq!(DocId::new(u16::MAX).to_string(), "FFFF");
+        assert_eq!(DocId::new(0x2A79).unwrap().to_string(), "2A79");
+        assert_eq!(DocId::new(u16::MAX).unwrap().to_string(), "FFFF");
     }
 
     #[test]
     fn parses_case_insensitively_and_normalizes_on_display() {
-        assert_eq!("2a79".parse(), Ok(DocId::new(0x2A79)));
-        assert_eq!("0000".parse(), Ok(DocId::new(0)));
+        assert_eq!("2a79".parse(), Ok(DocId::new(0x2A79).unwrap()));
     }
 
     #[test]
     fn rejects_values_outside_the_public_shape() {
-        for value in ["", "2A7", "02A79", "2A7G", "+A79", " A79"] {
+        assert_eq!(DocId::new(0), None);
+
+        for value in ["", "0000", "2A7", "02A79", "2A7G", "+A79", " A79"] {
             assert!(value.parse::<DocId>().is_err(), "accepted {value:?}");
         }
+    }
+
+    #[test]
+    fn converts_to_and_from_the_wire_integer() {
+        assert_eq!(u32::from(DocId::new(0x2A79).unwrap()), 0x2A79);
+        assert_eq!(DocId::try_from(0x2A79), Ok(DocId::new(0x2A79).unwrap()));
+        assert!(DocId::try_from(0).is_err());
+        assert!(DocId::try_from(u32::from(u16::MAX) + 1).is_err());
     }
 }

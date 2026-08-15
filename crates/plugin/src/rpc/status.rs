@@ -3,8 +3,8 @@ use tonic::Status;
 
 use crate::scheduler::Error as SchedulerError;
 
-pub(super) fn parse_document_id(id: &str) -> Result<DocId, Status> {
-    id.parse()
+pub(super) fn parse_document_id(id: u32) -> Result<DocId, Status> {
+    id.try_into()
         .map_err(|_| Status::invalid_argument("The document ID is invalid"))
 }
 

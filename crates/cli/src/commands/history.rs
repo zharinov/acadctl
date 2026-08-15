@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::HistoryRequest;
 
-use super::{fail, request_error_message};
+use super::{fail, request_error_message, target::Target};
 
 #[derive(Clone, Copy)]
 pub enum Direction {
@@ -10,12 +10,7 @@ pub enum Direction {
     Redo,
 }
 
-pub async fn run(id: String, direction: Direction) -> ExitCode {
-    let target = match super::target::resolve(&id) {
-        Ok(target) => target,
-        Err(error) => return fail(error),
-    };
-
+pub async fn run(target: Target, direction: Direction) -> ExitCode {
     let mut client = match super::connect_documents(target.process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),

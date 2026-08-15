@@ -1,8 +1,9 @@
 use std::fmt;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessId(u32);
+pub struct ProcessId(NonZeroU32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseProcessIdError;
@@ -12,15 +13,18 @@ impl ProcessId {
     pub const MAX_HEX_WIDTH: usize = 8;
 
     pub const fn new(value: u32) -> Option<Self> {
-        if value == 0 { None } else { Some(Self(value)) }
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
     }
 
     pub const fn get(self) -> u32 {
-        self.0
+        self.0.get()
     }
 
     pub const fn hex_width(self) -> usize {
-        let digits = ((u32::BITS - self.0.leading_zeros()) as usize).div_ceil(4);
+        let digits = ((u32::BITS - self.get().leading_zeros()) as usize).div_ceil(4);
 
         if digits < Self::MIN_HEX_WIDTH {
             Self::MIN_HEX_WIDTH
@@ -32,13 +36,13 @@ impl ProcessId {
 
 impl fmt::Display for ProcessId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:04X}", self.0)
+        write!(formatter, "{:04X}", self.get())
     }
 }
 
 impl fmt::UpperHex for ProcessId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::UpperHex::fmt(&self.0, formatter)
+        fmt::UpperHex::fmt(&self.get(), formatter)
     }
 }
 
@@ -86,6 +90,8 @@ mod tests {
 
     #[test]
     fn rejects_values_outside_the_public_shape() {
+        assert_eq!(ProcessId::new(0), None);
+
         for value in ["", "123", "0000", "000000000", "12G4", "+1234", " 1234"] {
             assert!(value.parse::<ProcessId>().is_err(), "accepted {value:?}");
         }

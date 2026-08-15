@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use acadctl_lisp::{FormSpan, ScanPosition};
+use acadctl_rpc::SourceName;
 use bytes::Bytes;
 
 use super::diagnostic::{append_diagnostic, bounded_diagnostic};
@@ -13,7 +14,7 @@ use super::{ExecStepKind, ExecStepResult, ExecStepResultKind};
 
 pub struct Exec {
     mode: ExecMode,
-    source_name: String,
+    source_name: SourceName,
     source: Bytes,
     next_scan: ScanPosition,
     next_form_index: usize,
@@ -65,7 +66,7 @@ enum UnwindCause {
 impl Exec {
     pub fn new(
         mode: ExecMode,
-        source_name: String,
+        source_name: SourceName,
         source: Bytes,
     ) -> Result<(Self, OutputStream), SourceValidationError> {
         let mut source = source;
@@ -397,18 +398,7 @@ impl Exec {
                     self.value_retained = true;
                 }
 
-                if result.primary_failed() {
-                    self.begin_unwind(UnwindCause::Failure(ExecFailure {
-                        message: result.into_message("form evaluation failed"),
-                        form_index: Some(index),
-                        location: Some(SourceLocation {
-                            source_name: self.source_name.clone(),
-                            line,
-                            column,
-                        }),
-                        drawing_outcome: DrawingOutcome::Unknown,
-                    }));
-                } else if !result.succeeded() {
+                if !result.succeeded() {
                     self.begin_unwind(UnwindCause::Failure(ExecFailure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),

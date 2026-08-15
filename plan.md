@@ -1,6 +1,6 @@
 # `acadctl eval`, `exec`, and drawing history
 
-Status: the installed private build runs document-scoped `eval`, `exec`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The implementation and its post-commit first-principles naming pass are committed locally; cleanup and independent spec audits remain. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
+Status: the installed private build runs document-scoped `eval`, `exec`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The implementation has completed its first-principles naming and cleanup passes; independent spec audits remain. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
 
 ## Current implementation checklist
 
@@ -9,7 +9,7 @@ Status: the installed private build runs document-scoped `eval`, `exec`, rollbac
 - [x] Live drawing-wide `undo` and `redo`, including exact inactive-document routing and restoration of the prior active document.
 - [x] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates on macOS and AutoCAD 2027.
 - [x] Commit the one-value output and process-identity corrections, then complete the first-principles naming reconciliation.
-- [ ] Complete the cleanup and independent spec audits.
+- [ ] Complete the independent spec audits.
 
 ## Design center
 
@@ -35,7 +35,7 @@ AutoLISP remains fully capable code. `acadctl` is not a sandbox. Agent instructi
 | `acadctl redo <id>` | Redo the drawing's next AutoCAD history step. | Nothing. |
 | `acadctl kill [pid] [--force]` | Terminate an AutoCAD instance, not an execution request. | Nothing. |
 
-`<id>` is the document ID reported by `acadctl ls`. The document ID also resolves the owning AutoCAD process, matching the existing `save` and `close` commands.
+`<id>` is the document ID reported by `acadctl ps`. The document ID also resolves the owning AutoCAD process, matching the existing `save` and `close` commands.
 
 There is no `repl` command. Repeated `eval` or `exec` invocations provide command-by-command use, while one invocation containing several forms provides batch use. Definitions and variables live in the target document's normal AutoLISP environment and therefore persist across requests until that document closes.
 
@@ -114,7 +114,7 @@ It does not build an AST, interpret symbols, validate argument shapes, expand ma
 
 ```rust
 struct SourceBatch {
-    source_name: String,
+    source_name: SourceName,
     source: String,
     forms: Vec<FormSpan>,
 }
@@ -318,7 +318,7 @@ enum ExecutionClientMessage {
 }
 
 struct ExecutionRequest {
-    document_id: String,
+    document_id: u32,
     mode: ExecutionMode,
     source_name: String,
     source: Bytes,
@@ -776,7 +776,7 @@ Native step observations carry reserved-symbol cleanup status separately from th
 
 The lifecycle methods and bidirectional Execute method are separate services on the same local transport. Lifecycle requests are limited to 64 KiB; responses retain a 4 MiB bound so a status listing with many server-owned document paths is not accidentally constrained to one request's path limit. Execute requests permit a 5 MiB transport envelope so a 4 MiB source, an optional three-byte UTF-8 BOM, source metadata, and protobuf framing reach the authoritative application check; Execute responses are limited to 32 KiB. Raising the request limit on the existing service was rejected because it would allow multi-megabyte `open`, `save`, and `close` inputs for no execution benefit. The split does not add an IPC version or compatibility layer.
 
-The protobuf source field is `bytes` generated as `bytes::Bytes`. Rust validates UTF-8, rejects U+0000, strips the BOM with a shared slice, scans through borrowed text, and carries clones of the same allocation into native form steps. A protobuf `string`, a `Vec<u8>`, and converting the admitted source into `Arc<str>` were rejected because each can add a full 4 MiB copy while the bidirectional input stream remains alive for `Cancel`. The source name is limited to 4 KiB, document IDs must exactly match the existing six-character alphabet, open paths are limited to 32 KiB, and stored or transmitted diagnostic detail is limited to 16 KiB with an explicit truncation marker.
+The protobuf source field is `bytes` generated as `bytes::Bytes`. Rust validates UTF-8, rejects U+0000, strips the BOM with a shared slice, scans through borrowed text, and carries clones of the same allocation into native form steps. A protobuf `string`, a `Vec<u8>`, and converting the admitted source into `Arc<str>` were rejected because each can add a full 4 MiB copy while the bidirectional input stream remains alive for `Cancel`. The source name is limited to 4 KiB, document IDs must be nonzero 16-bit values displayed as exactly four hexadecimal digits, open paths are limited to 32 KiB, and stored or transmitted diagnostic detail is limited to 16 KiB with an explicit truncation marker.
 
 Admission is bounded across connections, not merely per HTTP/2 connection: at most eight Execute streams may exist while waiting for their first message, validating, queued, running, or returning their terminal response. The scheduler admits at most eight nonempty executions and 32 MiB of source across queued and active jobs. All durable mutation jobs, including lifecycle requests, are capped at 32. A five-second first-message timeout prevents an idle stream from retaining its permit indefinitely. Relying on the transport's per-connection stream limit or an unbounded scheduler queue was rejected because multiple connections could otherwise retain gigabytes of decoded requests or disconnected durable jobs.
 

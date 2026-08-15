@@ -7,6 +7,8 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+use commands::target::Target;
+
 #[derive(Parser)]
 #[command(version, about = "Control AutoCAD from the command line")]
 struct Cli {
@@ -34,22 +36,22 @@ enum Command {
     /// Save an open AutoCAD document in place.
     Save {
         /// Document target shown by `acadctl ps`.
-        id: String,
+        id: Target,
     },
     /// Undo the drawing's last AutoCAD history step.
     Undo {
         /// Document target shown by `acadctl ps`.
-        id: String,
+        id: Target,
     },
     /// Redo the drawing's next AutoCAD history step.
     Redo {
         /// Document target shown by `acadctl ps`.
-        id: String,
+        id: Target,
     },
     /// Close an open AutoCAD document.
     Close {
         /// Document target shown by `acadctl ps`.
-        id: String,
+        id: Target,
 
         /// Discard unsaved changes.
         #[arg(long)]
@@ -73,7 +75,7 @@ enum Command {
 #[derive(Args)]
 struct EvalArgs {
     /// Document target shown by `acadctl ps`.
-    id: String,
+    id: Target,
 
     /// AutoLISP form. Reads stdin when omitted.
     #[arg(
@@ -96,7 +98,7 @@ struct EvalArgs {
 #[derive(Args)]
 struct ExecArgs {
     /// Document target shown by `acadctl ps`.
-    id: String,
+    id: Target,
 
     /// AutoLISP forms. Reads stdin when omitted.
     #[arg(

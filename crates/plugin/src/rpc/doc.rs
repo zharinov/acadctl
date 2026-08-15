@@ -33,7 +33,7 @@ impl DocService for DocRpc {
 
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let id = request.into_inner().id;
-        let id = parse_document_id(&id)?;
+        let id = parse_document_id(id)?;
         let document = crate::scheduler::save(id).await.map_err(scheduler_error)?;
         Ok(Response::new(SaveResponse {
             document: Some(document.into()),
@@ -45,7 +45,7 @@ impl DocService for DocRpc {
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
         let id = request.into_inner().id;
-        let id = parse_document_id(&id)?;
+        let id = parse_document_id(id)?;
         let document = crate::scheduler::undo(id).await.map_err(scheduler_error)?;
         Ok(Response::new(HistoryResponse {
             document: Some(document.into()),
@@ -57,7 +57,7 @@ impl DocService for DocRpc {
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
         let id = request.into_inner().id;
-        let id = parse_document_id(&id)?;
+        let id = parse_document_id(id)?;
         let document = crate::scheduler::redo(id).await.map_err(scheduler_error)?;
         Ok(Response::new(HistoryResponse {
             document: Some(document.into()),
@@ -69,7 +69,7 @@ impl DocService for DocRpc {
         request: Request<CloseRequest>,
     ) -> Result<Response<CloseResponse>, Status> {
         let request = request.into_inner();
-        let id = parse_document_id(&request.id)?;
+        let id = parse_document_id(request.id)?;
         crate::scheduler::close(id, request.discard)
             .await
             .map_err(scheduler_error)?;
@@ -80,9 +80,9 @@ impl DocService for DocRpc {
 impl From<crate::doc::Doc> for RpcDoc {
     fn from(document: crate::doc::Doc) -> Self {
         Self {
-            id: document.id.to_string(),
-            display_name: document.display_name,
-            file_path: document.file_path,
+            id: document.id.into(),
+            display_name: document.display_name().to_owned(),
+            file_path: document.file_path().map(|path| path.as_str().to_owned()),
             modified: document.modified,
             read_only: document.read_only,
         }

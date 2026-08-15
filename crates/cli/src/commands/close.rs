@@ -2,14 +2,9 @@ use std::process::ExitCode;
 
 use acadctl_rpc::CloseRequest;
 
-use super::{fail, request_error_message};
+use super::{fail, request_error_message, target::Target};
 
-pub async fn run(id: String, discard: bool) -> ExitCode {
-    let target = match super::target::resolve(&id) {
-        Ok(target) => target,
-        Err(error) => return fail(error),
-    };
-
+pub async fn run(target: Target, discard: bool) -> ExitCode {
     let mut client = match super::connect_documents(target.process_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),

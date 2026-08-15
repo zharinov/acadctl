@@ -6,8 +6,8 @@ use acadctl_rpc::{
     DocId, DrawingOutcome as RpcDrawingOutcome, ExecAccepted, ExecCancelAcknowledgement,
     ExecCancelDisposition, ExecCancelled, ExecClientMessage, ExecFailure as RpcExecFailure,
     ExecFinished, ExecMode as RpcExecMode, ExecOutcome as RpcExecOutcome, ExecOutput, ExecRequest,
-    ExecServerEvent, ExecService, ExecSuccess, SourceLocation as RpcSourceLocation,
-    exec_client_message, exec_outcome, exec_server_event,
+    ExecServerEvent, ExecService, ExecSuccess, SourceLocation as RpcSourceLocation, SourceName,
+    SourceNameError, exec_client_message, exec_outcome, exec_server_event,
 };
 use futures_util::{Stream, stream};
 use tokio::sync::mpsc;
@@ -321,23 +321,17 @@ fn terminal_response(
 }
 
 fn validate_execution_request(request: ExecRequest) -> Result<ValidatedExecRequest, ExecFailure> {
-    let document_id = request
-        .document_id
-        .parse()
-        .map_err(|_| failure("The document ID is invalid"))?;
-
-    if request.source_name.is_empty() {
-        return Err(failure("The source name is required"));
-    }
-
-    if request.source_name.len() > acadctl_rpc::MAX_SOURCE_NAME_BYTES {
-        return Err(failure("The source name exceeds the 4 KiB limit"));
-    }
+    let document_id =
+        DocId::try_from(request.document_id).map_err(|_| failure("The document ID is invalid"))?;
+    let source_name = SourceName::new(request.source_name).map_err(|error| match error {
+        SourceNameError::Empty => failure("The source name is required"),
+        SourceNameError::TooLong => failure("The source name exceeds the 4 KiB limit"),
+    })?;
 
     Ok(ValidatedExecRequest {
         document_id,
         mode: request.mode,
-        source_name: request.source_name,
+        source_name,
         source: request.source,
     })
 }
@@ -345,11 +339,11 @@ fn validate_execution_request(request: ExecRequest) -> Result<ValidatedExecReque
 struct ValidatedExecRequest {
     document_id: DocId,
     mode: i32,
-    source_name: String,
+    source_name: SourceName,
     source: bytes::Bytes,
 }
 
-fn validation_failure(error: SourceValidationError, source_name: String) -> ExecFailure {
+fn validation_failure(error: SourceValidationError, source_name: SourceName) -> ExecFailure {
     match error {
         SourceValidationError::SourceTooLarge => failure("The source exceeds the 4 MiB limit"),
         SourceValidationError::InvalidUtf8 => failure("The source is not valid UTF-8"),
@@ -413,7 +407,7 @@ fn rpc_failure(failure: ExecFailure) -> RpcExecFailure {
         message: bounded_diagnostic(failure.message),
         form_index: failure.form_index.map(|index| index as u64),
         location: failure.location.map(|location| RpcSourceLocation {
-            source_name: location.source_name,
+            source_name: location.source_name.into_string(),
             line: location.line as u64,
             column: location.column as u64,
         }),

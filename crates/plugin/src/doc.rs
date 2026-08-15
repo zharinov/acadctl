@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use acadctl_rpc::{DocId, DrawingPath};
+use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::ffi::NativeDocSnapshot;
 
@@ -16,10 +17,15 @@ pub struct DocRegistry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
     pub id: DocId,
-    pub display_name: String,
-    pub file_path: Option<String>,
+    name: DocName,
     pub modified: bool,
     pub read_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DocName {
+    Named(Utf8PathBuf),
+    Unnamed(String),
 }
 
 struct TrackedDoc {
@@ -94,31 +100,33 @@ impl DocRegistry {
             .find(|tracked| {
                 tracked
                     .document
-                    .file_path
-                    .as_deref()
-                    .is_some_and(|file_path| path.matches(file_path))
+                    .file_path()
+                    .is_some_and(|file_path| path.matches(file_path.as_str()))
             })
             .map(document_target)
     }
 }
 
-fn public_document(id: DocId, native: NativeDocSnapshot) -> Doc {
-    let name = document_name(native.name, native.named);
-    let (display_name, file_path) = if native.named {
-        let display_name = std::path::Path::new(&name)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&name)
-            .to_owned();
-        (display_name, Some(name))
-    } else {
-        (name, None)
-    };
+impl Doc {
+    pub fn display_name(&self) -> &str {
+        match &self.name {
+            DocName::Named(path) => path.file_name().unwrap_or(path.as_str()),
+            DocName::Unnamed(name) => name,
+        }
+    }
 
+    pub fn file_path(&self) -> Option<&Utf8Path> {
+        match &self.name {
+            DocName::Named(path) => Some(path),
+            DocName::Unnamed(_) => None,
+        }
+    }
+}
+
+fn public_document(id: DocId, native: NativeDocSnapshot) -> Doc {
     Doc {
         id,
-        display_name,
-        file_path,
+        name: document_name(native.name, native.named),
         modified: native.modified,
         read_only: native.read_only,
     }
@@ -140,9 +148,9 @@ fn take_document_id(documents: &mut Vec<TrackedDoc>, document_token: usize) -> O
 
 fn new_document_id(reserved_ids: &mut HashSet<DocId>) -> DocId {
     loop {
-        let id = nanoid::nanoid!(DOCUMENT_ID_LENGTH, &DOCUMENT_ID_ALPHABET)
-            .parse()
-            .expect("the document ID alphabet and width are valid");
+        let Ok(id) = nanoid::nanoid!(DOCUMENT_ID_LENGTH, &DOCUMENT_ID_ALPHABET).parse() else {
+            continue;
+        };
 
         if reserved_ids.insert(id) {
             return id;
@@ -150,16 +158,19 @@ fn new_document_id(reserved_ids: &mut HashSet<DocId>) -> DocId {
     }
 }
 
-fn document_name(mut name: String, named: bool) -> String {
-    if !named
-        && name
-            .get(name.len().saturating_sub(4)..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dwg"))
+fn document_name(mut name: String, named: bool) -> DocName {
+    if named {
+        return DocName::Named(name.into());
+    }
+
+    if name
+        .get(name.len().saturating_sub(4)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dwg"))
     {
         name.truncate(name.len() - 4);
     }
 
-    name
+    DocName::Unnamed(name)
 }
 
 #[cfg(test)]
@@ -182,8 +193,11 @@ mod tests {
         let listed = documents.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, original_id);
-        assert_eq!(listed[0].display_name, "site.dwg");
-        assert_eq!(listed[0].file_path.as_deref(), Some("/tmp/site.dwg"));
+        assert_eq!(listed[0].display_name(), "site.dwg");
+        assert_eq!(
+            listed[0].file_path().map(Utf8Path::as_str),
+            Some("/tmp/site.dwg")
+        );
         assert!(listed[0].modified);
         assert!(listed[0].read_only);
         assert_eq!(
@@ -213,22 +227,31 @@ mod tests {
         let listed = documents.list();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, original[1].id);
-        assert_eq!(listed[0].display_name, "site.dwg");
-        assert_eq!(listed[0].file_path.as_deref(), Some("/tmp/site.dwg"));
+        assert_eq!(listed[0].display_name(), "site.dwg");
+        assert_eq!(
+            listed[0].file_path().map(Utf8Path::as_str),
+            Some("/tmp/site.dwg")
+        );
         assert_ne!(listed[1].id, original[0].id);
         assert_ne!(listed[1].id, original[1].id);
-        assert_eq!(listed[1].display_name, "Drawing1");
-        assert_eq!(listed[1].file_path, None);
+        assert_eq!(listed[1].display_name(), "Drawing1");
+        assert_eq!(listed[1].file_path(), None);
     }
 
     #[test]
     fn strips_drawing_suffix_only_from_unnamed_documents() {
-        assert_eq!(document_name("Drawing1.DWG".into(), false), "Drawing1");
+        assert_eq!(
+            document_name("Drawing1.DWG".into(), false),
+            DocName::Unnamed("Drawing1".into())
+        );
         assert_eq!(
             document_name("/tmp/house.DWG".into(), true),
-            "/tmp/house.DWG"
+            DocName::Named("/tmp/house.DWG".into())
         );
-        assert_eq!(document_name("図面".into(), false), "図面");
+        assert_eq!(
+            document_name("図面".into(), false),
+            DocName::Unnamed("図面".into())
+        );
     }
 
     #[test]
@@ -251,10 +274,13 @@ mod tests {
             }
         );
         assert_eq!(
-            by_id.document.display_name,
+            by_id.document.display_name(),
             house.as_path().file_name().unwrap()
         );
-        assert_eq!(by_id.document.file_path.as_deref(), Some(house.as_str()));
+        assert_eq!(
+            by_id.document.file_path().map(Utf8Path::as_str),
+            Some(house.as_str())
+        );
         assert_eq!(
             documents
                 .find_by_path(&house)

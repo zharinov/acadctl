@@ -8,6 +8,10 @@ use tokio::sync::mpsc;
 use super::{start, stop};
 use crate::scheduler::CancelResult;
 
+fn source_name(value: &str) -> SourceName {
+    SourceName::new(value).unwrap()
+}
+
 #[test]
 fn reports_documents_and_stops_promptly() {
     let _test = crate::scheduler::TEST_LOCK.blocking_lock();
@@ -50,7 +54,7 @@ fn reports_documents_and_stops_promptly() {
         .unwrap();
         let listed = client.list(ListRequest {}).await.unwrap().into_inner();
         assert_eq!(listed.documents.len(), 2);
-        assert_eq!(listed.documents[0].id.len(), 4);
+        assert!(DocId::try_from(listed.documents[0].id).is_ok());
         assert_eq!(
             listed.documents[0].display_name,
             house.as_path().file_name().unwrap()
@@ -61,7 +65,7 @@ fn reports_documents_and_stops_promptly() {
         );
         assert!(!listed.documents[0].modified);
         assert!(!listed.documents[0].read_only);
-        assert_eq!(listed.documents[1].id.len(), 4);
+        assert!(DocId::try_from(listed.documents[1].id).is_ok());
         assert_ne!(listed.documents[0].id, listed.documents[1].id);
         assert_eq!(
             listed.documents[1].display_name,
@@ -84,9 +88,7 @@ fn reports_documents_and_stops_promptly() {
         assert_eq!(opened.id, listed.documents[0].id);
 
         let saved = client
-            .save(SaveRequest {
-                id: opened.id.clone(),
-            })
+            .save(SaveRequest { id: opened.id })
             .await
             .unwrap()
             .into_inner()
@@ -96,7 +98,7 @@ fn reports_documents_and_stops_promptly() {
         assert!(!saved.modified);
 
         let mut undo_client = client.clone();
-        let undo_id = opened.id.clone();
+        let undo_id = opened.id;
         let undo_response =
             tokio::spawn(async move { undo_client.undo(HistoryRequest { id: undo_id }).await });
         let undo_action = next_native_action().await;
@@ -138,7 +140,7 @@ fn reports_documents_and_stops_promptly() {
         assert!(undone.modified);
 
         let mut redo_client = client.clone();
-        let redo_id = opened.id.clone();
+        let redo_id = opened.id;
         let redo_response =
             tokio::spawn(async move { redo_client.redo(HistoryRequest { id: redo_id }).await });
         let redo_action = next_native_action().await;
@@ -181,7 +183,7 @@ fn reports_documents_and_stops_promptly() {
 
         let close_error = client
             .close(CloseRequest {
-                id: listed.documents[1].id.clone(),
+                id: listed.documents[1].id,
                 discard: false,
             })
             .await
@@ -446,7 +448,7 @@ fn execution_request(document_id: DocId, source: Bytes) -> ExecClientMessage {
         message: Some(exec_client_message::Message::Request(ExecRequest::new(
             document_id,
             RpcExecMode::Exec,
-            "<stdin>".into(),
+            source_name("<stdin>"),
             source,
         ))),
     }

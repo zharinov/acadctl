@@ -4,7 +4,7 @@ use acadctl_rpc::{Doc, ProcessId};
 
 use crate::instance::Instance;
 
-use super::{fail, query_error_message};
+use super::{fail, parse_document_id, query_error_message};
 
 pub async fn run(long: bool) -> ExitCode {
     let instances = match crate::instance::list().await {
@@ -41,7 +41,7 @@ fn render(instances: &[Instance], long: bool) -> Result<Vec<String>, String> {
                 process_id_width,
                 document,
                 long,
-            ));
+            )?);
         }
     }
 
@@ -53,7 +53,8 @@ fn document_line(
     process_id_width: usize,
     document: &Doc,
     long: bool,
-) -> String {
+) -> Result<String, String> {
+    let document_id = parse_document_id(document.id)?;
     let modified = if document.modified { "*" } else { "." };
     let mode = if document.read_only { "ro" } else { "rw" };
     let name = if long {
@@ -65,10 +66,9 @@ fn document_line(
         &document.display_name
     };
 
-    format!(
-        "{process_id:0process_id_width$X}:{}  {modified}  {mode}  {name}",
-        document.id
-    )
+    Ok(format!(
+        "{process_id:0process_id_width$X}:{document_id}  {modified}  {mode}  {name}"
+    ))
 }
 
 #[cfg(test)]
@@ -194,7 +194,7 @@ mod tests {
             .unwrap_or(path)
             .to_owned();
         Doc {
-            id: id.into(),
+            id: u32::from(id.parse::<acadctl_rpc::DocId>().unwrap()),
             display_name,
             file_path,
             modified,

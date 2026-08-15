@@ -4,6 +4,10 @@ use super::diagnostic::append_diagnostic;
 use super::value::writer::{NativeValueWriter, ValueEvent, WriteResult};
 use super::*;
 
+fn source_name(value: &str) -> acadctl_rpc::SourceName {
+    acadctl_rpc::SourceName::new(value).unwrap()
+}
+
 #[test]
 fn diagnostic_composition_preserves_the_stored_byte_limit() {
     let mut message = bounded_diagnostic("é".repeat(acadctl_rpc::MAX_DIAGNOSTIC_BYTES));
@@ -25,7 +29,7 @@ fn validates_source_before_native_admission() {
     assert!(
         Exec::new(
             ExecMode::Exec,
-            "<stdin>".into(),
+            source_name("<stdin>"),
             "x".repeat(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES).into(),
         )
         .is_ok()
@@ -33,7 +37,7 @@ fn validates_source_before_native_admission() {
     assert!(
         Exec::new(
             ExecMode::Exec,
-            "<stdin>".into(),
+            source_name("<stdin>"),
             format!(
                 "\u{feff}{}",
                 "x".repeat(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES)
@@ -45,7 +49,7 @@ fn validates_source_before_native_admission() {
     assert_eq!(
         Exec::new(
             ExecMode::Exec,
-            "<stdin>".into(),
+            source_name("<stdin>"),
             "x".repeat(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1)
                 .into(),
         )
@@ -54,7 +58,7 @@ fn validates_source_before_native_admission() {
         SourceValidationError::SourceTooLarge
     );
     assert_eq!(
-        Exec::new(ExecMode::Exec, "<stdin>".into(), "x\0y".into())
+        Exec::new(ExecMode::Exec, source_name("<stdin>"), "x\0y".into())
             .err()
             .unwrap(),
         SourceValidationError::NullCharacter
@@ -62,7 +66,7 @@ fn validates_source_before_native_admission() {
     assert_eq!(
         Exec::new(
             ExecMode::Exec,
-            "<stdin>".into(),
+            source_name("<stdin>"),
             Bytes::from_static(b"\xff"),
         )
         .err()
@@ -70,7 +74,7 @@ fn validates_source_before_native_admission() {
         SourceValidationError::InvalidUtf8
     );
     assert!(matches!(
-        Exec::new(ExecMode::Exec, "<stdin>".into(), "(unfinished".into(),),
+        Exec::new(ExecMode::Exec, source_name("<stdin>"), "(unfinished".into(),),
         Err(SourceValidationError::Scan(_))
     ));
 }
@@ -78,19 +82,19 @@ fn validates_source_before_native_admission() {
 #[test]
 fn eval_requires_exactly_one_form_while_exec_accepts_a_batch() {
     assert_eq!(
-        Exec::new(ExecMode::Eval, "<stdin>".into(), "".into())
+        Exec::new(ExecMode::Eval, source_name("<stdin>"), "".into())
             .err()
             .unwrap(),
         SourceValidationError::ExpectedOneForm { actual: 0 }
     );
     assert_eq!(
-        Exec::new(ExecMode::Eval, "<stdin>".into(), "a b".into())
+        Exec::new(ExecMode::Eval, source_name("<stdin>"), "a b".into())
             .err()
             .unwrap(),
         SourceValidationError::ExpectedOneForm { actual: 2 }
     );
-    assert!(Exec::new(ExecMode::Eval, "<stdin>".into(), "a".into()).is_ok());
-    assert!(Exec::new(ExecMode::Exec, "<stdin>".into(), "a b".into()).is_ok());
+    assert!(Exec::new(ExecMode::Eval, source_name("<stdin>"), "a".into()).is_ok());
+    assert!(Exec::new(ExecMode::Exec, source_name("<stdin>"), "a b".into()).is_ok());
 }
 
 #[test]
@@ -110,7 +114,7 @@ fn embedded_execution_driver_is_one_complete_definition() {
 fn yields_exact_forms_then_commits() {
     let mut execution = Exec::new(
         ExecMode::Exec,
-        "batch.lsp".into(),
+        source_name("batch.lsp"),
         "(setq x 1) ; keep with separator\n(+ x 2)".into(),
     )
     .unwrap()
@@ -138,7 +142,7 @@ fn yields_exact_forms_then_commits() {
 #[test]
 fn eval_retains_its_form_value_and_emits_it_only_after_commit() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Eval, "inspect.lsp".into(), "(+ 1 2)".into()).unwrap();
+        Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "(+ 1 2)".into()).unwrap();
     begin(&mut execution);
 
     let form = execution.take_step();
@@ -164,7 +168,7 @@ fn eval_retains_its_form_value_and_emits_it_only_after_commit() {
 
 #[test]
 fn exec_forms_never_request_value_retention() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "(+ 1 2)".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "(+ 1 2)".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -187,7 +191,7 @@ fn a_missing_post_commit_writer_is_a_committed_failure() {
             message: "the AutoLISP evaluator did not emit its result value".into(),
             form_index: Some(1),
             location: Some(SourceLocation {
-                source_name: "inspect.lsp".into(),
+                source_name: source_name("inspect.lsp"),
                 line: 1,
                 column: 1,
             }),
@@ -251,7 +255,7 @@ fn post_commit_bridge_failure_keeps_cleanup_evidence() {
 #[test]
 fn eval_cancellation_clears_the_retained_value_before_rollback() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
     begin(&mut execution);
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
     assert!(execution.request_cancel());
@@ -274,7 +278,7 @@ fn eval_cancellation_clears_the_retained_value_before_rollback() {
 #[test]
 fn eval_value_cleanup_failure_is_preserved_when_rollback_succeeds() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
     begin(&mut execution);
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
     assert!(execution.request_cancel());
@@ -304,7 +308,7 @@ fn eval_value_cleanup_failure_is_preserved_when_rollback_succeeds() {
 #[test]
 fn form_failure_keeps_lisp_and_cleanup_evidence() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
     begin(&mut execution);
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
     assert!(execution.complete_step(with_cleanup(lisp_error("bad argument type", 7), -5001,)));
@@ -334,7 +338,7 @@ fn form_failure_keeps_lisp_and_cleanup_evidence() {
 
 #[test]
 fn rolls_back_a_lisp_failure_at_its_form_location() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "ok\n  bad".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "ok\n  bad".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -355,7 +359,7 @@ fn rolls_back_a_lisp_failure_at_its_form_location() {
             message: "bad argument type".into(),
             form_index: Some(2),
             location: Some(SourceLocation {
-                source_name: "batch.lsp".into(),
+                source_name: source_name("batch.lsp"),
                 line: 2,
                 column: 3,
             }),
@@ -366,7 +370,7 @@ fn rolls_back_a_lisp_failure_at_its_form_location() {
 
 #[test]
 fn rollback_failure_preserves_the_original_error_and_marks_unknown() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "bad".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "bad".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -389,7 +393,7 @@ fn rollback_failure_preserves_the_original_error_and_marks_unknown() {
 
 #[test]
 fn commit_failure_is_rolled_back() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "ok".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "ok".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -417,7 +421,7 @@ fn commit_failure_is_rolled_back() {
 
 #[test]
 fn eval_commit_failure_clears_its_value_before_rollback() {
-    let mut execution = Exec::new(ExecMode::Eval, "inspect.lsp".into(), "ok".into())
+    let mut execution = Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "ok".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -447,7 +451,7 @@ fn eval_commit_failure_clears_its_value_before_rollback() {
 
 #[test]
 fn begin_failure_never_claims_that_drawing_work_started() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "ok".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "ok".into())
         .unwrap()
         .0;
     assert_eq!(execution.take_step().kind(), ExecStepKind::BeginUndoGroup);
@@ -482,7 +486,7 @@ fn cleanup_failure_overrides_success_with_an_unknown_drawing_outcome() {
 
 #[test]
 fn cleanup_failure_preserves_an_existing_execution_failure() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "bad".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "bad".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -506,9 +510,13 @@ fn cleanup_failure_preserves_an_existing_execution_failure() {
 
 #[test]
 fn abandonment_terminalizes_an_in_flight_form_as_unknown() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "ok\nchanged".into())
-        .unwrap()
-        .0;
+    let mut execution = Exec::new(
+        ExecMode::Exec,
+        source_name("batch.lsp"),
+        "ok\nchanged".into(),
+    )
+    .unwrap()
+    .0;
     begin(&mut execution);
     assert_eq!(execution.take_step().source(), "ok");
     assert!(execution.complete_step(success()));
@@ -525,7 +533,7 @@ fn abandonment_terminalizes_an_in_flight_form_as_unknown() {
             message: "the target database changed during execution".into(),
             form_index: Some(2),
             location: Some(SourceLocation {
-                source_name: "batch.lsp".into(),
+                source_name: source_name("batch.lsp"),
                 line: 2,
                 column: 1,
             }),
@@ -536,7 +544,7 @@ fn abandonment_terminalizes_an_in_flight_form_as_unknown() {
 
 #[test]
 fn abandonment_preserves_the_failure_that_started_rollback() {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "bad".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "bad".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -560,7 +568,7 @@ fn abandonment_preserves_the_failure_that_started_rollback() {
 #[test]
 fn cancellation_before_begin_never_opens_an_undo_group() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
 
     assert!(execution.request_cancel());
     assert_eq!(execution.take_step().kind(), ExecStepKind::Done);
@@ -570,7 +578,7 @@ fn cancellation_before_begin_never_opens_an_undo_group() {
 #[test]
 fn cancellation_during_begin_closes_the_empty_group_without_u() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::BeginUndoGroup);
     assert!(execution.request_cancel());
@@ -587,7 +595,7 @@ fn cancellation_during_begin_closes_the_empty_group_without_u() {
 #[test]
 fn cancellation_after_a_form_uses_rollback() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     begin(&mut execution);
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
@@ -605,7 +613,7 @@ fn cancellation_after_a_form_uses_rollback() {
 #[test]
 fn evaluator_failure_wins_over_concurrent_cancellation() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Exec, "batch.lsp".into(), "bad".into()).unwrap();
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "bad".into()).unwrap();
     begin(&mut execution);
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
@@ -628,7 +636,7 @@ fn evaluator_failure_wins_over_concurrent_cancellation() {
 #[test]
 fn cancellation_after_commit_handoff_is_too_late() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     begin(&mut execution);
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
     assert!(execution.complete_step(success()));
@@ -643,7 +651,7 @@ fn cancellation_after_commit_handoff_is_too_late() {
 #[test]
 fn rollback_failure_overrides_cancellation() {
     let (mut execution, _output) =
-        Exec::new(ExecMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     begin(&mut execution);
     assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
     assert!(execution.request_cancel());
@@ -668,9 +676,13 @@ fn rollback_failure_overrides_cancellation() {
 
 #[test]
 fn empty_batch_finishes_without_an_undo_group() {
-    let mut execution = Exec::new(ExecMode::Exec, "<stdin>".into(), "; only a comment".into())
-        .unwrap()
-        .0;
+    let mut execution = Exec::new(
+        ExecMode::Exec,
+        source_name("<stdin>"),
+        "; only a comment".into(),
+    )
+    .unwrap()
+    .0;
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::Done);
     assert_eq!(execution.outcome(), Some(&ExecOutcome::Success));
@@ -682,7 +694,7 @@ fn begin(execution: &mut Exec) {
 }
 
 fn successful_execution() -> Exec {
-    let mut execution = Exec::new(ExecMode::Exec, "batch.lsp".into(), "ok".into())
+    let mut execution = Exec::new(ExecMode::Exec, source_name("batch.lsp"), "ok".into())
         .unwrap()
         .0;
     begin(&mut execution);
@@ -695,7 +707,7 @@ fn successful_execution() -> Exec {
 }
 
 fn eval_through_commit() -> Exec {
-    let mut execution = Exec::new(ExecMode::Eval, "inspect.lsp".into(), "(+ 1 2)".into())
+    let mut execution = Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "(+ 1 2)".into())
         .unwrap()
         .0;
     begin(&mut execution);

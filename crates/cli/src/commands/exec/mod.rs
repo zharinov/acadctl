@@ -25,12 +25,12 @@ use stream::{
 };
 use writer::PipeWriter;
 
-use super::{fail, query_error_message, request_error_message};
+use super::{fail, query_error_message, request_error_message, target::Target};
 
 const EXECUTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTION_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn run(id: String, source: crate::source::SourceSpec, mode: ExecMode) -> ExitCode {
+pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMode) -> ExitCode {
     let source = match crate::source::read(source, mode == ExecMode::Eval) {
         Ok(source) => source,
         Err(error) => {
@@ -38,11 +38,6 @@ pub async fn run(id: String, source: crate::source::SourceSpec, mode: ExecMode) 
 
             return ExitCode::FAILURE;
         }
-    };
-
-    let target = match super::target::resolve(&id) {
-        Ok(target) => target,
-        Err(error) => return fail(error),
     };
 
     let mut client = match tokio::time::timeout(
@@ -56,7 +51,7 @@ pub async fn run(id: String, source: crate::source::SourceSpec, mode: ExecMode) 
         Err(_) => return fail(query_error_message(&QueryError::TimedOut)),
     };
 
-    let source_name = source.name.clone();
+    let source_name = source.name.to_string();
     let request = ExecClientMessage {
         message: Some(exec_client_message::Message::Request(ExecRequest::new(
             target.document_id,

@@ -2,6 +2,7 @@ mod doc;
 mod path;
 mod pid;
 mod request;
+mod source;
 mod transport;
 
 use std::time::Duration;
@@ -25,6 +26,7 @@ pub use protocol::{
     SaveRequest, SaveResponse, SourceLocation, exec_client_message, exec_outcome,
     exec_server_event,
 };
+pub use source::{SourceName, SourceNameError};
 pub use transport::{Incoming, discover, incoming};
 
 mod protocol {

@@ -17,8 +17,7 @@ use crate::ffi::{
 
 use super::error::Error;
 use super::operation::{
-    HistoryDirection, Operation, OperationOutcome, Prepared, complete_operation, finalize,
-    native_action, prepare,
+    HistoryDirection, Operation, OperationOutcome, Prepared, complete_operation, finalize, prepare,
 };
 
 #[cfg(test)]
@@ -458,13 +457,9 @@ pub fn take_native_action() -> NativeAction {
             Prepared::Immediate(outcome) => {
                 TakeDecision::Complete(job.completion, outcome, job.operation.output_sink())
             }
-            Prepared::Native(mut action) => {
-                action.job_id = job.job_id;
-                job.native_target = (action.document_token != 0 || action.database_token != 0)
-                    .then_some(NativeDocKey {
-                        document_token: action.document_token,
-                        database_token: action.database_token,
-                    });
+            Prepared::Native(request) => {
+                let (action, native_target) = request.into_action(job.job_id);
+                job.native_target = native_target;
                 scheduler.active = Some(job);
                 TakeDecision::Action(action)
             }
@@ -1015,7 +1010,14 @@ impl MutationJob {
 }
 
 fn empty_action() -> NativeAction {
-    native_action(NativeActionKind::None, None, String::new(), false)
+    NativeAction {
+        job_id: 0,
+        kind: NativeActionKind::None,
+        document_token: 0,
+        database_token: 0,
+        path: String::new(),
+        discard: false,
+    }
 }
 
 fn schedule_native_actions() {

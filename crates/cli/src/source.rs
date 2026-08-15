@@ -3,13 +3,15 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
+use acadctl_rpc::{SourceName, SourceNameError};
+
 const UTF8_BOM: &[u8] = &[0xef, 0xbb, 0xbf];
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_RAW_SOURCE_BYTES: usize = acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + UTF8_BOM.len() + 1;
 
 #[derive(Debug)]
 pub struct SourceInput {
-    pub name: String,
+    pub name: SourceName,
     pub bytes: Bytes,
 }
 
@@ -23,7 +25,7 @@ pub enum SourceSpec {
 pub enum SourceError {
     Message(String),
     Scan {
-        source_name: String,
+        source_name: SourceName,
         error: acadctl_lisp::ScanError,
     },
 }
@@ -32,7 +34,7 @@ pub fn read(source: SourceSpec, eval: bool) -> Result<SourceInput, SourceError> 
     match source {
         SourceSpec::Stdin => read_stdin(eval),
         SourceSpec::CommandLine(source) => {
-            validate("<command-line>".into(), source.into_bytes(), eval)
+            validate(diagnostic_name("<command-line>"), source.into_bytes(), eval)
         }
         SourceSpec::File(path) => read_file(&path, eval),
     }
@@ -59,22 +61,22 @@ fn read_stdin(eval: bool) -> Result<SourceInput, SourceError> {
     let bytes = read_bounded(stdin.lock()).map_err(|error| {
         SourceError::Message(format!("Could not read AutoLISP from stdin: {error}"))
     })?;
-    validate("<stdin>".into(), bytes, eval)
+    validate(diagnostic_name("<stdin>"), bytes, eval)
 }
 
 fn read_file(path: &Path, eval: bool) -> Result<SourceInput, SourceError> {
-    let source_name = path.to_str().map(str::to_owned).ok_or_else(|| {
+    let source_name = path.to_str().ok_or_else(|| {
         SourceError::Message(format!(
             "Source path '{}' is not valid UTF-8.",
             path.to_string_lossy()
         ))
     })?;
-
-    if source_name.len() > acadctl_rpc::MAX_SOURCE_NAME_BYTES {
-        return Err(SourceError::Message(
-            "The source path exceeds the 4 KiB limit.".into(),
-        ));
-    }
+    let source_name = SourceName::new(source_name).map_err(|error| match error {
+        SourceNameError::Empty => SourceError::Message("The source path is empty.".into()),
+        SourceNameError::TooLong => {
+            SourceError::Message("The source path exceeds the 4 KiB limit.".into())
+        }
+    })?;
 
     let file = std::fs::File::open(path).map_err(|error| {
         SourceError::Message(format!("Could not read '{source_name}': {error}"))
@@ -120,7 +122,11 @@ fn read_bounded(mut reader: impl Read) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn validate(source_name: String, bytes: Vec<u8>, eval: bool) -> Result<SourceInput, SourceError> {
+fn validate(
+    source_name: SourceName,
+    bytes: Vec<u8>,
+    eval: bool,
+) -> Result<SourceInput, SourceError> {
     let mut bytes = Bytes::from(bytes);
 
     if bytes.starts_with(UTF8_BOM) {
@@ -159,6 +165,10 @@ fn validate(source_name: String, bytes: Vec<u8>, eval: bool) -> Result<SourceInp
     })
 }
 
+fn diagnostic_name(value: &str) -> SourceName {
+    SourceName::new(value).expect("built-in source names satisfy the wire contract")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +179,7 @@ mod tests {
         source.extend_from_slice(UTF8_BOM);
         source.resize(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3, b'x');
 
-        let source = validate("script.lsp".into(), source, false).unwrap();
+        let source = validate(diagnostic_name("script.lsp"), source, false).unwrap();
 
         assert_eq!(source.bytes.len(), acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES);
         assert_eq!(source.bytes[0], b'x');
@@ -179,18 +189,18 @@ mod tests {
     fn rejects_oversize_invalid_and_unrepresentable_source() {
         assert!(matches!(
             validate(
-                "script.lsp".into(),
+                diagnostic_name("script.lsp"),
                 vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1],
                 false
             ),
             Err(SourceError::Message(message)) if message.contains("4 MiB")
         ));
         assert!(matches!(
-            validate("script.lsp".into(), vec![0xff], false),
+            validate(diagnostic_name("script.lsp"), vec![0xff], false),
             Err(SourceError::Message(message)) if message.contains("UTF-8")
         ));
         assert!(matches!(
-            validate("script.lsp".into(), b"a\0b".to_vec(), false),
+            validate(diagnostic_name("script.lsp"), b"a\0b".to_vec(), false),
             Err(SourceError::Message(message)) if message.contains("U+0000")
         ));
     }
@@ -198,15 +208,21 @@ mod tests {
     #[test]
     fn applies_eval_shape_and_reports_scanner_locations() {
         assert!(matches!(
-            validate("script.lsp".into(), b"(a) (b)".to_vec(), true),
+            validate(diagnostic_name("script.lsp"), b"(a) (b)".to_vec(), true),
             Err(SourceError::Message(message)) if message.contains("found 2")
         ));
         assert!(matches!(
-            validate("script.lsp".into(), b"\n  (a".to_vec(), false),
+            validate(
+                diagnostic_name("script.lsp"),
+                b"\n  (a".to_vec(),
+                false
+            ),
             Err(SourceError::Scan { source_name, error })
-                if source_name == "script.lsp" && error.line == 2 && error.column == 3
+                if source_name.as_str() == "script.lsp"
+                    && error.line == 2
+                    && error.column == 3
         ));
-        assert!(validate("script.lsp".into(), Vec::new(), false).is_ok());
+        assert!(validate(diagnostic_name("script.lsp"), Vec::new(), false).is_ok());
     }
 
     #[test]
@@ -214,7 +230,9 @@ mod tests {
         assert!(matches!(
             read(SourceSpec::CommandLine("\n  (unfinished".into()), false),
             Err(SourceError::Scan { source_name, error })
-                if source_name == "<command-line>" && error.line == 2 && error.column == 3
+                if source_name.as_str() == "<command-line>"
+                    && error.line == 2
+                    && error.column == 3
         ));
     }
 
