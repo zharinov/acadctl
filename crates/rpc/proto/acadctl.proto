@@ -6,6 +6,8 @@ service DocumentService {
   rpc List(ListRequest) returns (ListResponse);
   rpc Open(OpenRequest) returns (OpenResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
+  rpc Undo(HistoryRequest) returns (HistoryResponse);
+  rpc Redo(HistoryRequest) returns (HistoryResponse);
   rpc Close(CloseRequest) returns (CloseResponse);
 }
 
@@ -32,6 +34,14 @@ message SaveRequest {
 }
 
 message SaveResponse {
+  Document document = 1;
+}
+
+message HistoryRequest {
+  string id = 1;
+}
+
+message HistoryResponse {
   Document document = 1;
 }
 

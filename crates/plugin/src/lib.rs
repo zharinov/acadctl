@@ -16,6 +16,8 @@ mod ffi {
         Open,
         Save,
         Close,
+        Undo,
+        Redo,
         RunExecution,
     }
 
@@ -32,6 +34,7 @@ mod ffi {
         LockFailed,
         SaveFailed,
         CloseFailed,
+        HistoryFailed,
         NotQuiescent,
         UndoDisabled,
         ContextFailed,
@@ -39,56 +42,6 @@ mod ffi {
         ExecutionCleanupFailed,
         EvaluatorStateCleanupFailed,
         ExecutionBridgeFailed,
-    }
-
-    #[derive(Debug)]
-    #[repr(u8)]
-    enum NativeHistoryEventKind {
-        Invalid,
-        CommandWillStart,
-        CommandEnded,
-        CommandCancelled,
-        CommandFailed,
-        LispWillStart,
-        LispEnded,
-        LispCancelled,
-        SystemVariableWillChange,
-        SystemVariableChanged,
-        UndoAuto,
-        UndoControl,
-        UndoBegin,
-        UndoEnd,
-        UndoMark,
-        UndoBack,
-        UndoNumber,
-        RedoNumber,
-        UndoWriteBoundary,
-        SubcommandsWillBeUndone,
-        DocumentCreated,
-        DocumentWillBeDestroyed,
-        DocumentBecameCurrent,
-        DocumentActivated,
-        DatabaseWillBeDestroyed,
-        DatabaseActivity,
-        DatabaseReactorAttachFailed,
-        DatabaseReactorDetachFailed,
-    }
-
-    #[derive(Debug)]
-    #[repr(u8)]
-    enum NativeDatabaseActivityKind {
-        ObjectAppended,
-        ObjectUnappended,
-        ObjectReappended,
-        ObjectOpenedForModify,
-        ObjectModified,
-        ObjectErased,
-        ObjectUnerased,
-        HeaderVariableWillChange,
-        HeaderVariableChanged,
-        HeaderVariableChangeFailed,
-        DatabaseGoodbye,
-        ProxyResurrectionCompleted,
     }
 
     #[derive(Debug)]
@@ -182,19 +135,6 @@ mod ffi {
         native_detail: String,
     }
 
-    struct NativeHistoryEvent {
-        kind: NativeHistoryEventKind,
-        event_document_token: usize,
-        event_database_token: usize,
-        current_document_token: usize,
-        current_database_token: usize,
-        active_document_token: usize,
-        active_database_token: usize,
-        argument0: i32,
-        argument1: i32,
-        database_activity: u32,
-    }
-
     struct NativeExecutionStepResult {
         kind: NativeExecutionStepResultKind,
         native_status: i32,
@@ -234,8 +174,6 @@ mod ffi {
         fn take_native_action() -> NativeAction;
 
         fn complete_native_action(job_id: u64, result: NativeActionResult);
-
-        fn record_native_history_event(event: NativeHistoryEvent);
 
         fn native_actions_need_wake() -> bool;
 
@@ -291,7 +229,6 @@ mod ffi {
 
 mod documents;
 mod execution;
-mod history;
 mod rpc_server;
 mod scheduler;
 
@@ -312,76 +249,6 @@ fn take_native_action() -> ffi::NativeAction {
 
 fn complete_native_action(job_id: u64, result: ffi::NativeActionResult) {
     scheduler::complete_native_action(job_id, result);
-}
-
-fn record_native_history_event(event: ffi::NativeHistoryEvent) {
-    use history::{HistoryContext, HistoryEventKind, NativeHistoryEvent};
-
-    let kind = match event.kind {
-        ffi::NativeHistoryEventKind::CommandWillStart => HistoryEventKind::CommandWillStart,
-        ffi::NativeHistoryEventKind::CommandEnded => HistoryEventKind::CommandEnded,
-        ffi::NativeHistoryEventKind::CommandCancelled => HistoryEventKind::CommandCancelled,
-        ffi::NativeHistoryEventKind::CommandFailed => HistoryEventKind::CommandFailed,
-        ffi::NativeHistoryEventKind::LispWillStart => HistoryEventKind::LispWillStart,
-        ffi::NativeHistoryEventKind::LispEnded => HistoryEventKind::LispEnded,
-        ffi::NativeHistoryEventKind::LispCancelled => HistoryEventKind::LispCancelled,
-        ffi::NativeHistoryEventKind::SystemVariableWillChange => {
-            HistoryEventKind::SystemVariableWillChange
-        }
-        ffi::NativeHistoryEventKind::SystemVariableChanged => {
-            HistoryEventKind::SystemVariableChanged
-        }
-        ffi::NativeHistoryEventKind::UndoAuto => HistoryEventKind::UndoAuto,
-        ffi::NativeHistoryEventKind::UndoControl => HistoryEventKind::UndoControl,
-        ffi::NativeHistoryEventKind::UndoBegin => HistoryEventKind::UndoBegin,
-        ffi::NativeHistoryEventKind::UndoEnd => HistoryEventKind::UndoEnd,
-        ffi::NativeHistoryEventKind::UndoMark => HistoryEventKind::UndoMark,
-        ffi::NativeHistoryEventKind::UndoBack => HistoryEventKind::UndoBack,
-        ffi::NativeHistoryEventKind::UndoNumber => HistoryEventKind::UndoNumber,
-        ffi::NativeHistoryEventKind::RedoNumber => HistoryEventKind::RedoNumber,
-        ffi::NativeHistoryEventKind::UndoWriteBoundary => HistoryEventKind::UndoWriteBoundary,
-        ffi::NativeHistoryEventKind::SubcommandsWillBeUndone => {
-            HistoryEventKind::SubcommandsWillBeUndone
-        }
-        ffi::NativeHistoryEventKind::DocumentCreated => HistoryEventKind::DocumentCreated,
-        ffi::NativeHistoryEventKind::DocumentWillBeDestroyed => {
-            HistoryEventKind::DocumentWillBeDestroyed
-        }
-        ffi::NativeHistoryEventKind::DocumentBecameCurrent => {
-            HistoryEventKind::DocumentBecameCurrent
-        }
-        ffi::NativeHistoryEventKind::DocumentActivated => HistoryEventKind::DocumentActivated,
-        ffi::NativeHistoryEventKind::DatabaseWillBeDestroyed => {
-            HistoryEventKind::DatabaseWillBeDestroyed
-        }
-        ffi::NativeHistoryEventKind::DatabaseActivity => HistoryEventKind::DatabaseActivity,
-        ffi::NativeHistoryEventKind::DatabaseReactorAttachFailed => {
-            HistoryEventKind::DatabaseReactorAttachFailed
-        }
-        ffi::NativeHistoryEventKind::DatabaseReactorDetachFailed => {
-            HistoryEventKind::DatabaseReactorDetachFailed
-        }
-        ffi::NativeHistoryEventKind::Invalid => HistoryEventKind::Invalid,
-        _ => HistoryEventKind::Invalid,
-    };
-    scheduler::record_native_history_event(NativeHistoryEvent {
-        kind,
-        event_context: HistoryContext {
-            document_token: event.event_document_token,
-            database_token: event.event_database_token,
-        },
-        current_context: HistoryContext {
-            document_token: event.current_document_token,
-            database_token: event.current_database_token,
-        },
-        active_context: HistoryContext {
-            document_token: event.active_document_token,
-            database_token: event.active_database_token,
-        },
-        argument0: event.argument0,
-        argument1: event.argument1,
-        database_activity: event.database_activity,
-    });
 }
 
 fn native_actions_need_wake() -> bool {

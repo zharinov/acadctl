@@ -10,10 +10,10 @@ use acadctl_rpc::{
     ExecutionCancelDisposition, ExecutionCancelled, ExecutionClientMessage,
     ExecutionFailure as RpcExecutionFailure, ExecutionFinished, ExecutionMode as RpcExecutionMode,
     ExecutionOutcome as RpcExecutionOutcome, ExecutionOutput, ExecutionRequest,
-    ExecutionServerEvent, ExecutionService, ExecutionServiceServer, ExecutionSuccess, ListRequest,
-    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse,
-    SourceLocation as RpcSourceLocation, execution_client_message, execution_outcome,
-    execution_server_event,
+    ExecutionServerEvent, ExecutionService, ExecutionServiceServer, ExecutionSuccess,
+    HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
+    SaveRequest, SaveResponse, SourceLocation as RpcSourceLocation, execution_client_message,
+    execution_outcome, execution_server_event,
 };
 use futures_util::{Stream, stream};
 use tokio::sync::{mpsc, oneshot};
@@ -92,6 +92,30 @@ impl DocumentService for DocumentRpc {
         validate_document_id(&id)?;
         let document = crate::scheduler::save(id).await.map_err(scheduler_error)?;
         Ok(Response::new(SaveResponse {
+            document: Some(document),
+        }))
+    }
+
+    async fn undo(
+        &self,
+        request: Request<HistoryRequest>,
+    ) -> Result<Response<HistoryResponse>, Status> {
+        let id = request.into_inner().id;
+        validate_document_id(&id)?;
+        let document = crate::scheduler::undo(id).await.map_err(scheduler_error)?;
+        Ok(Response::new(HistoryResponse {
+            document: Some(document),
+        }))
+    }
+
+    async fn redo(
+        &self,
+        request: Request<HistoryRequest>,
+    ) -> Result<Response<HistoryResponse>, Status> {
+        let id = request.into_inner().id;
+        validate_document_id(&id)?;
+        let document = crate::scheduler::redo(id).await.map_err(scheduler_error)?;
+        Ok(Response::new(HistoryResponse {
             document: Some(document),
         }))
     }
@@ -443,6 +467,7 @@ fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
         | SchedulerError::LockFailed(_)
         | SchedulerError::SaveFailed(_)
         | SchedulerError::CloseFailed(_)
+        | SchedulerError::HistoryFailed { .. }
         | SchedulerError::OpenNotPublished
         | SchedulerError::SaveNotPublished
         | SchedulerError::CloseNotPublished
@@ -751,6 +776,90 @@ mod tests {
             assert_eq!(saved.id, opened.id);
             assert!(!saved.modified);
 
+            let mut undo_client = client.clone();
+            let undo_id = opened.id.clone();
+            let undo_response =
+                tokio::spawn(async move { undo_client.undo(HistoryRequest { id: undo_id }).await });
+            let undo_action = next_native_action().await;
+            assert_eq!(undo_action.kind, crate::ffi::NativeActionKind::Undo);
+            replace_documents(vec![
+                crate::ffi::NativeDocumentSnapshot {
+                    document_token: 1,
+                    database_token: 101,
+                    name: "/tmp/house.dwg".into(),
+                    named: true,
+                    modified: true,
+                    read_only: false,
+                },
+                crate::ffi::NativeDocumentSnapshot {
+                    document_token: 2,
+                    database_token: 102,
+                    name: "/tmp/site.dwg".into(),
+                    named: true,
+                    modified: true,
+                    read_only: true,
+                },
+            ]);
+            crate::scheduler::complete_native_action(
+                undo_action.job_id,
+                crate::ffi::NativeActionResult {
+                    kind: crate::ffi::NativeActionResultKind::Success,
+                    native_status: 0,
+                    native_detail: String::new(),
+                },
+            );
+            let undone = undo_response
+                .await
+                .unwrap()
+                .unwrap()
+                .into_inner()
+                .document
+                .unwrap();
+            assert_eq!(undone.id, opened.id);
+            assert!(undone.modified);
+
+            let mut redo_client = client.clone();
+            let redo_id = opened.id.clone();
+            let redo_response =
+                tokio::spawn(async move { redo_client.redo(HistoryRequest { id: redo_id }).await });
+            let redo_action = next_native_action().await;
+            assert_eq!(redo_action.kind, crate::ffi::NativeActionKind::Redo);
+            replace_documents(vec![
+                crate::ffi::NativeDocumentSnapshot {
+                    document_token: 1,
+                    database_token: 101,
+                    name: "/tmp/house.dwg".into(),
+                    named: true,
+                    modified: false,
+                    read_only: false,
+                },
+                crate::ffi::NativeDocumentSnapshot {
+                    document_token: 2,
+                    database_token: 102,
+                    name: "/tmp/site.dwg".into(),
+                    named: true,
+                    modified: true,
+                    read_only: true,
+                },
+            ]);
+            crate::scheduler::complete_native_action(
+                redo_action.job_id,
+                crate::ffi::NativeActionResult {
+                    kind: crate::ffi::NativeActionResultKind::Success,
+                    native_status: 0,
+                    native_detail: String::new(),
+                },
+            );
+            let redone = redo_response
+                .await
+                .unwrap()
+                .unwrap()
+                .into_inner()
+                .document
+                .unwrap();
+            assert_eq!(redone.id, opened.id);
+            assert!(!redone.modified);
+
             let close_error = client
                 .close(CloseRequest {
                     id: listed.documents[1].id.clone(),
@@ -767,6 +876,21 @@ mod tests {
         stop();
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(client);
+    }
+
+    async fn next_native_action() -> crate::ffi::NativeAction {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let action = crate::scheduler::take_native_action();
+            if action.kind != crate::ffi::NativeActionKind::None {
+                return action;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "RPC did not enqueue a native action"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
     }
 
     #[test]

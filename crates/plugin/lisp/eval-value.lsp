@@ -198,7 +198,7 @@
                     ({{CALLBACK}} {{CYCLE}} nil)))
                 (T
                   (acadctl:invalid-value-task)))
-            T)
+            T))
          '()))
      (setq acadctl:*errno* (getvar "ERRNO"))
      (if (vl-catch-all-error-p acadctl:outcome)
@@ -210,4 +210,4 @@
          (setq acadctl:*status* T)
          (setq acadctl:*error* nil)))))
   (setq acadctl:*value* nil)
-  (princ)))
+  (princ))

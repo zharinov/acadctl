@@ -36,6 +36,16 @@ enum Command {
         /// Document ID shown by `acadctl ls`.
         id: String,
     },
+    /// Undo the drawing's last AutoCAD history step.
+    Undo {
+        /// Document ID shown by `acadctl ls`.
+        id: String,
+    },
+    /// Redo the drawing's next AutoCAD history step.
+    Redo {
+        /// Document ID shown by `acadctl ls`.
+        id: String,
+    },
     /// Close an open AutoCAD document.
     Close {
         /// Document ID shown by `acadctl ls`.
@@ -66,6 +76,12 @@ async fn main() -> ExitCode {
         Command::Ls { long } => commands::ls::run(long).await,
         Command::Open { path, pid } => commands::open::run(path, pid).await,
         Command::Save { id } => commands::save::run(id).await,
+        Command::Undo { id } => {
+            commands::history::run(id, commands::history::Direction::Undo).await
+        }
+        Command::Redo { id } => {
+            commands::history::run(id, commands::history::Direction::Redo).await
+        }
         Command::Close { id, discard } => commands::close::run(id, discard).await,
         Command::Eval(arguments) => {
             commands::execute::run(
@@ -104,8 +120,6 @@ mod tests {
     #[test]
     fn does_not_keep_superseded_or_unimplemented_commands() {
         assert!(Cli::try_parse_from(["acadctl", "status"]).is_err());
-        assert!(Cli::try_parse_from(["acadctl", "undo", "k7m2qx"]).is_err());
-        assert!(Cli::try_parse_from(["acadctl", "redo", "k7m2qx"]).is_err());
         assert!(Cli::try_parse_from(["acadctl", "kill"]).is_err());
     }
 
@@ -123,6 +137,15 @@ mod tests {
 
         let cli = Cli::try_parse_from(["acadctl", "save", "k7m2qx"]).unwrap();
         assert!(matches!(cli.command, Command::Save { id } if id == "k7m2qx"));
+
+        let cli = Cli::try_parse_from(["acadctl", "undo", "k7m2qx"]).unwrap();
+        assert!(matches!(cli.command, Command::Undo { id } if id == "k7m2qx"));
+
+        let cli = Cli::try_parse_from(["acadctl", "redo", "k7m2qx"]).unwrap();
+        assert!(matches!(cli.command, Command::Redo { id } if id == "k7m2qx"));
+
+        assert!(Cli::try_parse_from(["acadctl", "undo", "k7m2qx", "--force"]).is_err());
+        assert!(Cli::try_parse_from(["acadctl", "redo", "k7m2qx", "2"]).is_err());
 
         let cli = Cli::try_parse_from(["acadctl", "close", "k7m2qx", "--discard"]).unwrap();
         assert!(matches!(

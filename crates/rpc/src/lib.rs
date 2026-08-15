@@ -15,8 +15,9 @@ pub use protocol::{
     ExecutionCancelAcknowledgement, ExecutionCancelDisposition, ExecutionCancelRequest,
     ExecutionCancelled, ExecutionClientMessage, ExecutionFailure, ExecutionFinished, ExecutionMode,
     ExecutionOutcome, ExecutionOutput, ExecutionRequest, ExecutionServerEvent, ExecutionSuccess,
-    ListRequest, ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse,
-    SourceLocation, execution_client_message, execution_outcome, execution_server_event,
+    HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
+    SaveRequest, SaveResponse, SourceLocation, execution_client_message, execution_outcome,
+    execution_server_event,
 };
 pub use transport::{Incoming, incoming};
 

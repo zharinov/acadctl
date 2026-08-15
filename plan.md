@@ -1,6 +1,14 @@
-# `acadctl eval`, `exec`, and controlled history
+# `acadctl eval`, `exec`, and drawing history
 
-Status: agreed design. The execution and history commands remain unimplemented until the native proof gates at the end of this document pass.
+Status: implementation and live verification are in progress. The installed private build now runs document-scoped `eval`, `exec`, `acadctl:println`, rollback, undo, and redo in AutoCAD 2027. Public release still depends on the remaining proof gates at the end of this document.
+
+## Current implementation checklist
+
+- [x] Bounded scanner, Rust execution state machine, output/value rendering, RPC, and CLI.
+- [x] Live document-scoped `exec`, `eval`, `acadctl:println`, readable values, Lisp diagnostics, and drawing rollback.
+- [x] Live drawing-wide `undo` and `redo`, including exact inactive-document routing and restoration of the prior active document.
+- [ ] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates.
+- [ ] Final static checks, implementation commit, first-principles naming sweep, and reconciled cleanup commit.
 
 ## Design center
 
@@ -10,7 +18,7 @@ The design has five priorities:
 
 1. Familiar AutoLISP behavior for source, values, definitions, and printing.
 2. Exact routing to one open document without disturbing work already happening in AutoCAD.
-3. One drawing undo unit per successful mutating request, with drawing rollback on failure or cancellation.
+3. One drawing undo group per non-empty request, with drawing rollback on failure or cancellation.
 4. Predictable Unix behavior for stdin, files, stdout, stderr, exit status, Ctrl+C, and broken connections.
 5. A minimal C++ bridge, with queueing, scanning, state, protocol, formatting, and policy owned by Rust.
 
@@ -22,8 +30,8 @@ AutoLISP remains fully capable code. `acadctl` is not a sandbox. Agent instructi
 | --- | --- | --- |
 | `acadctl eval <id> [file]` | Evaluate exactly one top-level AutoLISP form. | The form's readable value, followed by a newline; explicit `acadctl:println` output comes first. |
 | `acadctl exec <id> [file]` | Execute zero or more top-level AutoLISP forms as one batch. | Only explicit `acadctl:println` output. |
-| `acadctl undo <id> [--force]` | Undo one drawing-history step. | Nothing. |
-| `acadctl redo <id> [--force]` | Redo one drawing-history step. | Nothing. |
+| `acadctl undo <id>` | Undo the drawing's last AutoCAD history step. | Nothing. |
+| `acadctl redo <id>` | Redo the drawing's next AutoCAD history step. | Nothing. |
 | `acadctl kill [pid] [--force]` | Terminate an AutoCAD instance, not an execution request. | Nothing. |
 
 `<id>` is the document ID reported by `acadctl ls`. The document ID also resolves the owning AutoCAD process, matching the existing `save` and `close` commands.
@@ -254,8 +262,8 @@ This is a state model, not an additional public job API.
 
 Every accepted `eval` or `exec` containing at least one form opens one undo group in the target drawing. All top-level forms in an `exec` share that group.
 
-- Success closes the group and leaves one natural AutoCAD undo step if the request produced undoable drawing changes.
-- A request with no undoable drawing changes does not claim an owned history step.
+- Success closes the group and leaves one natural AutoCAD undo step.
+- Empty `exec` is the only execution that skips the group entirely. AutoCAD may create a group record for non-empty read-only or Lisp-only work; acadctl does not infer otherwise.
 - AutoLISP failure, native failure, or cooperative cancellation stops execution and rolls the target drawing back to the beginning of the group.
 - Rollback is owned by AutoCAD document undo, not `AcTransactionManager`, because arbitrary AutoLISP and nested AutoCAD commands are not contained by a database transaction.
 
@@ -264,7 +272,8 @@ The atomicity boundary is deliberately drawing-only:
 - `setq`, `defun`, and other document AutoLISP environment changes are not undone by drawing undo and can remain after a later failure.
 - File I/O, COM calls, saves, other drawings, subprocesses, and other external effects are not rolled back.
 - Output already sent to stdout remains sent.
-- If drawing rollback itself cannot be proved successful, the result is an explicit rollback failure with unknown drawing outcome, and owned history provenance is cleared.
+- If drawing rollback itself cannot be proved successful, the result is an explicit rollback failure with unknown drawing outcome.
+- Successful rollback describes the drawing state when the request finishes. AutoCAD can retain the rolled-back group as the next redo step; a later ordinary `acadctl redo` or interactive `REDO` may therefore reapply it.
 
 This boundary makes failure behavior honest without pretending arbitrary Lisp side effects are transactional.
 
@@ -275,7 +284,8 @@ This boundary makes failure behavior honest without pretending arbitrary Lisp si
 Ctrl+C is scoped to the foreground `eval` or `exec` request:
 
 1. The first Ctrl+C sends an explicit cancellation message and keeps the CLI attached while the plugin reaches a safe checkpoint and rolls the drawing back.
-2. The second Ctrl+C detaches the CLI immediately. The already-sent cancellation request remains active, and the local process exits with status `130`.
+2. The second Ctrl+C requests detachment. The CLI exits after the plugin acknowledges the cancellation or reports that it is too late.
+3. A third Ctrl+C is the explicit unconfirmed escape. It exits with status `130` and warns that the accepted job may still be running.
 
 Cancellation is cooperative:
 
@@ -304,45 +314,21 @@ This choice avoids stopping between forms after non-undoable Lisp or external ef
 
 Forced termination can lose unsaved work in every document and cannot perform drawing rollback. Ctrl+C never implies either form of `kill`.
 
-## Safe undo and redo
+## Undo, redo, and save
 
-The default history commands operate only on positively known acadctl history. They never probe by issuing `U` or `REDO` against an unknown top entry.
+`undo` and `redo` deliberately use the same drawing-wide history the user sees inside AutoCAD. They do not distinguish user changes from acadctl changes, do not maintain provenance, and do not inspect or infer ownership.
 
-The plugin tracks a conservative, contiguous suffix of owned history per document:
+Each invocation:
 
-```rust
-struct HistoryProvenance {
-    undo_suffix: Vec<OwnedStep>,
-    redo_suffix: Vec<OwnedStep>,
-}
+- resolves the document ID to one exact open document/database generation at the FIFO head;
+- requires a quiescent document and fails busy without cancelling user work;
+- establishes and later restores the native document context;
+- issues exactly one fixed native `U` or `REDO` command;
+- returns the refreshed document state and prints nothing on success.
 
-struct OwnedStep {
-    execution_id: ExecutionId,
-    mode: ExecutionMode,
-    source_name: String,
-}
-```
+There is no `--force`, count, unknown barrier, safe-history mode, reactor trace grammar, or hidden repair command. Repeated invocations provide repeated traversal. If there is no applicable native history step, acadctl reports the native command result without probing through an extra mutation.
 
-An unknown barrier is implicit below each suffix. The tracker never claims knowledge of history that existed before observation began.
-
-Rules:
-
-- A successful request is added to `undo_suffix` only when AutoCAD reactor evidence confirms that the request produced the expected undo group.
-- A new owned drawing change clears `redo_suffix`.
-- A request that produces no undo record, such as a query, `setq`, or `defun`, neither adds nor clears `undo_suffix`.
-- A successful safe undo moves the top owned step from `undo_suffix` to `redo_suffix`.
-- A successful safe redo moves the top owned step back to `undo_suffix`.
-- Repeated safe undo and redo calls may traverse the contiguous owned suffix one step per invocation.
-- Any user command or Lisp activity, external database change, manual undo or redo, undo-control change, document replacement, plugin reload, or ambiguous event invalidates knowledge conservatively.
-- An intervening Lisp execution invalidates redo knowledge even if it is read-only, because native `REDO` requires immediate history continuity. Known undo ownership can remain when the request provably created no undo record.
-- Default redo recognizes only steps previously undone through `acadctl undo`.
-- After plugin load or reload, pre-existing undo and redo history is unknown.
-
-If ownership is not positive, the default commands refuse with `nothing safe to undo` or `nothing safe to redo`.
-
-`--force` bypasses provenance and performs exactly one native top undo or redo step. It still fails if no such step exists. A forced history operation clears both owned suffixes because the surrounding history is no longer known. The flag is never added or escalated automatically.
-
-The required evidence comes from execution scope plus editor, document, database, system-variable, undo-boundary, and undo/redo reactor events. C++ forwards the events; Rust owns the provenance state machine. False negatives are acceptable. Acting on a user-owned or unknown step without `--force` is not.
+`save` is the persistence checkpoint. Users who want a durable recovery point save before handing control to an agent, exactly as they do before risky interactive work. Saving does not clear or partition AutoCAD's undo history: subsequent undo or redo can still change the in-memory drawing, and another save is required to persist that later state.
 
 ## Execution protocol
 
@@ -421,23 +407,24 @@ Rust owns the load-bearing behavior:
 - Top-level lexical scanning and source locations.
 - Per-instance FIFO admission and deadlines.
 - Execution, cancellation, output, and terminal state.
+- Drawing-wide undo/redo direction, FIFO placement, and exact document-generation targeting.
 - Bounded output buffering and disconnect behavior.
 - Error classification and user-facing formatting.
-- Undo/redo provenance.
 - RPC messages and service behavior.
 
 ### C++
 
 The ObjectARX C++ surface remains bridge boilerplate:
 
-- Register and unregister ObjectARX callbacks and `acadctl:println`.
+- Register and unregister lifecycle callbacks and `acadctl:println`.
 - Schedule Rust-owned native actions in application context.
-- Resolve, activate, lock, and restore document context as directed by Rust.
-- Enter the supported synchronous in-memory AutoLISP execution path.
-- Open, close, roll back, undo, and redo native undo groups as directed by Rust.
-- Forward editor, Lisp, database, document, system-variable, and undo/redo events to Rust.
+- Resolve, establish, and restore document context as directed by Rust; lock only native database work that requires an explicit application-context lock.
+- Enter the target document's AutoLISP driver and exchange one staged form or value event per registered callback.
+- Open, close, and roll back the current execution's native undo group as directed by Rust.
+- Issue one fixed `U` or `REDO` action selected by Rust.
+- Coalesce native database changes only to refresh the Rust-owned document snapshot.
 
-No queueing policy, scanner, printer policy, error policy, or provenance state belongs in C++.
+No queueing policy, scanner, printer policy, error policy, history model, or document state belongs in C++.
 
 ### AutoLISP shim
 
@@ -481,10 +468,9 @@ Source remains in memory. A temporary `.lsp` file, `load`, command-line paste, o
 | Use exit status `75` for busy | `EX_TEMPFAIL` is established but obscure for an interpreter. Conventional `1`, plus a clear diagnostic, is less surprising. |
 | Prefix every error with several categories | The process and source context already identify the tool. A concise two-line diagnostic is easier to read. |
 | Build a full parser for inner-expression error columns | The native evaluator does not provide enough correlation to make those locations reliable. The top-level form start is honest. |
-| Blindly expose native `U` and `REDO` by default | A remote agent could undo user work. Default history operations require positive ownership. |
-| Remove provenance because `redo` exists | Redo can repair only an immediately preceding undo and does not prevent temporarily touching user state. It is a recovery operation, not ownership proof. |
-| Persist provenance by modifying the drawing | History tracking must not dirty drawings or add sentinel changes. Conservative in-memory evidence is sufficient and fails closed after reload. |
-| Add counts to undo and redo initially | One step per invocation keeps ownership checks and failures precise. Repeated calls traverse a known contiguous suffix. |
+| Track whether a history step belongs to acadctl | AutoCAD exposes drawing-wide undo/redo, not a stable supported top-record identity. Ownership inference is version-sensitive complexity that disagrees with the user's normal history model. |
+| Add `--force` or a separate safe-history mode | There is only one drawing-wide meaning. Saving is the explicit persistence checkpoint; history commands do not pretend to add a stronger safety boundary. |
+| Add counts to undo and redo initially | One fixed native step per invocation keeps routing, failures, and user intent precise. Repeated calls provide repeated traversal. |
 | Add IPC protocol versioning | The project is early-stage and does not preserve compatibility with an older execution protocol. |
 
 ## Native proof gates
@@ -494,21 +480,20 @@ The design depends on behavior that documentation alone does not establish stron
 | Gate | Required evidence | Consequence if the evidence fails |
 | --- | --- | --- |
 | Exact document routing | In-memory source evaluates in the requested document's Lisp environment; the prior active document is restored; another document is untouched. | `eval` and `exec` do not ship. |
-| Synchronous evaluator | A supported application-context path evaluates one source form synchronously, captures success/error, suppresses wrapper echo, and returns control between forms. | `eval` and `exec` do not ship; asynchronous command-line injection is not substituted. |
+| Document-context evaluator | A supported target-document Lisp driver evaluates one staged source form at a time, captures success/error, suppresses wrapper echo, and returns control to Rust between forms. | `eval` and `exec` do not ship until the driver and callback lifecycle are exact. |
 | Reader compatibility | Scanner spans agree with AutoLISP for atoms, quotes, strings and escapes, line and block comments, nested lists, dotted data, Unicode, BOM, CRLF, empty input, and incomplete input. | Scanner behavior is corrected before integration. |
 | Value capture | Ordinary and opaque values can be formatted without confusing a returned error object with an uncaught error. Entity handles are stable enough for `handent`. | Unsupported values fall back to an honest opaque display; `eval` does not ship if success and failure cannot be distinguished. |
-| One undo group | Multiple top-level forms create one natural drawing undo step; read-only or Lisp-only source creates no claimed owned step. | Batch execution does not ship. |
-| Rollback | A later form failure and cooperative cancellation restore the target drawing while leaving already documented non-drawing effects outside the guarantee. | Mutating execution does not ship. |
+| One undo group | Multiple top-level forms create one natural drawing undo step. Empty `exec` creates none; AutoCAD's behavior for other non-mutating groups is accepted as native history behavior. | Batch execution does not ship. |
+| Rollback | A later form failure and cooperative cancellation restore the target drawing while leaving already documented non-drawing effects outside the guarantee. Immediate `REDO` may reapply the rolled-back group. | Mutating execution does not ship. |
 | Busy admission | Active commands, command prompts, scripts, Lisp, dialogs, and unavailable locks are not cancelled or interrupted; expiry happens off the main loop. | Admission behavior is corrected before execution ships. |
 | Cancellation checkpoints | A queued request cancels immediately; cancellation is observed between forms; blocked output wakes; one unreturned form remains honestly uninterruptible. | The contract is narrowed to only the checkpoints proven. |
 | Output routing | `acadctl:println` reaches only its owning client, preserves order, applies bounded backpressure, becomes a no-op without a sink, and does not alter standard AutoLISP printers. | Public output does not ship until routing is deterministic. |
 | Disconnect survival | An accepted job outlives its RPC sink, stops buffering after disconnect, and reaches a terminal internal state without leaking queue entries. | Disconnect semantics are corrected before streaming execution ships. |
-| Provenance | Reactor evidence reliably identifies owned undo groups and invalidates on foreign or ambiguous history activity. Safe repeated undo/redo never crosses the unknown barrier. | Default `undo` and `redo` do not ship; blind native history calls are not substituted. |
-| Forced history | `--force` performs exactly one native step, reports absence cleanly, and clears provenance. | The flags remain unavailable. |
+| Drawing history | One fixed `U` or `REDO` executes in the exact requested document, affects the same history visible to the user, reports native absence/failure honestly, and restores the prior current/active context. | `undo` and `redo` do not ship until routing and context restoration are exact. |
 | Source limit | A 4 MiB source is accepted with protocol overhead, a source one byte larger is rejected by both sides, and no transport default creates a smaller accidental limit. | Transport limits are aligned with the application contract. |
 | Process termination | Graceful termination respects the five-second wait and never escalates; forced termination targets only the selected PID. | `kill` remains unavailable until process selection and termination are exact. |
 
-The first implementation artifact is a narrow native vertical slice for routing, synchronous in-memory evaluation, undo grouping, rollback, and reactor provenance. The public CLI and full streaming protocol follow only after those foundations are demonstrated in live AutoCAD. No placeholder `exec`, protocol-version field, or knowingly incomplete history command is added in the meantime.
+The implementation remains a narrow native bridge for routing, fixed AutoCAD operations, evaluation, undo grouping, rollback, and lifecycle observation. Rust owns scanning, queueing, state, protocol, formatting, and policy. No protocol-version field or native history state machine is introduced.
 
 ## Reference behavior
 
@@ -632,6 +617,8 @@ Issuing an additional blind `U` after a successfully closed group was rejected a
 
 ### 2026-08-14 — I-018: native execution is compile-proved but not runtime-proved
 
+This historical checkpoint is superseded by I-069.
+
 The private bridge compiles and links against the installed ObjectARX 2027 SDK with the required application-context, document-locking, symbol, synchronous-command, and undo APIs. The embedded reader/evaluator expression has separately passed live AutoLISP conformance checks in AutoCAD 2027.
 
 These are not yet evidence that `acedPutSym` followed by `acedCommandS` works through the plugin callback, that an inactive target receives the correct Lisp environment without UI activation, or that `_UNDO _Begin`, `_End`, and `U` provide the expected reactor-observable group. Replacing the installed trusted ApplicationAddins bundle with the newly built private slice was not performed because that persistent external change requires explicit user approval. The public commands remain absent, and static linkability plus a manually entered Lisp oracle are not reported as a passed native proof gate.
@@ -656,7 +643,7 @@ Before `_UNDO _Begin`, the bridge reads `UNDOCTL` and refuses admission when bit
 
 Using `undoRecording()` alone was rejected because it says recording is enabled but does not exclude a pre-existing user group. Treating `acedCommandS` success or failure as proof of the resulting group state was rejected because a command can partially transition before reporting failure. Issuing `U` when this request never positively opened a group was rejected because it could undo the preceding user-owned step.
 
-The normal rollback path remains a live proof gate. In addition to proving `_End` plus `U` restores representative failures, verification must determine whether that sequence leaves the failed request on AutoCAD's redo stack. A rollback that can later be resurrected by an ordinary user `REDO` is not accepted as the final implementation; static command return codes do not answer that question.
+I-068 supersedes the earlier requirement that rollback remove its redo entry. The bridge must still prove that `_End` plus `U` restores the drawing when the request finishes. A later ordinary `REDO` may reapply that group as part of AutoCAD's drawing-wide history.
 
 ### 2026-08-14 — I-022: native staging roots and transient conversions are explicitly released
 
@@ -910,7 +897,7 @@ The eager `SourceBatch` and `SourceShape` examples in the original design are su
 
 The committed implementation now covers the lexical scanner, document-generation identity, scheduler-owned mutation jobs, private execution lease, bounded output, typed value rendering, request-routed `acadctl:println`, post-commit eval value emission, cancellation state, and bounded bidirectional Execute RPC. The architecture naming sweep is the final refactor before a public execution client consumes those APIs.
 
-The next implementation slice is the CLI `eval` and `exec` surface: stdin/file selection, local source checks, document-to-process routing, ordered stdout/stderr rendering, exit status, and two-stage Ctrl+C. Provenance-safe undo/redo follows only if the native history gates establish ownership without touching user steps. CLI-only process kill follows history, then the live AutoCAD gates and final cancellation/performance/memory/architecture reviews close the implementation sequence.
+I-056 through I-060 completed the CLI execution surface, and I-068 replaced provenance-safe history with ordinary drawing-wide undo and redo. This checkpoint remains only as implementation history.
 
 ### 2026-08-14 — I-056: the CLI validates one bounded in-memory source before contacting AutoCAD
 
@@ -993,3 +980,27 @@ The first native history-evidence boundary does not infer ownership. C++ forward
 That summary is diagnostic scaffolding, not the future authorization predicate: it deliberately loses order and repeated-event counts. The disposable native trace probe remains the source of ordered live evidence for I-062. If the trace proves a unique predicate, its exact state machine will be implemented in Rust before any production ownership transition or history command is enabled; otherwise safe undo and redo remain absent.
 
 Database observation failure is durable and fail-closed. C++ reports a typed attachment or detachment operation, raw native status, and the database-only subject; Rust permanently retains the first such failure for the loaded process and refuses to preserve any provenance after it. An attachment failure is retried while the exact generation remains open unless AutoCAD reports the ambiguous `eDuplicateKey` result. Every database reactor enters stable bridge-owned storage before `addReactor`, so no allocation or ownership transfer occurs after AutoCAD could retain its raw address. A failed removal or ambiguous duplicate attachment means AutoCAD may still retain that address, so the application-locked bridge keeps the storage and stops attaching new database reactors, bounding retained callbacks by the set that existed when ownership first became unprovable. Plugin unload is refused until every retained reactor has observed database goodbye. Application-context callbacks are likewise counted from scheduling through return, new wake requests are closed before RPC shutdown, and unload is refused while any callback is queued or running because ObjectARX exposes no cancellation operation for them. The initial document snapshot and native reactor installation complete before the RPC endpoint is published, so the first client cannot observe an artificial empty registry. If native initialization throws after callback installation or later RPC startup fails and cleanup cannot prove ownership released, RPC stays stopped and the inert locked module reports successful load rather than returning an error that would unload its code. Successful removal happens before the final atomic drain and destruction. A goodbye or database-destruction callback tombstones every matching subscription before snapshot code can dereference or reattach it. Dense activity is drained before Rust publishes a new active native job and again before that job completes, so an earlier foreign event cannot be attributed to the next mutation and a final owned event cannot escape its job lifetime. Because the installed headers do not state that reactor removal joins an already-running callback, callback thread identity and teardown overlap remain an explicit live gate before this evidence can authorize history.
+
+### 2026-08-14 — I-068: undo and redo are ordinary drawing-wide AutoCAD history
+
+I-062 through I-067 are superseded as product architecture. The live trace work proved why a provenance layer is the wrong abstraction: ObjectARX exposes no supported stable top-record identity, explicit groups can create records without database mutation, and the observed details are sensitive to host behavior rather than an acadctl domain guarantee. Maintaining an owned suffix would add a second, partial model of history that users already understand as drawing-wide AutoCAD state.
+
+`acadctl undo <id>` and `acadctl redo <id>` therefore perform exactly one ordinary drawing history action, regardless of whether the affected step came from the user, an acadctl execution, or another integration. They have no force flag, count, provenance, ownership claim, revision, trace predicate, or repair sequence. Rust owns the single FIFO operation, direction, exact document-generation target, RPC result, and diagnostic policy. C++ only establishes the physical document context, issues fixed `_.U` or `_.REDO`, restores context, and reports raw status.
+
+The persistence model is the familiar one: save before risky work when the on-disk drawing must remain a recovery point. Save does not truncate native undo history. A successful execution still creates one explicit group. Failure or cancellation closes that group and issues `U`; live AutoCAD proved the resulting group can remain redoable, and that is now documented ordinary history behavior rather than a release blocker. The experimental ownership ledger, raw history-event FFI, ordered trace predicate, redo-barrier investigation, and public safe-history gates are deleted. The native database observers remain only as lifecycle-safe, coalesced document-snapshot invalidation; no history semantics cross that boundary.
+
+### 2026-08-14 — I-069: the installed private build passes the core document-context path
+
+The freshly built and installed AutoCAD 2027 plugin passed live document-scoped execution in a fresh process. `exec` ran multiple forms in order, `acadctl:println` streamed explicit output, and `eval` returned a number, nested dotted list, escaped string, symbol, and entity handle. A failing second form returned AutoLISP's own `bad argument type` detail and removed geometry created by the first form. An inactive target executed successfully while AutoCAD restored the previously active drawing.
+
+One fixed `U`, one fixed `REDO`, and a final `U` moved the same execution-created entity through absent, present, and absent states. The same history action also routed to an inactive target and restored the prior active drawing. A request issued while AutoCAD was still completing the preceding document command failed busy and succeeded after the document became quiescent; it did not cancel or intrude on that work.
+
+This evidence closes the core evaluator, value-output, representative rollback, exact inactive-document routing, and ordinary drawing-history gates for the tested AutoCAD 2027 build. It does not close cancellation, disconnect, blocked-output, maximum-source, lifecycle/unload, platform, or process-termination gates. Those remain required before public release.
+
+### 2026-08-14 — I-070: execution uses one queued document Lisp driver, not a synchronous application callback
+
+This entry supersedes the native mechanics in I-002, I-013, and I-019 while preserving their batch, FIFO, and exact-document requirements. An application-context callback verifies quiescence and the exact target generation, activates the target when necessary, and queues one fixed outer AutoLISP driver in that document. The Rust scheduler keeps the same mutation job active until the driver and its application-context finalizer finish; it does not expose the next FIFO item between forms.
+
+The outer driver repeatedly calls one registered bridge function. Each call either stages one Rust-selected evaluator or value-visitor form and returns `T`, or returns `nil` after Rust reaches a terminal step. Rust owns form order, execution state, cancellation, outcomes, and output. C++ owns only the physical AutoCAD context, undo-group state, bounded symbol transfer, and callback correlation. No application-context callback, explicit document lock, or old synchronous C++ step loop is retained across the batch.
+
+The bridge records outer-driver start, nested Lisp depth, driver end, callback activity, and terminal readiness as separate facts. Entry into the registered execution callback also establishes the outer-driver correlation if AutoCAD's undocumented `lispWillStart` text normalization prevented an exact match. The action finalizes only after the terminal callback and outer Lisp return both occur. Premature termination or any internal bridge failure with an unproved undo group, staged program, value writer, or reserved evaluator state becomes `ExecutionCleanupFailed`, which quarantines later mutation until AutoCAD restarts. The application-context finalizer then restores and verifies the previous active document, refreshes snapshots, completes the same Rust job, and only afterward wakes the next FIFO item.

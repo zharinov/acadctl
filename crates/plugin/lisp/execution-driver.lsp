@@ -1,0 +1,6 @@
+(defun acadctl:_run-execution (/ acadctl:mode acadctl:program)
+  (while (setq acadctl:mode (acadctl:_execute-action))
+    (setq acadctl:program (read acadctl:*program*))
+    (eval acadctl:program))
+  (setq acadctl:*program* nil)
+  (princ))

@@ -97,27 +97,6 @@ impl DocumentRegistry {
             })
             .map(document_target)
     }
-
-    pub fn native_keys(&self) -> impl Iterator<Item = NativeDocumentKey> + '_ {
-        self.documents.iter().map(|tracked| tracked.native_key)
-    }
-
-    pub(crate) fn resolve_native_key(
-        &self,
-        document_token: usize,
-        database_token: usize,
-    ) -> Option<NativeDocumentKey> {
-        if document_token == 0 && database_token == 0 {
-            return None;
-        }
-
-        let mut matches = self.documents.iter().filter(|tracked| {
-            (document_token == 0 || tracked.native_key.document_token == document_token)
-                && (database_token == 0 || tracked.native_key.database_token == database_token)
-        });
-        let native_key = matches.next()?.native_key;
-        matches.next().is_none().then_some(native_key)
-    }
 }
 
 fn public_document(id: String, native: NativeDocumentSnapshot) -> Document {
@@ -227,30 +206,6 @@ mod tests {
                 .database_token,
             99
         );
-    }
-
-    #[test]
-    fn resolves_only_current_native_document_generations() {
-        let mut documents = DocumentRegistry::new();
-        documents.replace(vec![
-            named_document(1, "/tmp/one.dwg"),
-            named_document(2, "/tmp/two.dwg"),
-        ]);
-
-        let first = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        assert_eq!(documents.resolve_native_key(1, 101), Some(first));
-        assert_eq!(documents.resolve_native_key(1, 0), Some(first));
-        assert_eq!(documents.resolve_native_key(0, 101), Some(first));
-        assert_eq!(documents.resolve_native_key(1, 999), None);
-        assert_eq!(documents.resolve_native_key(0, 0), None);
-
-        let mut duplicate_database = named_document(3, "/tmp/three.dwg");
-        duplicate_database.database_token = 101;
-        documents.replace(vec![named_document(1, "/tmp/one.dwg"), duplicate_database]);
-        assert_eq!(documents.resolve_native_key(0, 101), None);
     }
 
     #[test]

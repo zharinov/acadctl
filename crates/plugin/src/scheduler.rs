@@ -14,9 +14,6 @@ use crate::execution::{
     Execution, ExecutionOutcome, ExecutionStepResult, NativeExecutionStep, bound_diagnostic,
 };
 use crate::ffi::{NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind};
-use crate::history::{
-    ActiveHistoryEvidence, HistoryObservationFailure, HistoryProvenance, NativeHistoryEvent,
-};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -38,8 +35,6 @@ pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 
 struct MutationScheduler {
     documents: DocumentRegistry,
-    provenance: HistoryProvenance,
-    history_observation_failure: Option<HistoryObservationFailure>,
     pending: VecDeque<MutationJob>,
     active: Option<MutationJob>,
     wake_pending: bool,
@@ -51,7 +46,6 @@ struct MutationJob {
     job_id: MutationJobId,
     operation: Operation,
     native_target: Option<NativeDocumentKey>,
-    history_evidence: Option<ActiveHistoryEvidence>,
     start_deadline: Option<Instant>,
     waiting_for_readiness: bool,
     retry_at: Option<Instant>,
@@ -85,10 +79,20 @@ enum Operation {
         id: String,
         discard: bool,
     },
+    History {
+        id: String,
+        direction: HistoryDirection,
+    },
     Execute {
         id: String,
         execution: Box<Execution>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryDirection {
+    Undo,
+    Redo,
 }
 
 enum OperationOutcome {
@@ -147,6 +151,10 @@ pub enum Error {
     LockFailed(NativeFailure),
     SaveFailed(NativeFailure),
     CloseFailed(NativeFailure),
+    HistoryFailed {
+        direction: HistoryDirection,
+        failure: NativeFailure,
+    },
     OpenNotPublished,
     SaveNotPublished,
     CloseNotPublished,
@@ -208,6 +216,13 @@ impl fmt::Display for Error {
             Self::CloseFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not close the document")
             }
+            Self::HistoryFailed { direction, failure } => failure.fmt_with_context(
+                formatter,
+                match direction {
+                    HistoryDirection::Undo => "Could not undo the drawing's last history step",
+                    HistoryDirection::Redo => "Could not redo the drawing's next history step",
+                },
+            ),
             Self::OpenNotPublished => formatter
                 .write_str("AutoCAD opened the drawing but did not publish its document state"),
             Self::SaveNotPublished => {
@@ -296,8 +311,6 @@ impl MutationScheduler {
     const fn new() -> Self {
         Self {
             documents: DocumentRegistry::new(),
-            provenance: HistoryProvenance::new(),
-            history_observation_failure: None,
             pending: VecDeque::new(),
             active: None,
             wake_pending: false,
@@ -316,7 +329,10 @@ impl MutationScheduler {
             .chain(self.active.iter())
             .filter_map(|job| match &job.operation {
                 Operation::Execute { execution, .. } => Some(execution.source_bytes()),
-                Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => None,
+                Operation::Open { .. }
+                | Operation::Save { .. }
+                | Operation::Close { .. }
+                | Operation::History { .. } => None,
             })
             .fold((0, 0), |(count, bytes), source_bytes| {
                 (count + 1, bytes + source_bytes)
@@ -368,6 +384,21 @@ pub async fn close(id: String, discard: bool) -> Result<(), Error> {
     }
 }
 
+pub async fn undo(id: String) -> Result<Document, Error> {
+    history(id, HistoryDirection::Undo).await
+}
+
+pub async fn redo(id: String) -> Result<Document, Error> {
+    history(id, HistoryDirection::Redo).await
+}
+
+async fn history(id: String, direction: HistoryDirection) -> Result<Document, Error> {
+    match dispatch(Operation::History { id, direction }).await? {
+        OperationOutcome::Document(document) => Ok(document),
+        OperationOutcome::Closed | OperationOutcome::Execution(_) => Err(Error::DocumentGone),
+    }
+}
+
 pub fn admit_execution(
     id: String,
     execution: Execution,
@@ -415,7 +446,6 @@ pub fn admit_execution(
                     execution: Box::new(execution),
                 },
                 native_target: None,
-                history_evidence: None,
                 start_deadline: Some(deadline),
                 waiting_for_readiness: false,
                 retry_at: None,
@@ -499,46 +529,6 @@ pub fn list() -> Result<Vec<Document>, Error> {
 pub fn replace_documents(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
         scheduler.documents.replace(documents);
-        let keys = scheduler.documents.native_keys().collect::<Vec<_>>();
-        if let Some(job) = scheduler.active.as_mut()
-            && job
-                .native_target
-                .is_some_and(|target| !keys.contains(&target))
-        {
-            job.history_evidence = None;
-        }
-        scheduler.provenance.reconcile_documents(keys);
-    }
-}
-
-pub fn record_native_history_event(event: NativeHistoryEvent) {
-    let Ok(mut scheduler) = SCHEDULER.lock() else {
-        return;
-    };
-    let event_subject = scheduler.documents.resolve_native_key(
-        event.event_context.document_token,
-        event.event_context.database_token,
-    );
-
-    if scheduler.history_observation_failure.is_none() {
-        scheduler.history_observation_failure = event.observation_failure();
-    }
-
-    if scheduler.history_observation_failure.is_some() {
-        scheduler.provenance.invalidate_all();
-    } else if event.kind.invalidates_provenance() {
-        if let Some(key) = event_subject {
-            scheduler.provenance.invalidate(key);
-        } else {
-            scheduler.provenance.invalidate_all();
-        }
-    }
-
-    if let Some(job) = scheduler.active.as_mut()
-        && let Some(target) = job.native_target
-        && let Some(evidence) = job.history_evidence.as_mut()
-    {
-        evidence.record(target, event_subject, event);
     }
 }
 
@@ -552,9 +542,7 @@ pub fn stop() {
     let stopped = SCHEDULER.lock().ok().map(|mut scheduler| {
         scheduler.stopping = true;
         scheduler.wake_pending = false;
-        scheduler.provenance.invalidate_all();
         let active_output = scheduler.active.as_mut().and_then(|job| {
-            job.history_evidence = None;
             if let Operation::Execute { execution, .. } = &mut job.operation {
                 let _ = execution.request_cancel();
                 Some(execution.output_sink())
@@ -606,7 +594,6 @@ async fn dispatch(operation: Operation) -> Result<OperationOutcome, Error> {
             job_id,
             operation,
             native_target: None,
-            history_evidence: None,
             start_deadline: None,
             waiting_for_readiness: false,
             retry_at: None,
@@ -650,10 +637,6 @@ pub fn take_native_action() -> NativeAction {
                                 document_token: action.document_token,
                                 database_token: action.database_token,
                             });
-                        if let Some(target) = job.native_target {
-                            scheduler.provenance.invalidate(target);
-                            job.history_evidence = Some(ActiveHistoryEvidence::default());
-                        }
                         scheduler.active = Some(job);
                         TakeDecision::Action(action)
                     }
@@ -707,7 +690,6 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
                 true
             } else {
                 job.native_target = None;
-                job.history_evidence = None;
                 job.defer_for_readiness(Instant::now());
                 scheduler.pending.push_front(job);
                 TIMERS_CHANGED.notify_one();
@@ -718,15 +700,20 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
         };
 
         let output = job.operation.output_sink();
+        let native_target = job.native_target;
         let outcome = if settled_before_start {
-            finalize(&mut job.operation, &scheduler.documents)
+            finalize(&mut job.operation, &scheduler.documents, native_target)
         } else {
-            complete_operation(result, &mut job.operation, &scheduler.documents)
+            complete_operation(
+                result,
+                &mut job.operation,
+                &scheduler.documents,
+                native_target,
+            )
         };
         let pending = if quarantine {
             scheduler.quarantined = true;
             scheduler.wake_pending = false;
-            scheduler.provenance.invalidate_all();
             std::mem::take(&mut scheduler.pending)
                 .into_iter()
                 .map(|job| (job.completion, job.operation.output_sink()))
@@ -774,9 +761,10 @@ pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
                         Action::Result(CancelResult::TooLate)
                     }
                 }
-                Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
-                    Action::Result(CancelResult::NotFound)
-                }
+                Operation::Open { .. }
+                | Operation::Save { .. }
+                | Operation::Close { .. }
+                | Operation::History { .. } => Action::Result(CancelResult::NotFound),
             }
         } else if let Some(index) = scheduler.pending.iter().position(|job| {
             job.job_id == job_id && matches!(job.operation, Operation::Execute { .. })
@@ -785,7 +773,10 @@ pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
                 Operation::Execute { execution, .. } => execution
                     .cancel_before_start()
                     .then(|| execution.output_sink()),
-                Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
+                Operation::Open { .. }
+                | Operation::Save { .. }
+                | Operation::Close { .. }
+                | Operation::History { .. } => {
                     unreachable!("only queued executions are selected")
                 }
             };
@@ -879,7 +870,7 @@ fn process_due_timers(now: Instant) {
             let mut job = scheduler.pending.remove(index).expect("queued job exists");
             if job.expire_if_due(now) {
                 let output = job.operation.output_sink();
-                let outcome = finalize(&mut job.operation, &scheduler.documents);
+                let outcome = finalize(&mut job.operation, &scheduler.documents, None);
                 expired.push((job.completion, outcome, output));
             } else {
                 scheduler.pending.insert(index, job);
@@ -940,9 +931,10 @@ pub fn take_execution_step(job_id: MutationJobId) -> NativeExecutionStep {
     job.expire_if_due(Instant::now());
     match &mut job.operation {
         Operation::Execute { execution, .. } => execution.take_step(),
-        Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => {
-            NativeExecutionStep::invalid()
-        }
+        Operation::Open { .. }
+        | Operation::Save { .. }
+        | Operation::Close { .. }
+        | Operation::History { .. } => NativeExecutionStep::invalid(),
     }
 }
 
@@ -964,7 +956,10 @@ pub fn begin_println(document_token: usize, database_token: usize) -> NativeValu
         }
         match &job.operation {
             Operation::Execute { execution, .. } => execution.acquire_form_output(),
-            Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => None,
+            Operation::Open { .. }
+            | Operation::Save { .. }
+            | Operation::Close { .. }
+            | Operation::History { .. } => None,
         }
     };
 
@@ -994,7 +989,10 @@ pub fn begin_eval_value(
         }
         match &job.operation {
             Operation::Execute { execution, .. } => execution.acquire_eval_value_output(),
-            Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => None,
+            Operation::Open { .. }
+            | Operation::Save { .. }
+            | Operation::Close { .. }
+            | Operation::History { .. } => None,
         }
     };
 
@@ -1014,7 +1012,10 @@ pub fn complete_execution_step(job_id: MutationJobId, mut result: ExecutionStepR
     }
     match &mut job.operation {
         Operation::Execute { execution, .. } => execution.complete_step(result),
-        Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
+        Operation::Open { .. }
+        | Operation::Save { .. }
+        | Operation::Close { .. }
+        | Operation::History { .. } => false,
     }
 }
 
@@ -1031,7 +1032,10 @@ pub fn abandon_execution(job_id: MutationJobId, mut result: ExecutionStepResult)
     }
     match &mut job.operation {
         Operation::Execute { execution, .. } => execution.abandon(result),
-        Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
+        Operation::Open { .. }
+        | Operation::Save { .. }
+        | Operation::Close { .. }
+        | Operation::History { .. } => false,
     }
 }
 
@@ -1088,6 +1092,18 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
             )),
             None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
         },
+        Operation::History { id, direction } => match documents.find_by_id(id) {
+            Some(target) => Prepared::Native(native_action(
+                match direction {
+                    HistoryDirection::Undo => NativeActionKind::Undo,
+                    HistoryDirection::Redo => NativeActionKind::Redo,
+                },
+                Some(target.native_key),
+                String::new(),
+                false,
+            )),
+            None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
+        },
         Operation::Execute { id, execution } => match documents.find_by_id(id) {
             Some(_) if execution.outcome().is_some() => {
                 Prepared::Immediate(Ok(OperationOutcome::Execution(
@@ -1132,6 +1148,7 @@ fn prepare_save(id: &str, target: DocumentTarget) -> Prepared {
 fn finalize(
     operation: &mut Operation,
     documents: &DocumentRegistry,
+    native_target: Option<NativeDocumentKey>,
 ) -> Result<OperationOutcome, Error> {
     match operation {
         Operation::Open { path } => documents
@@ -1155,6 +1172,15 @@ fn finalize(
                 Err(Error::CloseNotPublished)
             }
         }
+        Operation::History { id, .. } => {
+            let expected = native_target.ok_or(Error::DocumentGone)?;
+            let target = documents.find_by_id(id).ok_or(Error::DocumentGone)?;
+            if target.native_key != expected {
+                Err(Error::DocumentGenerationChanged)
+            } else {
+                Ok(OperationOutcome::Document(target.document))
+            }
+        }
         Operation::Execute { execution, .. } => execution
             .take_outcome()
             .map(OperationOutcome::Execution)
@@ -1166,6 +1192,7 @@ fn complete_operation(
     mut result: NativeActionResult,
     operation: &mut Operation,
     documents: &DocumentRegistry,
+    native_target: Option<NativeDocumentKey>,
 ) -> Result<OperationOutcome, Error> {
     if matches!(
         operation,
@@ -1177,14 +1204,14 @@ fn complete_operation(
             | NativeActionResultKind::EvaluatorStateCleanupFailed
             | NativeActionResultKind::ExecutionBridgeFailed
     ) {
-        return finalize(operation, documents);
+        return finalize(operation, documents, native_target);
     }
 
     if result.kind == NativeActionResultKind::EvaluatorStateCleanupFailed
         && let Operation::Execute { execution, .. } = operation
         && matches!(execution.outcome(), Some(ExecutionOutcome::Failure(_)))
     {
-        return finalize(operation, documents);
+        return finalize(operation, documents, native_target);
     }
 
     if matches!(
@@ -1202,11 +1229,11 @@ fn complete_operation(
             evaluator_state_cleanup_status: 0,
         });
         debug_assert!(recorded);
-        return finalize(operation, documents);
+        return finalize(operation, documents, native_target);
     }
 
     interpret(result, operation)?;
-    finalize(operation, documents)
+    finalize(operation, documents, native_target)
 }
 
 fn native_action(
@@ -1247,6 +1274,15 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         NativeActionResultKind::LockFailed => Err(Error::LockFailed(failure)),
         NativeActionResultKind::SaveFailed => Err(Error::SaveFailed(failure)),
         NativeActionResultKind::CloseFailed => Err(Error::CloseFailed(failure)),
+        NativeActionResultKind::HistoryFailed => {
+            let Operation::History { direction, .. } = operation else {
+                return Err(Error::UnknownResult(result.kind.repr));
+            };
+            Err(Error::HistoryFailed {
+                direction: *direction,
+                failure,
+            })
+        }
         NativeActionResultKind::NotQuiescent => Err(Error::NotQuiescent),
         NativeActionResultKind::UndoDisabled => Err(Error::UndoDisabled),
         NativeActionResultKind::ContextFailed => Err(Error::ContextFailed(failure)),
@@ -1277,7 +1313,10 @@ impl MutationJob {
                 "execution did not start within {} seconds",
                 EXECUTION_START_TIMEOUT.as_secs()
             )),
-            Operation::Open { .. } | Operation::Save { .. } | Operation::Close { .. } => false,
+            Operation::Open { .. }
+            | Operation::Save { .. }
+            | Operation::Close { .. }
+            | Operation::History { .. } => false,
         }
     }
 
@@ -1312,7 +1351,8 @@ impl MutationJob {
             Operation::Execute { .. }
             | Operation::Open { .. }
             | Operation::Save { .. }
-            | Operation::Close { .. } => false,
+            | Operation::Close { .. }
+            | Operation::History { .. } => false,
         }
     }
 
@@ -1327,14 +1367,19 @@ impl Operation {
     fn output_sink(&self) -> Option<OutputSink> {
         match self {
             Self::Execute { execution, .. } => Some(execution.output_sink()),
-            Self::Open { .. } | Self::Save { .. } | Self::Close { .. } => None,
+            Self::Open { .. } | Self::Save { .. } | Self::Close { .. } | Self::History { .. } => {
+                None
+            }
         }
     }
 
     fn document_id(&self) -> &str {
         match self {
             Self::Open { .. } => "",
-            Self::Save { id } | Self::Close { id, .. } | Self::Execute { id, .. } => id,
+            Self::Save { id }
+            | Self::Close { id, .. }
+            | Self::History { id, .. }
+            | Self::Execute { id, .. } => id,
         }
     }
 }
@@ -1374,7 +1419,6 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionMode;
     use crate::execution::value_bridge::{ValueEvent, WriteResult};
-    use crate::history::{HistoryContext, HistoryEventKind};
 
     #[test]
     fn preserves_native_guard_outcomes_as_types() {
@@ -1406,17 +1450,11 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
         let id = list().unwrap()[0].id.clone();
-        let key = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
 
         let first = tokio::spawn(save(id.clone()));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
-        assert!(!SCHEDULER.lock().unwrap().provenance.has_owned_step(key));
 
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
@@ -1434,6 +1472,58 @@ mod tests {
         replace_documents(Vec::new());
         complete_native_action(close_action.job_id, result(NativeActionResultKind::Success));
         assert!(second.await.unwrap().is_ok());
+        stop();
+    }
+
+    #[tokio::test]
+    async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+
+        let undo_waiter = tokio::spawn(undo(id.clone()));
+        tokio::task::yield_now().await;
+        let undo_action = take_native_action();
+        assert_eq!(undo_action.kind, NativeActionKind::Undo);
+        assert_eq!(undo_action.document_token, 1);
+        assert_eq!(undo_action.database_token, 101);
+
+        let redo_waiter = tokio::spawn(redo(id.clone()));
+        tokio::task::yield_now().await;
+        assert_eq!(take_native_action().kind, NativeActionKind::None);
+
+        replace_documents(vec![document(1, 101, true)]);
+        complete_native_action(undo_action.job_id, result(NativeActionResultKind::Success));
+        assert!(undo_waiter.await.unwrap().unwrap().modified);
+
+        let redo_action = take_native_action();
+        assert_eq!(redo_action.kind, NativeActionKind::Redo);
+        assert_eq!(redo_action.document_token, 1);
+        assert_eq!(redo_action.database_token, 101);
+        replace_documents(vec![document(1, 101, false)]);
+        complete_native_action(redo_action.job_id, result(NativeActionResultKind::Success));
+        assert!(!redo_waiter.await.unwrap().unwrap().modified);
+        stop();
+    }
+
+    #[tokio::test]
+    async fn drawing_history_fails_closed_on_missing_or_replaced_documents() {
+        let _test = TEST_LOCK.lock().await;
+        reset(vec![document(1, 101, false)]);
+        let id = list().unwrap()[0].id.clone();
+
+        assert_eq!(
+            undo("absent".into()).await,
+            Err(Error::DocumentNotFound("absent".into()))
+        );
+
+        let waiter = tokio::spawn(redo(id));
+        tokio::task::yield_now().await;
+        let action = take_native_action();
+        assert_eq!(action.kind, NativeActionKind::Redo);
+        replace_documents(vec![document(1, 201, false)]);
+        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+        assert_eq!(waiter.await.unwrap(), Err(Error::DocumentGenerationChanged));
         stop();
     }
 
@@ -2131,13 +2221,6 @@ mod tests {
         let id = list().unwrap()[0].id.clone();
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.provenance.seed_owned_step(
-                NativeDocumentKey {
-                    document_token: 1,
-                    database_token: 101,
-                },
-                1,
-            );
             scheduler.stopping = true;
             scheduler.quarantined = true;
         }
@@ -2148,292 +2231,10 @@ mod tests {
             let scheduler = SCHEDULER.lock().unwrap();
             assert!(!scheduler.stopping);
             assert!(scheduler.quarantined);
-            assert!(scheduler.provenance.has_owned_step(NativeDocumentKey {
-                document_token: 1,
-                database_token: 101,
-            }));
         }
         assert_eq!(save(id).await, Err(Error::NativeStateUnknown));
         reset(Vec::new());
         stop();
-    }
-
-    #[tokio::test]
-    async fn document_publication_reconciles_history_by_exact_native_key() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let original = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        SCHEDULER
-            .lock()
-            .unwrap()
-            .provenance
-            .seed_owned_step(original, 1);
-
-        replace_documents(vec![document(1, 101, true)]);
-        assert!(
-            SCHEDULER
-                .lock()
-                .unwrap()
-                .provenance
-                .has_owned_step(original)
-        );
-
-        replace_documents(vec![document(1, 201, true)]);
-        assert!(
-            !SCHEDULER
-                .lock()
-                .unwrap()
-                .provenance
-                .has_owned_step(original)
-        );
-        assert!(
-            !SCHEDULER
-                .lock()
-                .unwrap()
-                .provenance
-                .has_owned_step(NativeDocumentKey {
-                    document_token: 1,
-                    database_token: 201,
-                })
-        );
-        stop();
-    }
-
-    #[tokio::test]
-    async fn raw_history_activity_invalidates_only_its_exact_subject() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false), document(2, 102, false)]);
-        let first = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        let second = NativeDocumentKey {
-            document_token: 2,
-            database_token: 102,
-        };
-        {
-            let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.provenance.seed_owned_step(first, 1);
-            scheduler.provenance.seed_owned_step(second, 2);
-        }
-
-        record_native_history_event(history_event(HistoryEventKind::DocumentActivated, first));
-        assert!(SCHEDULER.lock().unwrap().provenance.has_owned_step(first));
-        record_native_history_event(history_event(
-            HistoryEventKind::DocumentBecameCurrent,
-            first,
-        ));
-        assert!(SCHEDULER.lock().unwrap().provenance.has_owned_step(first));
-
-        let mut event = history_event(HistoryEventKind::CommandWillStart, first);
-        event.event_context.database_token = 0;
-        record_native_history_event(event);
-
-        let scheduler = SCHEDULER.lock().unwrap();
-        assert!(!scheduler.provenance.has_owned_step(first));
-        assert!(scheduler.provenance.has_owned_step(second));
-        drop(scheduler);
-        stop();
-    }
-
-    #[tokio::test]
-    async fn unattributable_history_activity_invalidates_every_key() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false), document(2, 102, false)]);
-        let first = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        let second = NativeDocumentKey {
-            document_token: 2,
-            database_token: 102,
-        };
-        {
-            let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.provenance.seed_owned_step(first, 1);
-            scheduler.provenance.seed_owned_step(second, 2);
-        }
-        let mut event = history_event(HistoryEventKind::DatabaseActivity, first);
-        event.event_context.document_token = 0;
-        event.event_context.database_token = 0;
-        event.database_activity = u32::from(crate::history::DATABASE_OBJECT_MODIFIED);
-
-        record_native_history_event(event);
-
-        let scheduler = SCHEDULER.lock().unwrap();
-        assert!(!scheduler.provenance.has_owned_step(first));
-        assert!(!scheduler.provenance.has_owned_step(second));
-        drop(scheduler);
-        stop();
-    }
-
-    #[tokio::test]
-    async fn malformed_history_event_latches_failure_and_invalidates_every_key() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false), document(2, 102, false)]);
-        let first = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        let second = NativeDocumentKey {
-            document_token: 2,
-            database_token: 102,
-        };
-        {
-            let mut scheduler = SCHEDULER.lock().unwrap();
-            scheduler.provenance.seed_owned_step(first, 1);
-            scheduler.provenance.seed_owned_step(second, 2);
-        }
-        let mut malformed = history_event(HistoryEventKind::DatabaseActivity, first);
-        malformed.argument0 = 91;
-
-        record_native_history_event(malformed);
-
-        let scheduler = SCHEDULER.lock().unwrap();
-        assert!(!scheduler.provenance.has_owned_step(first));
-        assert!(!scheduler.provenance.has_owned_step(second));
-        assert_eq!(
-            scheduler.history_observation_failure,
-            Some(crate::history::HistoryObservationFailure {
-                kind: crate::history::HistoryObservationFailureKind::MalformedEvent,
-                raw_subject: HistoryContext {
-                    document_token: 1,
-                    database_token: 101,
-                },
-                native_status: 91,
-            })
-        );
-        drop(scheduler);
-        stop();
-    }
-
-    #[tokio::test]
-    async fn first_history_observation_failure_survives_scheduler_restart() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let key = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        let mut attach_failure = history_event(HistoryEventKind::DatabaseReactorAttachFailed, key);
-        attach_failure.event_context.document_token = 0;
-        attach_failure.argument0 = 42;
-
-        record_native_history_event(attach_failure);
-        assert_eq!(
-            SCHEDULER.lock().unwrap().history_observation_failure,
-            Some(crate::history::HistoryObservationFailure {
-                kind: crate::history::HistoryObservationFailureKind::DatabaseReactorAttach,
-                raw_subject: HistoryContext {
-                    document_token: 0,
-                    database_token: 101,
-                },
-                native_status: 42,
-            })
-        );
-
-        stop();
-        start();
-        let first_failure = SCHEDULER.lock().unwrap().history_observation_failure;
-        let mut detach_failure = history_event(HistoryEventKind::DatabaseReactorDetachFailed, key);
-        detach_failure.argument0 = 77;
-        record_native_history_event(detach_failure);
-        assert_eq!(
-            SCHEDULER.lock().unwrap().history_observation_failure,
-            first_failure
-        );
-        stop();
-    }
-
-    #[tokio::test]
-    async fn active_history_evidence_is_job_owned_and_never_creates_provenance() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
-        let key = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
-        let pending = tokio::spawn(save(id));
-        tokio::task::yield_now().await;
-
-        let action = take_native_action();
-        assert_eq!(action.kind, NativeActionKind::Save);
-        assert_eq!(
-            SCHEDULER
-                .lock()
-                .unwrap()
-                .active
-                .as_ref()
-                .unwrap()
-                .history_evidence,
-            Some(ActiveHistoryEvidence::default())
-        );
-        let mut event = history_event(HistoryEventKind::DatabaseActivity, key);
-        event.event_context.document_token = 0;
-        event.database_activity = u32::from(crate::history::DATABASE_OBJECT_MODIFIED);
-        record_native_history_event(event);
-        assert_ne!(
-            SCHEDULER
-                .lock()
-                .unwrap()
-                .active
-                .as_ref()
-                .unwrap()
-                .history_evidence,
-            Some(ActiveHistoryEvidence::default())
-        );
-
-        replace_documents(vec![document(1, 101, false)]);
-        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
-
-        assert!(pending.await.unwrap().is_ok());
-        let scheduler = SCHEDULER.lock().unwrap();
-        assert!(scheduler.active.is_none());
-        assert!(!scheduler.provenance.has_owned_step(key));
-        drop(scheduler);
-        stop();
-    }
-
-    #[tokio::test]
-    async fn unproved_native_mutation_invalidates_history_before_issue() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
-        let key = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
-        let pending = tokio::spawn(save(id));
-        tokio::task::yield_now().await;
-
-        let action = take_native_action();
-
-        assert_eq!(action.kind, NativeActionKind::Save);
-        assert!(!SCHEDULER.lock().unwrap().provenance.has_owned_step(key));
-        complete_native_action(action.job_id, result(NativeActionResultKind::SaveFailed));
-        assert!(matches!(pending.await.unwrap(), Err(Error::SaveFailed(_))));
-        stop();
-    }
-
-    #[tokio::test]
-    async fn plugin_stop_forgets_history_provenance() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let key = NativeDocumentKey {
-            document_token: 1,
-            database_token: 101,
-        };
-        SCHEDULER.lock().unwrap().provenance.seed_owned_step(key, 1);
-
-        stop();
-
-        assert!(!SCHEDULER.lock().unwrap().provenance.has_owned_step(key));
     }
 
     #[tokio::test]
@@ -2572,12 +2373,6 @@ mod tests {
         let first = take_native_action();
         assert_eq!(first.kind, NativeActionKind::RunExecution);
         complete_native_action(first.job_id, result(NativeActionResultKind::NotQuiescent));
-        {
-            let scheduler = SCHEDULER.lock().unwrap();
-            let retry = scheduler.pending.front().expect("execution is deferred");
-            assert_eq!(retry.native_target, None);
-            assert_eq!(retry.history_evidence, None);
-        }
         assert_eq!(take_native_action().kind, NativeActionKind::None);
 
         process_due_timers(Instant::now() + BUSY_RETRY_MAX);
@@ -2909,28 +2704,9 @@ mod tests {
         }
     }
 
-    fn history_event(kind: HistoryEventKind, key: NativeDocumentKey) -> NativeHistoryEvent {
-        let context = HistoryContext {
-            document_token: key.document_token,
-            database_token: key.database_token,
-        };
-        NativeHistoryEvent {
-            kind,
-            event_context: context,
-            current_context: context,
-            active_context: context,
-            argument0: 0,
-            argument1: 0,
-            database_activity: 0,
-        }
-    }
-
     fn reset(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {
         stop();
-        let mut scheduler = SCHEDULER.lock().unwrap();
-        scheduler.quarantined = false;
-        scheduler.history_observation_failure = None;
-        drop(scheduler);
+        SCHEDULER.lock().unwrap().quarantined = false;
         replace_documents(documents);
         start();
     }
