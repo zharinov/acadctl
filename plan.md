@@ -175,14 +175,14 @@ Both modes use stable forms for opaque values, including when an opaque value is
 ```text
 #<Entity 5A2>
 #<SelectionSet>
-#<VlaObject IAcadLine>
+#<VlaObject>
 #<File>
 #<Function>
 ```
 
 Type names use PascalCase. A payload appears only when it is useful. These forms are displays, not new readable AutoLISP literals.
 
-Only an entity handle is intentionally reusable identity. The entity from `#<Entity 5A2>` can later be resolved with `(handent "5A2")`, subject to the entity still being live in that drawing. Selection-set numbers, COM class names, file displays, and function names are descriptive rather than general object handles.
+Only an entity handle is intentionally reusable identity. The entity from `#<Entity 5A2>` can later be resolved with `(handent "5A2")`, subject to the entity still being live in that drawing. Selection-set, VLA-object, file, and function displays are descriptive type tags rather than general object handles.
 
 The implicit `eval` value is emitted only after successful completion of the drawing undo group. If execution or finalization fails, there is no implicit value. Previously streamed `acadctl:println` output remains visible.
 
@@ -355,7 +355,7 @@ enum ExecutionMode {
 
 enum ExecutionServerEvent {
     Accepted,
-    Output { text: String },
+    Output { chunk: String },
     CancelAcknowledgement(ExecutionCancelAcknowledgement),
     Finished(ExecutionOutcome),
 }
@@ -426,7 +426,7 @@ Rust owns the load-bearing behavior:
 
 The ObjectARX C++ surface remains bridge boilerplate:
 
-- Register and unregister lifecycle callbacks and `acadctl:println`.
+- Register and unregister lifecycle callbacks and the private Lisp bridge callbacks.
 - Schedule Rust-selected native work in application context.
 - Resolve, establish, and restore document context as directed by Rust; lock only native database work that requires an explicit application-context lock.
 - Enter the target document's AutoLISP driver and exchange one staged form or value event per registered callback.

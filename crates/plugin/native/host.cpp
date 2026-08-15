@@ -393,21 +393,20 @@ bool matchesExecutionContext(AcApDocument *document,
                              std::size_t databaseToken,
                              AcApDocument *expectedActive);
 
-acadctl::NativeValueEvent
-valueEvent(acadctl::NativeValueEventKind kind) {
-  return {kind};
-}
-
-bool writeValueEvent(acadctl::NativeValueWriter &writer,
-                     acadctl::NativeValueEvent event,
-                     rust::Str text = rust::Str()) {
-  return acadctl::write_value_event(writer, event, text) ==
-         acadctl::NativeValueWriteResult::Continue;
-}
-
-bool writeValueKind(acadctl::NativeValueWriter &writer,
-                    acadctl::NativeValueEventKind kind) {
-  return writeValueEvent(writer, valueEvent(kind));
+void finishValueWriter(
+    std::optional<rust::Box<acadctl::NativeValueWriter>> &retainedWriter,
+    bool invalidate) {
+  activeValueWriter = nullptr;
+  if (!retainedWriter) {
+    return;
+  }
+  if (invalidate) {
+    acadctl::invalidate_value_writer(**retainedWriter);
+  }
+  rust::Box<acadctl::NativeValueWriter> writer =
+      std::move(*retainedWriter);
+  retainedWriter.reset();
+  acadctl::finish_value_writer(std::move(writer));
 }
 
 std::size_t boundedWideChunkLength(const ACHAR *text) {
@@ -576,14 +575,12 @@ int acadctlEvalValueEvent() noexcept {
     }
     const int returnStatus = keepGoing ? acedRetT() : acedRetNil();
     if (returnStatus != RTNORM && activeValueWriter) {
-      writeValueKind(*activeValueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
+      acadctl::invalidate_value_writer(*activeValueWriter);
     }
     return returnStatus == RTNORM ? RSRSLT : RSERR;
   } catch (...) {
     if (activeValueWriter) {
-      writeValueKind(*activeValueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
+      acadctl::invalidate_value_writer(*activeValueWriter);
     }
     return acedRetNil() == RTNORM ? RSRSLT : RSERR;
   }
@@ -842,18 +839,6 @@ acadctl::NativeExecutionStepResult valueVisitorOutcome(int commandStatus) {
   }
   return {acadctl::NativeExecutionStepResultKind::LispError, 0,
           lispErrnoValue, std::move(detail), 0};
-}
-
-LispBridgeStepResult finishEvalValueEmission(
-    acadctl::NativeExecutionStepResult result) {
-  const int cleanupStatus = clearExecutionBridgeSymbols();
-  if (cleanupStatus == RTNORM) {
-    return {std::move(result), false};
-  }
-  const bool bridgeSymbolsMayBeRetained =
-      clearExecutionBridgeSymbols() != RTNORM;
-  result.bridge_symbols_clear_status = cleanupStatus;
-  return {std::move(result), bridgeSymbolsMayBeRetained};
 }
 
 struct UndoCommandResult {
@@ -1439,13 +1424,7 @@ void ObjectArxBridge::failExecutionDriver() {
   }
 
   DocumentContextDispatch &dispatch = *documentContextDispatch_;
-  if (dispatch.valueWriter) {
-    activeValueWriter = nullptr;
-    rust::Box<acadctl::NativeValueWriter> writer =
-        std::move(*dispatch.valueWriter);
-    dispatch.valueWriter.reset();
-    acadctl::finish_value_writer(std::move(writer));
-  }
+  finishValueWriter(dispatch.valueWriter, false);
 
   dispatch.dispatchResult = bridgeFailure(
       acadctl::NativeActionResultKind::ExecutionBridgeFailed,
@@ -1462,15 +1441,7 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
   }
 
   DocumentContextDispatch &dispatch = *documentContextDispatch_;
-  if (dispatch.valueWriter) {
-    writeValueKind(**dispatch.valueWriter,
-                   acadctl::NativeValueEventKind::Invalid);
-    activeValueWriter = nullptr;
-    rust::Box<acadctl::NativeValueWriter> writer =
-        std::move(*dispatch.valueWriter);
-    dispatch.valueWriter.reset();
-    acadctl::finish_value_writer(std::move(writer));
-  }
+  finishValueWriter(dispatch.valueWriter, true);
 
   AcApDocument *target = document(dispatch.documentToken);
   if (!target ||
@@ -1503,7 +1474,7 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
   } else if (dispatch.stagedFormKind ==
              DocumentContextDispatch::StagedFormKind::ValueVisitor) {
     LispBridgeStepResult interrupted =
-        finishEvalValueEmission(stepNativeFailure(RTERROR));
+        finishEvaluation(stepNativeFailure(RTERROR), false);
     dispatch.bridgeSymbolsMayBeRetained =
         interrupted.bridgeSymbolsMayBeRetained;
     dispatch.stagedFormKind = DocumentContextDispatch::StagedFormKind::None;
@@ -1657,7 +1628,7 @@ int acadctlBeginPrintln() noexcept {
           ACRX_T("acadctl:*bridge-status*"), visitorPending);
     }
     if (preparationStatus != RTNORM) {
-      writeValueKind(*writer, acadctl::NativeValueEventKind::Invalid);
+      acadctl::invalidate_value_writer(*writer);
       acadctl::finish_value_writer(std::move(writer));
       clearSymbol(ACRX_T("acadctl:*bridge-value*"));
       return acedRetNil() == RTNORM ? RSRSLT : RSERR;
@@ -1667,13 +1638,7 @@ int acadctlBeginPrintln() noexcept {
     activeValueWriter = &**dispatch.valueWriter;
     const int returnStatus = acedRetT();
     if (returnStatus != RTNORM) {
-      writeValueKind(**dispatch.valueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
-      activeValueWriter = nullptr;
-      rust::Box<acadctl::NativeValueWriter> retained =
-          std::move(*dispatch.valueWriter);
-      dispatch.valueWriter.reset();
-      acadctl::finish_value_writer(std::move(retained));
+      finishValueWriter(dispatch.valueWriter, true);
       clearSymbol(ACRX_T("acadctl:*bridge-value*"));
     }
     return returnStatus == RTNORM ? RSRSLT : RSERR;
@@ -1705,13 +1670,7 @@ int acadctlFinishPrintln() noexcept {
     AcApDocument *document = bridge->document(dispatch.documentToken);
     if (!document ||
         !matchesExecutionContext(document, dispatch.databaseToken, document)) {
-      writeValueKind(**dispatch.valueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
-      activeValueWriter = nullptr;
-      rust::Box<acadctl::NativeValueWriter> writer =
-          std::move(*dispatch.valueWriter);
-      dispatch.valueWriter.reset();
-      acadctl::finish_value_writer(std::move(writer));
+      finishValueWriter(dispatch.valueWriter, true);
       dispatch.dispatchResult = abandonLostExecutionContext(
           dispatch.jobId, document, dispatch.databaseToken, document,
           dispatch.undoGroup != UndoGroupState::Inactive,
@@ -1720,23 +1679,16 @@ int acadctlFinishPrintln() noexcept {
     }
     if (valueVisitorOutcome(RTNORM).kind !=
         acadctl::NativeExecutionStepResultKind::Success) {
-      writeValueKind(**dispatch.valueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
+      acadctl::invalidate_value_writer(**dispatch.valueWriter);
     }
     if (clearSymbol(ACRX_T("acadctl:*bridge-value*")) != RTNORM) {
-      writeValueKind(**dispatch.valueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
+      acadctl::invalidate_value_writer(**dispatch.valueWriter);
     }
     const int returnStatus = acedRetNil();
     if (returnStatus != RTNORM) {
-      writeValueKind(**dispatch.valueWriter,
-                     acadctl::NativeValueEventKind::Invalid);
+      acadctl::invalidate_value_writer(**dispatch.valueWriter);
     }
-    activeValueWriter = nullptr;
-    rust::Box<acadctl::NativeValueWriter> writer =
-        std::move(*dispatch.valueWriter);
-    dispatch.valueWriter.reset();
-    acadctl::finish_value_writer(std::move(writer));
+    finishValueWriter(dispatch.valueWriter, false);
     return returnStatus == RTNORM ? RSRSLT : RSERR;
   } catch (...) {
     activeValueWriter = nullptr;
@@ -1797,15 +1749,7 @@ int acadctlAdvanceExecution() noexcept {
 
       if (dispatch.stagedFormKind ==
           ObjectArxBridge::DocumentContextDispatch::StagedFormKind::Evaluator) {
-        if (dispatch.valueWriter) {
-          writeValueKind(**dispatch.valueWriter,
-                         acadctl::NativeValueEventKind::Invalid);
-          activeValueWriter = nullptr;
-          rust::Box<acadctl::NativeValueWriter> writer =
-              std::move(*dispatch.valueWriter);
-          dispatch.valueWriter.reset();
-          acadctl::finish_value_writer(std::move(writer));
-        }
+        finishValueWriter(dispatch.valueWriter, true);
         LispBridgeStepResult evaluation = collectEvaluation(
             dispatch.retainValue);
         dispatch.bridgeSymbolsMayBeRetained =
@@ -1832,18 +1776,13 @@ int acadctlAdvanceExecution() noexcept {
       } else if (dispatch.stagedFormKind ==
                  ObjectArxBridge::DocumentContextDispatch::StagedFormKind::ValueVisitor) {
         activeValueWriter = nullptr;
-        LispBridgeStepResult emission = finishEvalValueEmission(
-            valueVisitorOutcome(RTNORM));
+        LispBridgeStepResult emission =
+            finishEvaluation(valueVisitorOutcome(RTNORM), false);
         dispatch.bridgeSymbolsMayBeRetained =
             emission.bridgeSymbolsMayBeRetained;
         dispatch.stagedFormKind =
             ObjectArxBridge::DocumentContextDispatch::StagedFormKind::None;
-        if (dispatch.valueWriter) {
-          rust::Box<acadctl::NativeValueWriter> writer =
-              std::move(*dispatch.valueWriter);
-          dispatch.valueWriter.reset();
-          acadctl::finish_value_writer(std::move(writer));
-        }
+        finishValueWriter(dispatch.valueWriter, false);
         if (!acadctl::complete_execution_step(
                 dispatch.jobId, std::move(emission.result))) {
           dispatch.dispatchResult = bridgeFailure(
@@ -1961,7 +1900,7 @@ int acadctlAdvanceExecution() noexcept {
           if (!acadctl::value_writer_active(*writer)) {
             acadctl::finish_value_writer(std::move(writer));
             LispBridgeStepResult emission =
-                finishEvalValueEmission(stepSuccess());
+                finishEvaluation(stepSuccess(), false);
             stepResult = std::move(emission.result);
             dispatch.bridgeSymbolsMayBeRetained =
                 emission.bridgeSymbolsMayBeRetained;
@@ -1979,13 +1918,13 @@ int acadctlAdvanceExecution() noexcept {
                 ACRX_T("acadctl:*bridge-status*"), visitorPending);
           }
           if (preparationStatus != RTNORM || activeValueWriter) {
-            writeValueKind(*writer,
-                           acadctl::NativeValueEventKind::Invalid);
+            acadctl::invalidate_value_writer(*writer);
             acadctl::finish_value_writer(std::move(writer));
-            LispBridgeStepResult emission = finishEvalValueEmission(
+            LispBridgeStepResult emission = finishEvaluation(
                 stepNativeFailure(preparationStatus == RTNORM
                                       ? RTERROR
-                                      : preparationStatus));
+                                      : preparationStatus),
+                false);
             stepResult = std::move(emission.result);
             dispatch.bridgeSymbolsMayBeRetained =
                 emission.bridgeSymbolsMayBeRetained;
@@ -2027,12 +1966,8 @@ int acadctlAdvanceExecution() noexcept {
         acadctl::NativeActionResultKind::ExecutionBridgeFailed, returnStatus);
     evaluateStagedForm = false;
   }
-  if (!evaluateStagedForm && dispatch.valueWriter) {
-    activeValueWriter = nullptr;
-    rust::Box<acadctl::NativeValueWriter> writer =
-        std::move(*dispatch.valueWriter);
-    dispatch.valueWriter.reset();
-    acadctl::finish_value_writer(std::move(writer));
+  if (!evaluateStagedForm) {
+    finishValueWriter(dispatch.valueWriter, false);
   }
   if (!evaluateStagedForm && returnStatus == RTNORM) {
     dispatch.driverExitReady = true;

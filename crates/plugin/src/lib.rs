@@ -68,36 +68,6 @@ mod ffi {
 
     #[derive(Debug)]
     #[repr(u8)]
-    enum NativeValueEventKind {
-        Invalid,
-        BeginList,
-        EndList,
-        Dot,
-        Nil,
-        True,
-        Integer,
-        Real,
-        Point2,
-        Point3,
-        BeginString,
-        StringChunk,
-        EndString,
-        BeginSymbol,
-        SymbolChunk,
-        EndSymbol,
-        Entity,
-        SelectionSet,
-        VlaObject,
-        File,
-        Function,
-        ErrorObject,
-        Void,
-        Unsupported,
-        Object,
-    }
-
-    #[derive(Debug)]
-    #[repr(u8)]
     enum NativeValueWriteResult {
         Continue,
         Inactive,
@@ -141,18 +111,6 @@ mod ffi {
         lisp_errno: i32,
         detail: String,
         bridge_symbols_clear_status: i32,
-    }
-
-    struct NativeValueEvent {
-        kind: NativeValueEventKind,
-        integer: i64,
-        number: u64,
-        native_type: u32,
-        real: f64,
-        x: f64,
-        y: f64,
-        z: f64,
-        has_payload: bool,
     }
 
     struct NativeLispValueEvent {
@@ -209,11 +167,7 @@ mod ffi {
 
         fn value_writer_active(writer: &NativeValueWriter) -> bool;
 
-        fn write_value_event(
-            writer: &mut NativeValueWriter,
-            event: NativeValueEvent,
-            text: &str,
-        ) -> NativeValueWriteResult;
+        fn invalidate_value_writer(writer: &mut NativeValueWriter);
 
         fn write_lisp_value_event(
             writer: &mut NativeValueWriter,
@@ -339,48 +293,8 @@ fn value_writer_active(writer: &NativeValueWriter) -> bool {
     writer.active()
 }
 
-fn write_value_event(
-    writer: &mut NativeValueWriter,
-    event: ffi::NativeValueEvent,
-    text: &str,
-) -> ffi::NativeValueWriteResult {
-    let value = match event.kind {
-        ffi::NativeValueEventKind::Invalid => ValueEvent::Invalid,
-        ffi::NativeValueEventKind::BeginList => ValueEvent::BeginList,
-        ffi::NativeValueEventKind::EndList => ValueEvent::EndList,
-        ffi::NativeValueEventKind::Dot => ValueEvent::Dot,
-        ffi::NativeValueEventKind::Nil => ValueEvent::Nil,
-        ffi::NativeValueEventKind::True => ValueEvent::True,
-        ffi::NativeValueEventKind::Integer => ValueEvent::Integer(event.integer),
-        ffi::NativeValueEventKind::Real => ValueEvent::Real(event.real),
-        ffi::NativeValueEventKind::Point2 => ValueEvent::Point2(event.x, event.y),
-        ffi::NativeValueEventKind::Point3 => ValueEvent::Point3(event.x, event.y, event.z),
-        ffi::NativeValueEventKind::BeginString => ValueEvent::BeginString,
-        ffi::NativeValueEventKind::StringChunk => ValueEvent::StringChunk(text),
-        ffi::NativeValueEventKind::EndString => ValueEvent::EndString,
-        ffi::NativeValueEventKind::BeginSymbol => ValueEvent::BeginSymbol,
-        ffi::NativeValueEventKind::SymbolChunk => ValueEvent::SymbolChunk(text),
-        ffi::NativeValueEventKind::EndSymbol => ValueEvent::EndSymbol,
-        ffi::NativeValueEventKind::Entity => ValueEvent::Entity(event.has_payload.then_some(text)),
-        ffi::NativeValueEventKind::SelectionSet => {
-            ValueEvent::SelectionSet(event.has_payload.then_some(event.number))
-        }
-        ffi::NativeValueEventKind::VlaObject => {
-            ValueEvent::VlaObject(event.has_payload.then_some(text))
-        }
-        ffi::NativeValueEventKind::File => ValueEvent::File,
-        ffi::NativeValueEventKind::Function => {
-            ValueEvent::Function(event.has_payload.then_some(text))
-        }
-        ffi::NativeValueEventKind::ErrorObject => ValueEvent::ErrorObject,
-        ffi::NativeValueEventKind::Void => ValueEvent::Void,
-        ffi::NativeValueEventKind::Unsupported => {
-            ValueEvent::Unsupported(event.has_payload.then_some(event.native_type))
-        }
-        ffi::NativeValueEventKind::Object => ValueEvent::Object(event.has_payload.then_some(text)),
-        _ => ValueEvent::Invalid,
-    };
-    native_value_write_result(writer.write(value))
+fn invalidate_value_writer(writer: &mut NativeValueWriter) {
+    writer.write(ValueEvent::Invalid);
 }
 
 fn write_lisp_value_event(

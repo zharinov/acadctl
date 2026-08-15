@@ -11,7 +11,6 @@ acadctl-rpc = { path = "../rpc" }
 bytes.workspace = true
 clap.workspace = true
 futures-util.workspace = true
-sysinfo.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tonic.workspace = true
 
@@ -19,6 +18,8 @@ tonic.workspace = true
 libc.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
+sysinfo.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+sysinfo.workspace = true
 windows-sys.workspace = true

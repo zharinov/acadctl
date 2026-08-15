@@ -4,8 +4,6 @@ pub const MAX_VALUE_DEPTH: usize = 64 * 1024;
 pub const MAX_VALUE_TEXT_BYTES: usize = OUTPUT_CHUNK_BYTES;
 
 const MAX_ENTITY_HANDLE_BYTES: usize = 32;
-const MAX_CLASS_NAME_BYTES: usize = 128;
-const MAX_FUNCTION_NAME_BYTES: usize = 256;
 const MAX_OBJECT_LABEL_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,7 +79,6 @@ enum OpaqueKind {
     Function,
     Error,
     Object,
-    Void,
 }
 
 impl ValuePrinter {
@@ -172,31 +169,6 @@ impl ValuePrinter {
     pub fn real(&mut self, value: f64) -> Result<(), PrintError> {
         let text = format_autolisp_real(value).ok_or(PrintError::InvalidSequence)?;
         self.scalar(&text)
-    }
-
-    pub fn point(&mut self, coordinates: &[f64]) -> Result<(), PrintError> {
-        if !matches!(coordinates.len(), 2 | 3) {
-            return Err(PrintError::InvalidSequence);
-        }
-        let coordinates = coordinates
-            .iter()
-            .copied()
-            .map(format_autolisp_real)
-            .collect::<Option<Vec<_>>>()
-            .ok_or(PrintError::InvalidSequence)?;
-        if self.skipped_lists != 0 {
-            return self.poll_output();
-        }
-        self.require_no_atom()?;
-        self.before_value()?;
-        self.write("(")?;
-        for (index, coordinate) in coordinates.iter().enumerate() {
-            if index != 0 {
-                self.write(" ")?;
-            }
-            self.write(coordinate)?;
-        }
-        self.write(")")
     }
 
     pub fn begin_symbol(&mut self) -> Result<(), PrintError> {
@@ -330,36 +302,24 @@ impl ValuePrinter {
         self.opaque_value(OpaqueKind::Entity, handle.as_deref())
     }
 
-    pub fn selection_set(&mut self, number: Option<u64>) -> Result<(), PrintError> {
-        let number = number.map(|number| number.to_string());
-        self.opaque_value(OpaqueKind::SelectionSet, number.as_deref())
+    pub fn selection_set(&mut self) -> Result<(), PrintError> {
+        self.opaque_value(OpaqueKind::SelectionSet, None)
     }
 
-    pub fn vla_object(&mut self, class_name: Option<&str>) -> Result<(), PrintError> {
-        self.opaque_value(
-            OpaqueKind::VlaObject,
-            class_name.filter(|name| valid_label(name, MAX_CLASS_NAME_BYTES)),
-        )
+    pub fn vla_object(&mut self) -> Result<(), PrintError> {
+        self.opaque_value(OpaqueKind::VlaObject, None)
     }
 
     pub fn file(&mut self) -> Result<(), PrintError> {
         self.opaque_value(OpaqueKind::File, None)
     }
 
-    pub fn function(&mut self, name: Option<&str>) -> Result<(), PrintError> {
-        self.opaque_value(
-            OpaqueKind::Function,
-            name.filter(|name| valid_label(name, MAX_FUNCTION_NAME_BYTES)),
-        )
+    pub fn function(&mut self) -> Result<(), PrintError> {
+        self.opaque_value(OpaqueKind::Function, None)
     }
 
     pub fn error_object(&mut self) -> Result<(), PrintError> {
         self.opaque_value(OpaqueKind::Error, None)
-    }
-
-    pub fn unsupported(&mut self, native_type: Option<u32>) -> Result<(), PrintError> {
-        let native_type = native_type.map(|native_type| format!("RT{native_type}"));
-        self.opaque_value(OpaqueKind::Object, native_type.as_deref())
     }
 
     pub fn object(&mut self, label: Option<&str>) -> Result<(), PrintError> {
@@ -367,10 +327,6 @@ impl ValuePrinter {
             OpaqueKind::Object,
             label.filter(|label| valid_label(label, MAX_OBJECT_LABEL_BYTES)),
         )
-    }
-
-    pub fn void(&mut self) -> Result<(), PrintError> {
-        self.opaque_value(OpaqueKind::Void, None)
     }
 
     pub fn finish(self) -> Result<(), PrintError> {
@@ -552,7 +508,6 @@ impl OpaqueKind {
             Self::Function => "Function",
             Self::Error => "Error",
             Self::Object => "Object",
-            Self::Void => "Void",
         }
     }
 }
@@ -647,21 +602,6 @@ fn requires_readable_escape(character: char) -> bool {
 mod tests {
     use super::*;
     use crate::execution::output::{OutputStream, channel};
-
-    #[tokio::test]
-    async fn concatenates_display_arguments_and_adds_one_newline() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Display);
-        printer.begin_string().unwrap();
-        printer.string_chunk("created: ").unwrap();
-        printer.end_string().unwrap();
-        printer.integer(12).unwrap();
-        printer.finish().unwrap();
-        terminal.finish();
-
-        assert_eq!(collect(stream).await, "created: 12\n");
-    }
 
     #[tokio::test]
     async fn renders_readable_nested_strings_incrementally() {
@@ -766,10 +706,10 @@ mod tests {
         let mut printer = ValuePrinter::new(sink, PrintMode::Display);
         printer.begin_list().unwrap();
         printer.entity(Some("5a2")).unwrap();
-        printer.selection_set(Some(7)).unwrap();
+        printer.selection_set().unwrap();
+        printer.vla_object().unwrap();
         printer.file().unwrap();
-        printer.function(Some("TWICE")).unwrap();
-        printer.function(Some("#<SUBR @123>")).unwrap();
+        printer.function().unwrap();
         printer.object(Some("Cycle")).unwrap();
         printer.object(Some("bad label")).unwrap();
         printer.end_list().unwrap();
@@ -778,7 +718,7 @@ mod tests {
 
         assert_eq!(
             collect(stream).await,
-            "(#<Entity 5A2> #<SelectionSet 7> #<File> #<Function TWICE> #<Function> #<Object Cycle> #<Object>)\n"
+            "(#<Entity 5A2> #<SelectionSet> #<VlaObject> #<File> #<Function> #<Object Cycle> #<Object>)\n"
         );
     }
 
