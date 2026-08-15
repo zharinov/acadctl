@@ -15,12 +15,7 @@ pub async fn run(id: String) -> ExitCode {
         Err(error) => return fail(error),
     };
 
-    let saved = match client
-        .save(SaveRequest {
-            id: target.document_id,
-        })
-        .await
-    {
+    let saved = match client.save(SaveRequest::from(target.document_id)).await {
         Ok(response) => response.into_inner(),
         Err(status) => return fail(request_error_message("save the document", status)),
     };

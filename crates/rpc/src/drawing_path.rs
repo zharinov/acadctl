@@ -1,0 +1,205 @@
+use std::ffi::OsString;
+use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use camino::{Utf8Path, Utf8PathBuf};
+
+use crate::MAX_DRAWING_PATH_BYTES;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DrawingPath(Utf8PathBuf);
+
+#[derive(Debug)]
+pub enum DrawingPathError {
+    NotDwg,
+    NotFile(PathBuf),
+    NotAbsolute,
+    TooLong,
+    Resolve { path: PathBuf, source: io::Error },
+    InvalidUtf8(OsString),
+}
+
+impl DrawingPath {
+    pub fn canonicalize(path: impl AsRef<Path>) -> Result<Self, DrawingPathError> {
+        let path = path.as_ref();
+
+        if !Self::has_dwg_extension(path) {
+            return Err(DrawingPathError::NotDwg);
+        }
+
+        if !path.is_file() {
+            return Err(DrawingPathError::NotFile(path.to_owned()));
+        }
+
+        let canonical =
+            std::fs::canonicalize(path).map_err(|source| DrawingPathError::Resolve {
+                path: path.to_owned(),
+                source,
+            })?;
+        let canonical = Utf8PathBuf::from_path_buf(canonical)
+            .map_err(|path| DrawingPathError::InvalidUtf8(path.into_os_string()))?;
+
+        Self::from_canonical(canonical)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn as_path(&self) -> &Utf8Path {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0.into_string()
+    }
+
+    pub fn has_dwg_extension(path: impl AsRef<Path>) -> bool {
+        path.as_ref()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dwg"))
+    }
+
+    pub fn matches(&self, path: &str) -> bool {
+        paths_equal(self.as_str(), path)
+    }
+
+    fn from_canonical(path: Utf8PathBuf) -> Result<Self, DrawingPathError> {
+        if !path.is_absolute() {
+            return Err(DrawingPathError::NotAbsolute);
+        }
+
+        if path.as_str().len() > MAX_DRAWING_PATH_BYTES {
+            return Err(DrawingPathError::TooLong);
+        }
+
+        if !Self::has_dwg_extension(path.as_std_path()) {
+            return Err(DrawingPathError::NotDwg);
+        }
+
+        Ok(Self(path))
+    }
+}
+
+impl fmt::Display for DrawingPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for DrawingPath {
+    type Err = DrawingPathError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() > MAX_DRAWING_PATH_BYTES {
+            return Err(DrawingPathError::TooLong);
+        }
+
+        if !Utf8Path::new(value).is_absolute() {
+            return Err(DrawingPathError::NotAbsolute);
+        }
+
+        Self::canonicalize(value)
+    }
+}
+
+impl fmt::Display for DrawingPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDwg => formatter.write_str("Only DWG drawings can be opened."),
+            Self::NotFile(path) => {
+                write!(formatter, "Drawing '{}' does not exist.", path.display())
+            }
+            Self::NotAbsolute => formatter.write_str("The drawing path must be absolute."),
+            Self::TooLong => formatter.write_str("The drawing path exceeds the 32 KiB limit."),
+            Self::Resolve { path, source } => {
+                write!(
+                    formatter,
+                    "Could not resolve '{}': {source}",
+                    path.display()
+                )
+            }
+            Self::InvalidUtf8(path) => write!(
+                formatter,
+                "Drawing path '{}' is not valid UTF-8.",
+                path.to_string_lossy()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DrawingPathError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Resolve { source, .. } => Some(source),
+            Self::NotDwg
+            | Self::NotFile(_)
+            | Self::NotAbsolute
+            | Self::TooLong
+            | Self::InvalidUtf8(_) => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn paths_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn paths_equal(left: &str, right: &str) -> bool {
+    left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_dwg_and_non_absolute_wire_paths() {
+        assert!(matches!(
+            "/tmp/drawing.dxf".parse::<DrawingPath>(),
+            Err(DrawingPathError::NotDwg)
+        ));
+        assert!(matches!(
+            "drawing.dwg".parse::<DrawingPath>(),
+            Err(DrawingPathError::NotAbsolute)
+        ));
+    }
+
+    #[test]
+    fn canonicalizes_an_existing_drawing() {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-drawing-path-{}-{}.dwg",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, []).unwrap();
+
+        let drawing = DrawingPath::canonicalize(&path).unwrap();
+        let expected = std::fs::canonicalize(&path).unwrap();
+        assert_eq!(drawing.as_path().as_std_path(), expected);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn parsing_a_wire_path_preserves_the_canonical_invariant() {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-wire-drawing-path-{}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, []).unwrap();
+        let drawing: DrawingPath = path.to_str().unwrap().parse().unwrap();
+
+        assert_eq!(
+            drawing.as_path().as_std_path(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+
+        std::fs::remove_file(path).unwrap();
+    }
+}

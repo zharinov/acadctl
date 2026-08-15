@@ -22,20 +22,8 @@ pub async fn run(id: String, direction: Direction) -> ExitCode {
     };
 
     let response = match direction {
-        Direction::Undo => {
-            client
-                .undo(HistoryRequest {
-                    id: target.document_id,
-                })
-                .await
-        }
-        Direction::Redo => {
-            client
-                .redo(HistoryRequest {
-                    id: target.document_id,
-                })
-                .await
-        }
+        Direction::Undo => client.undo(HistoryRequest::from(target.document_id)).await,
+        Direction::Redo => client.redo(HistoryRequest::from(target.document_id)).await,
     };
 
     let response = match response {

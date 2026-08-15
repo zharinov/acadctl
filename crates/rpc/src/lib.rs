@@ -1,4 +1,7 @@
+mod document_id;
+mod drawing_path;
 mod process_id;
+mod requests;
 mod transport;
 
 use std::time::Duration;
@@ -7,6 +10,8 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
+pub use document_id::{DocumentId, ParseDocumentIdError};
+pub use drawing_path::{DrawingPath, DrawingPathError};
 pub use process_id::{ParseProcessIdError, ProcessId};
 pub use protocol::document_service_client::DocumentServiceClient;
 pub use protocol::document_service_server::{DocumentService, DocumentServiceServer};

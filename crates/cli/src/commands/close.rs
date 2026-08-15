@@ -16,10 +16,7 @@ pub async fn run(id: String, discard: bool) -> ExitCode {
     };
 
     if let Err(status) = client
-        .close(CloseRequest {
-            id: target.document_id,
-            discard,
-        })
+        .close(CloseRequest::new(target.document_id, discard))
         .await
     {
         return fail(request_error_message("close the document", status));

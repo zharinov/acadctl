@@ -51,12 +51,7 @@ pub async fn run(id: String, file: Option<PathBuf>, mode: ExecutionMode) -> Exit
     let source_name = source.name.clone();
     let request = ExecutionClientMessage {
         message: Some(execution_client_message::Message::Request(
-            ExecutionRequest {
-                document_id: target.document_id,
-                mode: mode as i32,
-                source_name: source.name,
-                source: source.bytes,
-            },
+            ExecutionRequest::new(target.document_id, mode, source.name, source.bytes),
         )),
     };
 

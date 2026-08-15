@@ -1,16 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use acadctl_rpc::{OpenRequest, ProcessId};
+use acadctl_rpc::{DrawingPath, OpenRequest, ProcessId};
 
 use crate::instances::Instance;
 
 use super::{fail, query_error_message, request_error_message};
 
 pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
-    let path = match drawing_path(&path) {
+    let path = match DrawingPath::canonicalize(&path) {
         Ok(path) => path,
-        Err(error) => return fail(error),
+        Err(error) => return fail(error.to_string()),
     };
 
     let process_id = match process_id {
@@ -33,7 +33,7 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
         Err(error) => return fail(error),
     };
 
-    let opened = match client.open(OpenRequest { path }).await {
+    let opened = match client.open(OpenRequest::from(path)).await {
         Ok(response) => response.into_inner(),
         Err(status) => return fail(request_error_message("open the drawing", status)),
     };
@@ -44,29 +44,6 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
 
     println!("{process_id}:{}", document.id);
     ExitCode::SUCCESS
-}
-
-fn drawing_path(path: &Path) -> Result<String, String> {
-    if !path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("dwg"))
-    {
-        return Err("Only DWG drawings can be opened.".into());
-    }
-
-    if !path.is_file() {
-        return Err(format!("Drawing '{}' does not exist.", path.display()));
-    }
-
-    let path = std::fs::canonicalize(path)
-        .map_err(|error| format!("Could not resolve '{}': {error}", path.display()))?;
-    path.into_os_string().into_string().map_err(|path| {
-        format!(
-            "Drawing path '{}' is not valid UTF-8.",
-            path.to_string_lossy()
-        )
-    })
 }
 
 fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {

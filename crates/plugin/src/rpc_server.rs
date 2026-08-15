@@ -5,15 +5,15 @@ use std::thread::{self, JoinHandle as ThreadJoinHandle};
 use std::time::Duration;
 
 use acadctl_rpc::{
-    CloseRequest, CloseResponse, DocumentService, DocumentServiceServer,
-    DrawingOutcome as RpcDrawingOutcome, ExecutionAccepted, ExecutionCancelAcknowledgement,
-    ExecutionCancelDisposition, ExecutionCancelled, ExecutionClientMessage,
-    ExecutionFailure as RpcExecutionFailure, ExecutionFinished, ExecutionMode as RpcExecutionMode,
-    ExecutionOutcome as RpcExecutionOutcome, ExecutionOutput, ExecutionRequest,
-    ExecutionServerEvent, ExecutionService, ExecutionServiceServer, ExecutionSuccess,
-    HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-    SaveRequest, SaveResponse, SourceLocation as RpcSourceLocation, execution_client_message,
-    execution_outcome, execution_server_event,
+    CloseRequest, CloseResponse, DocumentId, DocumentService, DocumentServiceServer,
+    DrawingOutcome as RpcDrawingOutcome, DrawingPathError, ExecutionAccepted,
+    ExecutionCancelAcknowledgement, ExecutionCancelDisposition, ExecutionCancelled,
+    ExecutionClientMessage, ExecutionFailure as RpcExecutionFailure, ExecutionFinished,
+    ExecutionMode as RpcExecutionMode, ExecutionOutcome as RpcExecutionOutcome, ExecutionOutput,
+    ExecutionRequest, ExecutionServerEvent, ExecutionService, ExecutionServiceServer,
+    ExecutionSuccess, HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest,
+    OpenResponse, SaveRequest, SaveResponse, SourceLocation as RpcSourceLocation,
+    execution_client_message, execution_outcome, execution_server_event,
 };
 use futures_util::{Stream, stream};
 use tokio::sync::{mpsc, oneshot};
@@ -72,27 +72,31 @@ struct ExecuteResponseState {
 #[tonic::async_trait]
 impl DocumentService for DocumentRpc {
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let documents = crate::scheduler::list().map_err(scheduler_error)?;
+        let documents = crate::scheduler::list()
+            .map_err(scheduler_error)?
+            .into_iter()
+            .map(Into::into)
+            .collect();
         Ok(Response::new(ListResponse { documents }))
     }
 
     async fn open(&self, request: Request<OpenRequest>) -> Result<Response<OpenResponse>, Status> {
         let path = request.into_inner().path;
-        validate_open_path(&path)?;
+        let path = path.parse().map_err(drawing_path_status)?;
         let document = crate::scheduler::open(path)
             .await
             .map_err(scheduler_error)?;
         Ok(Response::new(OpenResponse {
-            document: Some(document),
+            document: Some(document.into()),
         }))
     }
 
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let id = request.into_inner().id;
-        validate_document_id(&id)?;
+        let id = parse_document_id(&id)?;
         let document = crate::scheduler::save(id).await.map_err(scheduler_error)?;
         Ok(Response::new(SaveResponse {
-            document: Some(document),
+            document: Some(document.into()),
         }))
     }
 
@@ -101,10 +105,10 @@ impl DocumentService for DocumentRpc {
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
         let id = request.into_inner().id;
-        validate_document_id(&id)?;
+        let id = parse_document_id(&id)?;
         let document = crate::scheduler::undo(id).await.map_err(scheduler_error)?;
         Ok(Response::new(HistoryResponse {
-            document: Some(document),
+            document: Some(document.into()),
         }))
     }
 
@@ -113,10 +117,10 @@ impl DocumentService for DocumentRpc {
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
         let id = request.into_inner().id;
-        validate_document_id(&id)?;
+        let id = parse_document_id(&id)?;
         let document = crate::scheduler::redo(id).await.map_err(scheduler_error)?;
         Ok(Response::new(HistoryResponse {
-            document: Some(document),
+            document: Some(document.into()),
         }))
     }
 
@@ -125,8 +129,8 @@ impl DocumentService for DocumentRpc {
         request: Request<CloseRequest>,
     ) -> Result<Response<CloseResponse>, Status> {
         let request = request.into_inner();
-        validate_document_id(&request.id)?;
-        crate::scheduler::close(request.id, request.discard)
+        let id = parse_document_id(&request.id)?;
+        crate::scheduler::close(id, request.discard)
             .await
             .map_err(scheduler_error)?;
         Ok(Response::new(CloseResponse {}))
@@ -162,7 +166,7 @@ impl ExecutionService for ExecutionRpc {
             Err(failure) => return Ok(Response::new(terminal_response(reservation, failure))),
         };
 
-        let ExecutionRequest {
+        let ValidatedExecutionRequest {
             document_id,
             mode,
             source_name,
@@ -415,10 +419,11 @@ fn terminal_response(
 
 fn validate_execution_request(
     request: ExecutionRequest,
-) -> Result<ExecutionRequest, ExecutionFailure> {
-    if !crate::documents::valid_document_id(&request.document_id) {
-        return Err(failure("The document ID is invalid"));
-    }
+) -> Result<ValidatedExecutionRequest, ExecutionFailure> {
+    let document_id = request
+        .document_id
+        .parse()
+        .map_err(|_| failure("The document ID is invalid"))?;
 
     if request.source_name.is_empty() {
         return Err(failure("The source name is required"));
@@ -428,7 +433,19 @@ fn validate_execution_request(
         return Err(failure("The source name exceeds the 4 KiB limit"));
     }
 
-    Ok(request)
+    Ok(ValidatedExecutionRequest {
+        document_id,
+        mode: request.mode,
+        source_name: request.source_name,
+        source: request.source,
+    })
+}
+
+struct ValidatedExecutionRequest {
+    document_id: DocumentId,
+    mode: i32,
+    source_name: String,
+    source: bytes::Bytes,
 }
 
 fn validation_failure(error: SourceValidationError, source_name: String) -> ExecutionFailure {
@@ -509,38 +526,21 @@ fn server_event(event: execution_server_event::Event) -> ExecutionServerEvent {
     ExecutionServerEvent { event: Some(event) }
 }
 
-fn validate_open_path(path: &str) -> Result<(), Status> {
-    if path.len() > acadctl_rpc::MAX_DRAWING_PATH_BYTES {
-        return Err(Status::invalid_argument(
-            "The drawing path exceeds the 32 KiB limit",
-        ));
-    }
-
-    let path = std::path::Path::new(path);
-
-    if !path.is_absolute() {
-        return Err(Status::invalid_argument(
-            "The drawing path must be absolute",
-        ));
-    }
-
-    if !is_dwg(path) {
-        return Err(Status::invalid_argument("Only DWG drawings can be opened"));
-    }
-
-    Ok(())
+fn parse_document_id(id: &str) -> Result<DocumentId, Status> {
+    id.parse()
+        .map_err(|_| Status::invalid_argument("The document ID is invalid"))
 }
 
-fn validate_document_id(id: &str) -> Result<(), Status> {
-    crate::documents::valid_document_id(id)
-        .then_some(())
-        .ok_or_else(|| Status::invalid_argument("The document ID is invalid"))
-}
-
-fn is_dwg(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("dwg"))
+fn drawing_path_status(error: DrawingPathError) -> Status {
+    let message = match error {
+        DrawingPathError::NotDwg => "Only DWG drawings can be opened",
+        DrawingPathError::NotAbsolute => "The drawing path must be absolute",
+        DrawingPathError::TooLong => "The drawing path exceeds the 32 KiB limit",
+        DrawingPathError::NotFile(_)
+        | DrawingPathError::Resolve { .. }
+        | DrawingPathError::InvalidUtf8(_) => "The drawing path is invalid",
+    };
+    Status::invalid_argument(message)
 }
 
 fn scheduler_error(error: SchedulerError) -> Status {
@@ -701,11 +701,13 @@ mod tests {
     #[test]
     fn reports_documents_and_stops_promptly() {
         let _test = crate::scheduler::TEST_LOCK.blocking_lock();
+        let house = test_drawing_path("house");
+        let site = test_drawing_path("site");
         crate::scheduler::replace_document_snapshot(vec![
             crate::ffi::NativeDocumentSnapshot {
                 document_token: 1,
                 database_token: 101,
-                name: "/tmp/house.dwg".into(),
+                name: house.as_str().into(),
                 named: true,
                 modified: false,
                 read_only: false,
@@ -713,7 +715,7 @@ mod tests {
             crate::ffi::NativeDocumentSnapshot {
                 document_token: 2,
                 database_token: 102,
-                name: "/tmp/site.dwg".into(),
+                name: site.as_str().into(),
                 named: true,
                 modified: true,
                 read_only: true,
@@ -739,27 +741,31 @@ mod tests {
             let listed = client.list(ListRequest {}).await.unwrap().into_inner();
             assert_eq!(listed.documents.len(), 2);
             assert_eq!(listed.documents[0].id.len(), 4);
-            assert_eq!(listed.documents[0].display_name, "house.dwg");
+            assert_eq!(
+                listed.documents[0].display_name,
+                house.as_path().file_name().unwrap()
+            );
             assert_eq!(
                 listed.documents[0].file_path.as_deref(),
-                Some("/tmp/house.dwg")
+                Some(house.as_str())
             );
             assert!(!listed.documents[0].modified);
             assert!(!listed.documents[0].read_only);
             assert_eq!(listed.documents[1].id.len(), 4);
             assert_ne!(listed.documents[0].id, listed.documents[1].id);
-            assert_eq!(listed.documents[1].display_name, "site.dwg");
+            assert_eq!(
+                listed.documents[1].display_name,
+                site.as_path().file_name().unwrap()
+            );
             assert_eq!(
                 listed.documents[1].file_path.as_deref(),
-                Some("/tmp/site.dwg")
+                Some(site.as_str())
             );
             assert!(listed.documents[1].modified);
             assert!(listed.documents[1].read_only);
 
             let opened = client
-                .open(OpenRequest {
-                    path: "/tmp/house.dwg".into(),
-                })
+                .open(OpenRequest::from(house.clone()))
                 .await
                 .unwrap()
                 .into_inner()
@@ -789,7 +795,7 @@ mod tests {
                 crate::ffi::NativeDocumentSnapshot {
                     document_token: 1,
                     database_token: 101,
-                    name: "/tmp/house.dwg".into(),
+                    name: house.as_str().into(),
                     named: true,
                     modified: true,
                     read_only: false,
@@ -797,7 +803,7 @@ mod tests {
                 crate::ffi::NativeDocumentSnapshot {
                     document_token: 2,
                     database_token: 102,
-                    name: "/tmp/site.dwg".into(),
+                    name: site.as_str().into(),
                     named: true,
                     modified: true,
                     read_only: true,
@@ -831,7 +837,7 @@ mod tests {
                 crate::ffi::NativeDocumentSnapshot {
                     document_token: 1,
                     database_token: 101,
-                    name: "/tmp/house.dwg".into(),
+                    name: house.as_str().into(),
                     named: true,
                     modified: false,
                     read_only: false,
@@ -839,7 +845,7 @@ mod tests {
                 crate::ffi::NativeDocumentSnapshot {
                     document_token: 2,
                     database_token: 102,
-                    name: "/tmp/site.dwg".into(),
+                    name: site.as_str().into(),
                     named: true,
                     modified: true,
                     read_only: true,
@@ -879,6 +885,17 @@ mod tests {
         stop();
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(client);
+        std::fs::remove_file(house.as_path()).unwrap();
+        std::fs::remove_file(site.as_path()).unwrap();
+    }
+
+    fn test_drawing_path(name: &str) -> acadctl_rpc::DrawingPath {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-rpc-server-{}-{name}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, []).unwrap();
+        acadctl_rpc::DrawingPath::canonicalize(path).unwrap()
     }
 
     async fn next_native_action() -> crate::ffi::NativeAction {
@@ -910,7 +927,7 @@ mod tests {
             modified: false,
             read_only: false,
         }]);
-        let document_id = crate::scheduler::list().unwrap()[0].id.clone();
+        let document_id = crate::scheduler::list().unwrap()[0].id;
         start().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -925,7 +942,7 @@ mod tests {
             .unwrap();
             execute_and_cancel(
                 &mut client,
-                &document_id,
+                document_id,
                 Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES]),
             )
             .await;
@@ -933,10 +950,10 @@ mod tests {
             let mut with_bom = Vec::with_capacity(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3);
             with_bom.extend_from_slice(&[0xef, 0xbb, 0xbf]);
             with_bom.resize(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3, b'x');
-            execute_and_cancel(&mut client, &document_id, Bytes::from(with_bom)).await;
+            execute_and_cancel(&mut client, document_id, Bytes::from(with_bom)).await;
 
             let request = execution_request(
-                &document_id,
+                document_id,
                 Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1]),
             );
             let mut response = client
@@ -986,7 +1003,7 @@ mod tests {
             modified: false,
             read_only: false,
         }]);
-        let document_id = crate::scheduler::list().unwrap()[0].id.clone();
+        let document_id = crate::scheduler::list().unwrap()[0].id;
         start().unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1001,7 +1018,7 @@ mod tests {
             .unwrap();
             let (sender, receiver) = mpsc::channel(1);
             sender
-                .send(execution_request(&document_id, Bytes::from_static(b"form")))
+                .send(execution_request(document_id, Bytes::from_static(b"form")))
                 .await
                 .unwrap();
             let outbound = stream::unfold(receiver, |mut receiver| async move {
@@ -1077,7 +1094,7 @@ mod tests {
 
     async fn execute_and_cancel(
         client: &mut acadctl_rpc::ExecutionServiceClient<tonic::transport::Channel>,
-        document_id: &str,
+        document_id: DocumentId,
         source: Bytes,
     ) {
         let (sender, receiver) = mpsc::channel(2);
@@ -1136,15 +1153,15 @@ mod tests {
         assert!(finished_seen);
     }
 
-    fn execution_request(document_id: &str, source: Bytes) -> ExecutionClientMessage {
+    fn execution_request(document_id: DocumentId, source: Bytes) -> ExecutionClientMessage {
         ExecutionClientMessage {
             message: Some(execution_client_message::Message::Request(
-                ExecutionRequest {
-                    document_id: document_id.into(),
-                    mode: RpcExecutionMode::Exec as i32,
-                    source_name: "<stdin>".into(),
+                ExecutionRequest::new(
+                    document_id,
+                    RpcExecutionMode::Exec,
+                    "<stdin>".into(),
                     source,
-                },
+                ),
             )),
         }
     }

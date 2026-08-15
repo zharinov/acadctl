@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use acadctl_rpc::Document;
+use acadctl_rpc::{DocumentId, DrawingPath};
 use tokio::sync::{Notify, oneshot};
 
-use crate::documents::{DocumentRegistry, DocumentTarget, NativeDocumentKey};
+use crate::documents::{Document, DocumentRegistry, DocumentTarget, NativeDocumentKey};
 use crate::execution::output::{OutputSink, OutputStream};
 use crate::execution::value_bridge::NativeValueWriter;
 use crate::execution::{
@@ -94,21 +94,21 @@ impl Drop for ExecutionReservationInner {
 
 enum Operation {
     Open {
-        path: String,
+        path: DrawingPath,
     },
     Save {
-        id: String,
+        id: DocumentId,
     },
     Close {
-        id: String,
+        id: DocumentId,
         discard: bool,
     },
     History {
-        id: String,
+        id: DocumentId,
         direction: HistoryDirection,
     },
     Execute {
-        id: String,
+        id: DocumentId,
         execution: Box<Execution>,
     },
 }
@@ -163,12 +163,12 @@ pub enum Error {
     ScheduleFailed(i32),
     Stopped,
     PluginStopping,
-    DocumentNotFound(String),
+    DocumentNotFound(DocumentId),
     DocumentGone,
     DocumentGenerationChanged,
-    Unnamed(String),
-    ReadOnly(String),
-    Dirty(String),
+    Unnamed(DocumentId),
+    ReadOnly(DocumentId),
+    Dirty(DocumentId),
     NotDwg,
     OpenFailed(NativeFailure),
     LockFailed(NativeFailure),
@@ -403,21 +403,21 @@ impl MutationScheduler {
     }
 }
 
-pub async fn open(path: String) -> Result<Document, Error> {
+pub async fn open(path: DrawingPath) -> Result<Document, Error> {
     match submit_operation(Operation::Open { path }).await? {
         OperationOutcome::Document(document) => Ok(document),
         OperationOutcome::Closed | OperationOutcome::Execution(_) => Err(Error::OpenNotPublished),
     }
 }
 
-pub async fn save(id: String) -> Result<Document, Error> {
+pub async fn save(id: DocumentId) -> Result<Document, Error> {
     match submit_operation(Operation::Save { id }).await? {
         OperationOutcome::Document(document) => Ok(document),
         OperationOutcome::Closed | OperationOutcome::Execution(_) => Err(Error::SaveNotPublished),
     }
 }
 
-pub async fn close(id: String, discard: bool) -> Result<(), Error> {
+pub async fn close(id: DocumentId, discard: bool) -> Result<(), Error> {
     match submit_operation(Operation::Close { id, discard }).await? {
         OperationOutcome::Closed => Ok(()),
         OperationOutcome::Document(_) | OperationOutcome::Execution(_) => {
@@ -426,15 +426,15 @@ pub async fn close(id: String, discard: bool) -> Result<(), Error> {
     }
 }
 
-pub async fn undo(id: String) -> Result<Document, Error> {
+pub async fn undo(id: DocumentId) -> Result<Document, Error> {
     history(id, HistoryDirection::Undo).await
 }
 
-pub async fn redo(id: String) -> Result<Document, Error> {
+pub async fn redo(id: DocumentId) -> Result<Document, Error> {
     history(id, HistoryDirection::Redo).await
 }
 
-async fn history(id: String, direction: HistoryDirection) -> Result<Document, Error> {
+async fn history(id: DocumentId, direction: HistoryDirection) -> Result<Document, Error> {
     match submit_operation(Operation::History { id, direction }).await? {
         OperationOutcome::Document(document) => Ok(document),
         OperationOutcome::Closed | OperationOutcome::Execution(_) => Err(Error::DocumentGone),
@@ -442,7 +442,7 @@ async fn history(id: String, direction: HistoryDirection) -> Result<Document, Er
 }
 
 pub fn admit_execution(
-    id: String,
+    id: DocumentId,
     execution: Execution,
     output: OutputStream,
     reservation: ExecutionReservation,
@@ -1216,19 +1216,19 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
                 Prepared::Native(native_action(
                     NativeActionKind::Open,
                     None,
-                    path.clone(),
+                    path.as_str().to_owned(),
                     false,
                 ))
             },
             |target| Prepared::Immediate(Ok(OperationOutcome::Document(target.document))),
         ),
-        Operation::Save { id } => match documents.find_by_id(id) {
-            Some(target) => prepare_save(id, target),
-            None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
+        Operation::Save { id } => match documents.find_by_id(*id) {
+            Some(target) => prepare_save(*id, target),
+            None => Prepared::Immediate(Err(Error::DocumentNotFound(*id))),
         },
-        Operation::Close { id, discard } => match documents.find_by_id(id) {
+        Operation::Close { id, discard } => match documents.find_by_id(*id) {
             Some(target) if target.document.modified && !discard => {
-                Prepared::Immediate(Err(Error::Dirty(id.clone())))
+                Prepared::Immediate(Err(Error::Dirty(*id)))
             }
             Some(target) => Prepared::Native(native_action(
                 NativeActionKind::Close,
@@ -1236,9 +1236,9 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
                 String::new(),
                 *discard,
             )),
-            None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
+            None => Prepared::Immediate(Err(Error::DocumentNotFound(*id))),
         },
-        Operation::History { id, direction } => match documents.find_by_id(id) {
+        Operation::History { id, direction } => match documents.find_by_id(*id) {
             Some(target) => Prepared::Native(native_action(
                 match direction {
                     HistoryDirection::Undo => NativeActionKind::Undo,
@@ -1248,9 +1248,9 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
                 String::new(),
                 false,
             )),
-            None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
+            None => Prepared::Immediate(Err(Error::DocumentNotFound(*id))),
         },
-        Operation::Execute { id, execution } => match documents.find_by_id(id) {
+        Operation::Execute { id, execution } => match documents.find_by_id(*id) {
             Some(_) if execution.outcome().is_some() => {
                 Prepared::Immediate(Ok(OperationOutcome::Execution(
                     execution
@@ -1265,21 +1265,21 @@ fn prepare(operation: &Operation, documents: &DocumentRegistry) -> Prepared {
                 String::new(),
                 false,
             )),
-            None => Prepared::Immediate(Err(Error::DocumentNotFound(id.clone()))),
+            None => Prepared::Immediate(Err(Error::DocumentNotFound(*id))),
         },
     }
 }
 
-fn prepare_save(id: &str, target: DocumentTarget) -> Prepared {
+fn prepare_save(id: DocumentId, target: DocumentTarget) -> Prepared {
     if target.document.read_only {
-        return Prepared::Immediate(Err(Error::ReadOnly(id.to_owned())));
+        return Prepared::Immediate(Err(Error::ReadOnly(id)));
     }
 
     let Some(file_path) = target.document.file_path.as_deref() else {
-        return Prepared::Immediate(Err(Error::Unnamed(id.to_owned())));
+        return Prepared::Immediate(Err(Error::Unnamed(id)));
     };
 
-    if !is_dwg(std::path::Path::new(file_path)) {
+    if !DrawingPath::has_dwg_extension(file_path) {
         return Prepared::Immediate(Err(Error::NotDwg));
     }
 
@@ -1307,8 +1307,8 @@ fn finalize(
             .ok_or(Error::OpenNotPublished),
         Operation::Save { id } => {
             let target = documents
-                .find_by_id(id)
-                .ok_or_else(|| Error::DocumentNotFound(id.clone()))?;
+                .find_by_id(*id)
+                .ok_or(Error::DocumentNotFound(*id))?;
 
             if target.document.modified {
                 Err(Error::SaveNotPublished)
@@ -1317,7 +1317,7 @@ fn finalize(
             }
         }
         Operation::Close { id, .. } => {
-            if documents.find_by_id(id).is_none() {
+            if documents.find_by_id(*id).is_none() {
                 Ok(OperationOutcome::Closed)
             } else {
                 Err(Error::CloseNotPublished)
@@ -1325,7 +1325,7 @@ fn finalize(
         }
         Operation::History { id, .. } => {
             let expected = native_target.ok_or(Error::DocumentGone)?;
-            let target = documents.find_by_id(id).ok_or(Error::DocumentGone)?;
+            let target = documents.find_by_id(*id).ok_or(Error::DocumentGone)?;
 
             if target.native_key != expected {
                 Err(Error::DocumentGenerationChanged)
@@ -1419,11 +1419,18 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         NativeActionResultKind::Success => Ok(()),
         NativeActionResultKind::DocumentGone => Err(Error::DocumentGone),
         NativeActionResultKind::DocumentGenerationChanged => Err(Error::DocumentGenerationChanged),
-        NativeActionResultKind::Unnamed => Err(Error::Unnamed(operation.document_id().to_owned())),
-        NativeActionResultKind::ReadOnly => {
-            Err(Error::ReadOnly(operation.document_id().to_owned()))
-        }
-        NativeActionResultKind::Dirty => Err(Error::Dirty(operation.document_id().to_owned())),
+        NativeActionResultKind::Unnamed => Err(operation
+            .document_id()
+            .map(Error::Unnamed)
+            .unwrap_or(Error::UnknownResult(result.kind.repr))),
+        NativeActionResultKind::ReadOnly => Err(operation
+            .document_id()
+            .map(Error::ReadOnly)
+            .unwrap_or(Error::UnknownResult(result.kind.repr))),
+        NativeActionResultKind::Dirty => Err(operation
+            .document_id()
+            .map(Error::Dirty)
+            .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::OpenFailed => Err(Error::OpenFailed(failure)),
         NativeActionResultKind::LockFailed => Err(Error::LockFailed(failure)),
         NativeActionResultKind::SaveFailed => Err(Error::SaveFailed(failure)),
@@ -1532,25 +1539,19 @@ impl Operation {
         }
     }
 
-    fn document_id(&self) -> &str {
+    fn document_id(&self) -> Option<DocumentId> {
         match self {
-            Self::Open { .. } => "",
+            Self::Open { .. } => None,
             Self::Save { id }
             | Self::Close { id, .. }
             | Self::History { id, .. }
-            | Self::Execute { id, .. } => id,
+            | Self::Execute { id, .. } => Some(*id),
         }
     }
 }
 
 fn empty_action() -> NativeAction {
     native_action(NativeActionKind::None, None, String::new(), false)
-}
-
-fn is_dwg(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("dwg"))
 }
 
 fn schedule_native_actions() {
@@ -1678,23 +1679,29 @@ mod tests {
         assert_eq!(
             interpret(
                 result(NativeActionResultKind::DocumentGone),
-                &Operation::Save { id: "doc".into() },
+                &Operation::Save {
+                    id: "D0C0".parse().unwrap(),
+                },
             ),
             Err(Error::DocumentGone)
         );
         assert_eq!(
             interpret(
                 result(NativeActionResultKind::DocumentGenerationChanged),
-                &Operation::Save { id: "doc".into() },
+                &Operation::Save {
+                    id: "D0C0".parse().unwrap(),
+                },
             ),
             Err(Error::DocumentGenerationChanged)
         );
         assert_eq!(
             interpret(
                 result(NativeActionResultKind::ReadOnly),
-                &Operation::Save { id: "doc".into() },
+                &Operation::Save {
+                    id: "D0C0".parse().unwrap(),
+                },
             ),
-            Err(Error::ReadOnly("doc".into()))
+            Err(Error::ReadOnly("D0C0".parse().unwrap()))
         );
     }
 
@@ -1702,9 +1709,9 @@ mod tests {
     async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
-        let first = tokio::spawn(save(id.clone()));
+        let first = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
@@ -1712,7 +1719,7 @@ mod tests {
         first.abort();
         assert!(first.await.unwrap_err().is_cancelled());
 
-        let second = tokio::spawn(close(id.clone(), true));
+        let second = tokio::spawn(close(id, true));
         tokio::task::yield_now().await;
         assert_eq!(take_native_action().kind, NativeActionKind::None);
 
@@ -1732,16 +1739,16 @@ mod tests {
     async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
-        let undo_waiter = tokio::spawn(undo(id.clone()));
+        let undo_waiter = tokio::spawn(undo(id));
         tokio::task::yield_now().await;
         let undo_action = take_native_action();
         assert_eq!(undo_action.kind, NativeActionKind::Undo);
         assert_eq!(undo_action.document_token, 1);
         assert_eq!(undo_action.database_token, 101);
 
-        let redo_waiter = tokio::spawn(redo(id.clone()));
+        let redo_waiter = tokio::spawn(redo(id));
         tokio::task::yield_now().await;
         assert_eq!(take_native_action().kind, NativeActionKind::None);
 
@@ -1763,11 +1770,11 @@ mod tests {
     async fn drawing_history_fails_closed_on_missing_or_replaced_documents() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
         assert_eq!(
-            undo("absent".into()).await,
-            Err(Error::DocumentNotFound("absent".into()))
+            undo("DEAD".parse().unwrap()).await,
+            Err(Error::DocumentNotFound("DEAD".parse().unwrap()))
         );
 
         let waiter = tokio::spawn(redo(id));
@@ -1785,9 +1792,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(Vec::new());
 
-        let first = tokio::spawn(open("/tmp/first.dwg".into()));
-        let second = tokio::spawn(open("/tmp/second.dwg".into()));
-        let third = tokio::spawn(open("/tmp/third.dwg".into()));
+        let first = tokio::spawn(open(drawing_path("first")));
+        let second = tokio::spawn(open(drawing_path("second")));
+        let third = tokio::spawn(open(drawing_path("third")));
         tokio::task::yield_now().await;
 
         wake_failed(42);
@@ -1804,9 +1811,9 @@ mod tests {
     async fn shutdown_rejects_pending_work_but_preserves_the_active_operation() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
-        let active = tokio::spawn(save(id.clone()));
+        let active = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
@@ -1827,14 +1834,14 @@ mod tests {
     async fn keeps_one_mutation_job_active_across_a_batch() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) = Execution::new(
             ExecutionMode::Exec,
             "batch.lsp".into(),
             "first\nsecond".into(),
         )
         .unwrap();
-        let (_output, pending) = spawn_test_execution(id.clone(), execution, output);
+        let (_output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1876,7 +1883,7 @@ mod tests {
     async fn routes_println_only_to_the_exact_active_form() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -1934,7 +1941,7 @@ mod tests {
     async fn routes_the_eval_value_only_after_commit_and_only_once() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -1996,7 +2003,7 @@ mod tests {
     async fn rolls_back_a_malformed_active_value_stream() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (_output, pending) = spawn_test_execution(id, execution, output);
@@ -2051,7 +2058,7 @@ mod tests {
     async fn unfinished_writer_fails_its_own_form_checkpoint() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (_output, pending) = spawn_test_execution(id, execution, output);
@@ -2104,16 +2111,16 @@ mod tests {
     async fn queued_cancellation_removes_only_that_execution() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
-        let active = tokio::spawn(save(id.clone()));
+        let active = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let (mut output, pending) = spawn_test_execution(id.clone(), execution, output);
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
         let job_id = SCHEDULER
             .lock()
@@ -2138,9 +2145,9 @@ mod tests {
     async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
-        let active = tokio::spawn(save(id.clone()));
+        let active = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
@@ -2178,7 +2185,7 @@ mod tests {
     async fn wake_failure_stops_a_pending_execution_output_stream() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -2196,7 +2203,7 @@ mod tests {
     async fn active_cancellation_rolls_back_after_the_current_form() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -2237,7 +2244,7 @@ mod tests {
     async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -2270,7 +2277,7 @@ mod tests {
     async fn cancellation_after_commit_handoff_does_not_cancel_output() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -2309,7 +2316,7 @@ mod tests {
     async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let (mut output, pending) = spawn_test_execution(id, execution, output);
@@ -2346,10 +2353,10 @@ mod tests {
     async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let (mut output, executing) = spawn_test_execution(id.clone(), execution, output);
+        let (mut output, executing) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2399,10 +2406,10 @@ mod tests {
     async fn document_context_restore_failure_amends_a_terminal_execution_outcome() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
-        let (_output, pending) = spawn_test_execution(id.clone(), execution, output);
+        let (_output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2427,7 +2434,7 @@ mod tests {
             crate::execution::ExecutionStepKind::Done
         );
 
-        let blocked = tokio::spawn(save(id.clone()));
+        let blocked = tokio::spawn(save(id));
         tokio::task::yield_now().await;
 
         complete_native_action(
@@ -2461,7 +2468,7 @@ mod tests {
     async fn start_does_not_clear_native_state_quarantine() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
             scheduler.stopping = true;
@@ -2485,10 +2492,10 @@ mod tests {
     async fn retained_execution_state_quarantines_without_erasing_commit_evidence() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
-        let (_output, pending) = spawn_test_execution(id.clone(), execution, output);
+        let (_output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2531,7 +2538,7 @@ mod tests {
             crate::execution::ExecutionStepKind::Done
         );
 
-        let blocked = tokio::spawn(save(id.clone()));
+        let blocked = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         complete_execution_native_action(
             action.job_id,
@@ -2573,8 +2580,8 @@ mod tests {
     async fn queued_execution_expires_without_starting_a_form() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
-        let saving = tokio::spawn(save(id.clone()));
+        let id = list().unwrap()[0].id;
+        let saving = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
@@ -2617,7 +2624,7 @@ mod tests {
     async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
@@ -2649,7 +2656,7 @@ mod tests {
     async fn deadline_wins_while_the_busy_probe_is_in_flight() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
@@ -2680,7 +2687,7 @@ mod tests {
     async fn deadline_winner_survives_a_native_preflight_failure() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
@@ -2714,7 +2721,7 @@ mod tests {
     async fn deadline_winner_survives_a_failing_begin_step() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
@@ -2771,7 +2778,7 @@ mod tests {
     async fn admitted_execution_survives_dropped_rpc_observers() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         let admission = admit_test_execution(id, execution, output).unwrap();
@@ -2796,19 +2803,19 @@ mod tests {
     async fn execution_count_capacity_is_released_by_queued_cancellation() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let mut admissions = Vec::new();
 
         for _ in 0..MAX_ADMITTED_EXECUTIONS {
             let (execution, output) =
                 Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-            admissions.push(admit_test_execution(id.clone(), execution, output).unwrap());
+            admissions.push(admit_test_execution(id, execution, output).unwrap());
         }
 
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
         assert!(matches!(
-            admit_test_execution(id.clone(), execution, output),
+            admit_test_execution(id, execution, output),
             Err(Error::ExecutionCapacity)
         ));
 
@@ -2837,7 +2844,7 @@ mod tests {
     async fn detached_execution_retains_its_shared_admission_reservation() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
         let response_reservation = try_reserve_execution().unwrap();
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
@@ -2864,11 +2871,11 @@ mod tests {
     async fn queued_cancel_and_deadline_have_one_serialized_winner() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
+        let id = list().unwrap()[0].id;
 
         let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let admission = admit_test_execution(id.clone(), execution, output).unwrap();
+        let admission = admit_test_execution(id, execution, output).unwrap();
         let (expired_id, _output, expired_completion) = admission.into_parts();
         {
             let mut scheduler = SCHEDULER.lock().unwrap();
@@ -2907,8 +2914,8 @@ mod tests {
     async fn mutation_job_capacity_bounds_disconnected_waiters() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, true)]);
-        let id = list().unwrap()[0].id.clone();
-        let active = tokio::spawn(save(id.clone()));
+        let id = list().unwrap()[0].id;
+        let active = tokio::spawn(save(id));
         tokio::task::yield_now().await;
         let action = take_native_action();
         assert_eq!(action.kind, NativeActionKind::Save);
@@ -2916,7 +2923,7 @@ mod tests {
         let mut queued = Vec::new();
 
         for _ in 1..MAX_MUTATION_JOBS {
-            queued.push(tokio::spawn(save(id.clone())));
+            queued.push(tokio::spawn(save(id)));
             tokio::task::yield_now().await;
         }
 
@@ -2932,7 +2939,7 @@ mod tests {
     }
 
     fn admit_test_execution(
-        id: String,
+        id: DocumentId,
         execution: Execution,
         output: OutputStream,
     ) -> Result<ExecutionAdmission, Error> {
@@ -2941,7 +2948,7 @@ mod tests {
     }
 
     fn spawn_test_execution(
-        id: String,
+        id: DocumentId,
         execution: Execution,
         output: OutputStream,
     ) -> (
@@ -2984,6 +2991,17 @@ mod tests {
             modified,
             read_only: false,
         }
+    }
+
+    fn drawing_path(name: &str) -> DrawingPath {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-scheduler-{}-{name}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, []).unwrap();
+        let drawing = DrawingPath::canonicalize(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        drawing
     }
 
     fn reset(documents: Vec<crate::ffi::NativeDocumentSnapshot>) {

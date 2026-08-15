@@ -1,23 +1,37 @@
 use std::collections::HashSet;
 
-use acadctl_rpc::Document;
+use acadctl_rpc::{DocumentId, DrawingPath};
 
 use crate::ffi::NativeDocumentSnapshot;
 
-const DOCUMENT_ID_LENGTH: usize = 4;
 const DOCUMENT_ID_ALPHABET: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
 ];
-
-pub(crate) fn valid_document_id(id: &str) -> bool {
-    id.len() == DOCUMENT_ID_LENGTH
-        && id
-            .chars()
-            .all(|character| DOCUMENT_ID_ALPHABET.contains(&character))
-}
+const DOCUMENT_ID_LENGTH: usize = DocumentId::HEX_WIDTH;
 
 pub struct DocumentRegistry {
     documents: Vec<TrackedDocument>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Document {
+    pub id: DocumentId,
+    pub display_name: String,
+    pub file_path: Option<String>,
+    pub modified: bool,
+    pub read_only: bool,
+}
+
+impl From<Document> for acadctl_rpc::Document {
+    fn from(document: Document) -> Self {
+        Self {
+            id: document.id.to_string(),
+            display_name: document.display_name,
+            file_path: document.file_path,
+            modified: document.modified,
+            read_only: document.read_only,
+        }
+    }
 }
 
 struct TrackedDocument {
@@ -48,7 +62,7 @@ impl DocumentRegistry {
         let mut reserved_ids = self
             .documents
             .iter()
-            .map(|tracked| tracked.document.id.clone())
+            .map(|tracked| tracked.document.id)
             .collect::<HashSet<_>>();
         let mut previous = std::mem::take(&mut self.documents);
         let mut seen_tokens = HashSet::with_capacity(native_documents.len());
@@ -79,14 +93,14 @@ impl DocumentRegistry {
             .collect()
     }
 
-    pub fn find_by_id(&self, id: &str) -> Option<DocumentTarget> {
+    pub fn find_by_id(&self, id: DocumentId) -> Option<DocumentTarget> {
         self.documents
             .iter()
             .find(|tracked| tracked.document.id == id)
             .map(document_target)
     }
 
-    pub fn find_by_path(&self, path: &str) -> Option<DocumentTarget> {
+    pub fn find_by_path(&self, path: &DrawingPath) -> Option<DocumentTarget> {
         self.documents
             .iter()
             .find(|tracked| {
@@ -94,13 +108,13 @@ impl DocumentRegistry {
                     .document
                     .file_path
                     .as_deref()
-                    .is_some_and(|file_path| paths_equal(file_path, path))
+                    .is_some_and(|file_path| path.matches(file_path))
             })
             .map(document_target)
     }
 }
 
-fn public_document(id: String, native: NativeDocumentSnapshot) -> Document {
+fn public_document(id: DocumentId, native: NativeDocumentSnapshot) -> Document {
     let name = document_name(native.name, native.named);
     let (display_name, file_path) = if native.named {
         let display_name = std::path::Path::new(&name)
@@ -129,28 +143,23 @@ fn document_target(tracked: &TrackedDocument) -> DocumentTarget {
     }
 }
 
-#[cfg(windows)]
-fn paths_equal(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
-}
-
-#[cfg(not(windows))]
-fn paths_equal(left: &str, right: &str) -> bool {
-    left == right
-}
-
-fn take_document_id(documents: &mut Vec<TrackedDocument>, document_token: usize) -> Option<String> {
+fn take_document_id(
+    documents: &mut Vec<TrackedDocument>,
+    document_token: usize,
+) -> Option<DocumentId> {
     let position = documents
         .iter()
         .position(|document| document.native_key.document_token == document_token)?;
     Some(documents.swap_remove(position).document.id)
 }
 
-fn new_document_id(reserved_ids: &mut HashSet<String>) -> String {
+fn new_document_id(reserved_ids: &mut HashSet<DocumentId>) -> DocumentId {
     loop {
-        let id = nanoid::nanoid!(DOCUMENT_ID_LENGTH, &DOCUMENT_ID_ALPHABET);
+        let id = nanoid::nanoid!(DOCUMENT_ID_LENGTH, &DOCUMENT_ID_ALPHABET)
+            .parse()
+            .expect("the document ID alphabet and width are valid");
 
-        if reserved_ids.insert(id.clone()) {
+        if reserved_ids.insert(id) {
             return id;
         }
     }
@@ -173,20 +182,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_public_document_ids_exactly() {
-        assert!(valid_document_id("2A79"));
-        assert!(!valid_document_id(""));
-        assert!(!valid_document_id("2a7"));
-        assert!(!valid_document_id("2a790"));
-        assert!(!valid_document_id("2A7G"));
-        assert!(!valid_document_id("2a79"));
-    }
-
-    #[test]
     fn preserves_identity_while_replacing_native_state() {
         let mut documents = DocumentRegistry::new();
         documents.replace_snapshot(vec![named_document(1, "/tmp/house.dwg")]);
-        let original_id = documents.list()[0].id.clone();
+        let original_id = documents.list()[0].id;
 
         documents.replace_snapshot(vec![NativeDocumentSnapshot {
             database_token: 99,
@@ -204,7 +203,7 @@ mod tests {
         assert!(listed[0].read_only);
         assert_eq!(
             documents
-                .find_by_id(&original_id)
+                .find_by_id(original_id)
                 .unwrap()
                 .native_key
                 .database_token,
@@ -249,14 +248,16 @@ mod tests {
 
     #[test]
     fn finds_documents_by_id_and_named_path() {
+        let house = drawing_path("house");
+        let other = drawing_path("other");
         let mut documents = DocumentRegistry::new();
         documents.replace_snapshot(vec![
-            named_document(1, "/tmp/house.dwg"),
+            named_document(1, house.as_str()),
             unnamed_document(2, "Drawing1.dwg"),
         ]);
         let listed = documents.list();
 
-        let by_id = documents.find_by_id(&listed[0].id).unwrap();
+        let by_id = documents.find_by_id(listed[0].id).unwrap();
         assert_eq!(
             by_id.native_key,
             NativeDocumentKey {
@@ -264,28 +265,27 @@ mod tests {
                 database_token: 101,
             }
         );
-        assert_eq!(by_id.document.display_name, "house.dwg");
-        assert_eq!(by_id.document.file_path.as_deref(), Some("/tmp/house.dwg"));
+        assert_eq!(
+            by_id.document.display_name,
+            house.as_path().file_name().unwrap()
+        );
+        assert_eq!(by_id.document.file_path.as_deref(), Some(house.as_str()));
         assert_eq!(
             documents
-                .find_by_path("/tmp/house.dwg")
+                .find_by_path(&house)
                 .unwrap()
                 .native_key
                 .document_token,
             1
         );
-        assert!(documents.find_by_path("Drawing1").is_none());
+        assert!(documents.find_by_path(&other).is_none());
     }
 
     #[test]
     fn document_ids_are_fixed_width_and_unambiguous() {
         let id = new_document_id(&mut HashSet::new());
 
-        assert_eq!(id.len(), DOCUMENT_ID_LENGTH);
-        assert!(
-            id.chars()
-                .all(|character| DOCUMENT_ID_ALPHABET.contains(&character))
-        );
+        assert_eq!(id.to_string().len(), DocumentId::HEX_WIDTH);
     }
 
     fn named_document(document_token: usize, name: &str) -> NativeDocumentSnapshot {
@@ -304,5 +304,16 @@ mod tests {
             named: false,
             ..named_document(document_token, name)
         }
+    }
+
+    fn drawing_path(name: &str) -> DrawingPath {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-documents-{}-{name}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, []).unwrap();
+        let drawing = DrawingPath::canonicalize(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        drawing
     }
 }
