@@ -44,7 +44,7 @@ pub struct Execution {
     next_scan: ScanPosition,
     next_form_index: usize,
     phase: Phase,
-    form_attempted: bool,
+    form_handed_off: bool,
     value_retained: bool,
     eval_location: Option<SourceLocation>,
     cancel_requested: bool,
@@ -76,7 +76,7 @@ pub(crate) struct ValueOutputLease {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueOutputKind {
-    Form,
+    Println,
     EvalValue,
 }
 
@@ -167,7 +167,7 @@ pub struct ExecutionStepResult {
     pub native_status: i32,
     pub lisp_errno: i32,
     pub detail: String,
-    pub evaluator_symbols_clear_status: i32,
+    pub bridge_symbols_clear_status: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,7 +389,7 @@ impl Execution {
                 } else {
                     Phase::BeginUndoGroup
                 },
-                form_attempted: false,
+                form_handed_off: false,
                 value_retained: false,
                 eval_location: None,
                 cancel_requested: false,
@@ -422,8 +422,8 @@ impl Execution {
         self.source.len()
     }
 
-    pub fn form_started(&self) -> bool {
-        self.form_attempted
+    pub fn has_handed_off_form(&self) -> bool {
+        self.form_handed_off
     }
 
     pub fn cancellation_requested(&self) -> bool {
@@ -431,15 +431,15 @@ impl Execution {
     }
 
     pub fn start_deadline_pending(&self) -> bool {
-        !self.form_attempted
+        !self.form_handed_off
             && self.outcome.is_none()
             && !self.cancel_requested
             && self.unwind.is_none()
     }
 
-    pub(crate) fn acquire_form_output(&self) -> Option<ValueOutputLease> {
+    pub(crate) fn acquire_println_output(&self) -> Option<ValueOutputLease> {
         matches!(self.phase, Phase::AwaitingEvaluateForm { .. })
-            .then(|| self.io.acquire_value_output(ValueOutputKind::Form))
+            .then(|| self.io.acquire_value_output(ValueOutputKind::Println))
             .flatten()
     }
 
@@ -477,7 +477,7 @@ impl Execution {
     }
 
     pub fn expire_before_start(&mut self, message: String) -> bool {
-        if self.form_attempted || self.outcome.is_some() || self.cancel_requested {
+        if self.form_handed_off || self.outcome.is_some() || self.cancel_requested {
             return false;
         }
 
@@ -539,7 +539,7 @@ impl Execution {
                 }
                 Phase::BetweenForms => {
                     if self.cancel_requested {
-                        if self.form_attempted {
+                        if self.form_handed_off {
                             self.begin_unwind(UnwindCause::Cancelled);
                         } else {
                             self.unwind = Some(UnwindCause::Cancelled);
@@ -567,8 +567,8 @@ impl Execution {
                                     column: span.column,
                                 });
                             }
-                            self.io.begin_value_output(ValueOutputKind::Form);
-                            self.form_attempted = true;
+                            self.io.begin_value_output(ValueOutputKind::Println);
+                            self.form_handed_off = true;
                             return NativeExecutionStep::form(
                                 self.source.clone(),
                                 span,
@@ -662,7 +662,7 @@ impl Execution {
                 line,
                 column,
             } => {
-                let bridge_failure = self.io.close_value_output(ValueOutputKind::Form);
+                let bridge_failure = self.io.close_value_output(ValueOutputKind::Println);
                 if self.mode == ExecutionMode::Eval && result.succeeded() {
                     self.value_retained = true;
                 }
@@ -679,7 +679,7 @@ impl Execution {
                     }));
                 } else if let Some(failure) = bridge_failure {
                     let mut message = failure.message().to_owned();
-                    if let Some(cleanup) = result.evaluator_symbols_clear_message() {
+                    if let Some(cleanup) = result.bridge_symbols_clear_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
                     self.begin_unwind(UnwindCause::Failure(ExecutionFailure {
@@ -740,7 +740,7 @@ impl Execution {
                     Some(result.into_message("could not emit the eval result"))
                 } else if let Some(bridge_failure) = bridge_failure {
                     let mut message = bridge_failure.message().to_owned();
-                    if let Some(cleanup) = result.evaluator_symbols_clear_message() {
+                    if let Some(cleanup) = result.bridge_symbols_clear_message() {
                         append_diagnostic(&mut message, &cleanup);
                     }
                     Some(message)
@@ -837,7 +837,7 @@ impl Execution {
 
     fn begin_unwind(&mut self, cause: UnwindCause) {
         self.unwind = Some(cause);
-        self.phase = if self.mode == ExecutionMode::Eval && self.form_attempted {
+        self.phase = if self.mode == ExecutionMode::Eval && self.form_handed_off {
             Phase::ClearRetainedEvalValue
         } else {
             Phase::RollbackUndoGroup
@@ -898,7 +898,7 @@ impl Execution {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
         if matches!(phase, Phase::AwaitingEvaluateForm { .. }) {
-            let _ = self.io.close_value_output(ValueOutputKind::Form);
+            let _ = self.io.close_value_output(ValueOutputKind::Println);
         } else if phase == Phase::AwaitingEmitEvalValue {
             let _ = self.io.close_value_output(ValueOutputKind::EvalValue);
         }
@@ -1006,24 +1006,24 @@ impl NativeExecutionStep {
 
 impl ExecutionStepResult {
     fn succeeded(&self) -> bool {
-        self.kind == ExecutionStepResultKind::Success && self.evaluator_symbols_clear_status == 0
+        self.kind == ExecutionStepResultKind::Success && self.bridge_symbols_clear_status == 0
     }
 
     fn primary_failed(&self) -> bool {
         self.kind != ExecutionStepResultKind::Success
     }
 
-    fn evaluator_symbols_clear_message(&self) -> Option<String> {
-        (self.evaluator_symbols_clear_status != 0).then(|| {
+    fn bridge_symbols_clear_message(&self) -> Option<String> {
+        (self.bridge_symbols_clear_status != 0).then(|| {
             format!(
-                "could not clear the reserved AutoLISP evaluator symbols (native status {})",
-                self.evaluator_symbols_clear_status
+                "could not clear the reserved AutoLISP execution bridge symbols (native status {})",
+                self.bridge_symbols_clear_status
             )
         })
     }
 
     fn into_message(self, fallback: &str) -> String {
-        let cleanup = self.evaluator_symbols_clear_message();
+        let cleanup = self.bridge_symbols_clear_message();
         let primary = if self.kind == ExecutionStepResultKind::Success {
             None
         } else if !self.detail.is_empty() {
@@ -1307,7 +1307,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "value visitor failed; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
+            "value visitor failed; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
     }
@@ -1327,7 +1327,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
+            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
     }
@@ -1418,7 +1418,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "bad argument type; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
+            "bad argument type; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1800,7 +1800,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
+            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1951,7 +1951,7 @@ mod tests {
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            evaluator_symbols_clear_status: 0,
+            bridge_symbols_clear_status: 0,
         }
     }
 
@@ -1961,7 +1961,7 @@ mod tests {
             native_status: 0,
             lisp_errno,
             detail: detail.into(),
-            evaluator_symbols_clear_status: 0,
+            bridge_symbols_clear_status: 0,
         }
     }
 
@@ -1971,15 +1971,15 @@ mod tests {
             native_status,
             lisp_errno: 0,
             detail: detail.into(),
-            evaluator_symbols_clear_status: 0,
+            bridge_symbols_clear_status: 0,
         }
     }
 
     fn with_cleanup(
         mut result: ExecutionStepResult,
-        evaluator_symbols_clear_status: i32,
+        bridge_symbols_clear_status: i32,
     ) -> ExecutionStepResult {
-        result.evaluator_symbols_clear_status = evaluator_symbols_clear_status;
+        result.bridge_symbols_clear_status = bridge_symbols_clear_status;
         result
     }
 }

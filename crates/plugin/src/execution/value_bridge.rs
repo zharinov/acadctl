@@ -45,7 +45,7 @@ pub enum ValueEvent<'a> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WriterPolicy {
     Inactive,
-    FormValue,
+    Println,
     EvalValue,
 }
 
@@ -67,7 +67,7 @@ impl NativeValueWriter {
     }
 
     pub(crate) fn println(lease: ValueOutputLease) -> Self {
-        Self::new(lease, PrintMode::Display, WriterPolicy::FormValue)
+        Self::new(lease, PrintMode::Display, WriterPolicy::Println)
     }
 
     pub(crate) fn eval_value(lease: ValueOutputLease) -> Self {
@@ -233,7 +233,7 @@ mod tests {
     async fn prints_exactly_one_display_value() {
         let (io, mut stream) = execution_io();
         let terminal = io.output_sink();
-        let mut writer = NativeValueWriter::println(form_lease(&io));
+        let mut writer = NativeValueWriter::println(println_lease(&io));
 
         assert_eq!(writer.write(ValueEvent::BeginString), WriteResult::Continue);
         assert_eq!(
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
         assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::Form),
+            io.close_value_output(super::super::ValueOutputKind::Println),
             None
         );
         terminal.finish();
@@ -254,15 +254,15 @@ mod tests {
     #[test]
     fn println_requires_exactly_one_root() {
         let (empty_io, _stream) = execution_io();
-        let empty = NativeValueWriter::println(form_lease(&empty_io));
+        let empty = NativeValueWriter::println(println_lease(&empty_io));
         assert_eq!(empty.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            empty_io.close_value_output(super::super::ValueOutputKind::Form),
+            empty_io.close_value_output(super::super::ValueOutputKind::Println),
             Some(ValueBridgeFailure::InvalidSequence)
         );
 
         let (multiple_io, _stream) = execution_io();
-        let mut multiple = NativeValueWriter::println(form_lease(&multiple_io));
+        let mut multiple = NativeValueWriter::println(println_lease(&multiple_io));
         assert_eq!(
             multiple.write(ValueEvent::Integer(1)),
             WriteResult::Continue
@@ -273,7 +273,7 @@ mod tests {
         );
         assert_eq!(multiple.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            multiple_io.close_value_output(super::super::ValueOutputKind::Form),
+            multiple_io.close_value_output(super::super::ValueOutputKind::Println),
             Some(ValueBridgeFailure::InvalidSequence)
         );
     }
@@ -375,10 +375,10 @@ mod tests {
     #[test]
     fn dropping_an_active_writer_records_an_abandoned_bridge() {
         let (io, _stream) = execution_io();
-        drop(NativeValueWriter::println(form_lease(&io)));
+        drop(NativeValueWriter::println(println_lease(&io)));
 
         assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::Form),
+            io.close_value_output(super::super::ValueOutputKind::Println),
             Some(ValueBridgeFailure::Abandoned)
         );
     }
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn terminal_writer_releases_its_formatter_and_execution_io() {
         let (io, stream) = execution_io();
-        let lease = form_lease(&io);
+        let lease = println_lease(&io);
         drop(stream);
 
         let writer = NativeValueWriter::println(lease);
@@ -394,7 +394,7 @@ mod tests {
         assert!(writer.printer.is_none());
         assert!(writer.lease.is_none());
         assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::Form),
+            io.close_value_output(super::super::ValueOutputKind::Println),
             None
         );
     }
@@ -410,10 +410,10 @@ mod tests {
         )
     }
 
-    fn form_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
-        io.begin_value_output(super::super::ValueOutputKind::Form);
-        io.acquire_value_output(super::super::ValueOutputKind::Form)
-            .expect("form output is open")
+    fn println_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
+        io.begin_value_output(super::super::ValueOutputKind::Println);
+        io.acquire_value_output(super::super::ValueOutputKind::Println)
+            .expect("println output is open")
     }
 
     fn eval_value_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {

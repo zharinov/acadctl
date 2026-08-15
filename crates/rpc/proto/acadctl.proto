@@ -86,7 +86,7 @@ message ExecutionServerEvent {
 message ExecutionAccepted {}
 
 message ExecutionOutput {
-  string text = 1;
+  string chunk = 1;
 }
 
 message ExecutionFinished {

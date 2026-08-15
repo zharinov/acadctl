@@ -136,7 +136,7 @@ pub enum CancelResult {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
-    StateUnavailable,
+    SchedulerStateUnavailable,
     ScheduleFailed(i32),
     Stopped,
     PluginStopping,
@@ -163,7 +163,7 @@ pub enum Error {
     DocumentContextFailed(NativeFailure),
     DocumentContextRestoreFailed(NativeFailure),
     ExecutionBridgeFinalizationFailed(NativeFailure),
-    EvaluatorSymbolsClearFailed(NativeFailure),
+    ExecutionBridgeSymbolsClearFailed(NativeFailure),
     ExecutionBridgeFailed(NativeFailure),
     ExecutionNotFinished,
     MutationCapacity,
@@ -181,7 +181,7 @@ pub struct NativeFailure {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StateUnavailable => formatter.write_str("native action state is unavailable"),
+            Self::SchedulerStateUnavailable => formatter.write_str("mutation scheduler state is unavailable"),
             Self::ScheduleFailed(status) => {
                 write!(
                     formatter,
@@ -246,9 +246,9 @@ impl fmt::Display for Error {
                 formatter,
                 "Could not release native execution state safely",
             ),
-            Self::EvaluatorSymbolsClearFailed(failure) => failure.fmt_with_context(
+            Self::ExecutionBridgeSymbolsClearFailed(failure) => failure.fmt_with_context(
                 formatter,
-                "Could not clear the reserved AutoLISP evaluator symbols",
+                "Could not clear the reserved AutoLISP execution bridge symbols",
             ),
             Self::ExecutionBridgeFailed(failure) => {
                 failure.fmt_with_context(formatter, "The AutoLISP execution bridge failed")
@@ -291,7 +291,7 @@ impl Error {
     pub const fn is_internal(&self) -> bool {
         matches!(
             self,
-            Self::StateUnavailable
+            Self::SchedulerStateUnavailable
                 | Self::Stopped
                 | Self::OpenNotPublished
                 | Self::SaveNotPublished
@@ -299,7 +299,7 @@ impl Error {
                 | Self::DocumentContextFailed(_)
                 | Self::DocumentContextRestoreFailed(_)
                 | Self::ExecutionBridgeFinalizationFailed(_)
-                | Self::EvaluatorSymbolsClearFailed(_)
+                | Self::ExecutionBridgeSymbolsClearFailed(_)
                 | Self::ExecutionBridgeFailed(_)
                 | Self::ExecutionNotFinished
                 | Self::NativeMutationStateUnknown
@@ -407,7 +407,9 @@ pub fn admit_execution(
 ) -> Result<ExecutionAdmission, Error> {
     let deadline = Instant::now() + EXECUTION_START_TIMEOUT;
     let (job_id, receiver, should_wake, immediate) = {
-        let mut scheduler = SCHEDULER.lock().map_err(|_| Error::StateUnavailable)?;
+        let mut scheduler = SCHEDULER
+            .lock()
+            .map_err(|_| Error::SchedulerStateUnavailable)?;
         if scheduler.stopping {
             return Err(Error::PluginStopping);
         }
@@ -507,7 +509,7 @@ impl ExecutionCompletion {
 pub fn list() -> Result<Vec<Document>, Error> {
     SCHEDULER
         .lock()
-        .map_err(|_| Error::StateUnavailable)
+        .map_err(|_| Error::SchedulerStateUnavailable)
         .map(|scheduler| scheduler.documents.list())
 }
 
@@ -557,7 +559,9 @@ pub fn stop() {
 
 async fn submit_operation(operation: Operation) -> Result<OperationOutcome, Error> {
     let (completed, should_wake) = {
-        let mut scheduler = SCHEDULER.lock().map_err(|_| Error::StateUnavailable)?;
+        let mut scheduler = SCHEDULER
+            .lock()
+            .map_err(|_| Error::SchedulerStateUnavailable)?;
         if scheduler.stopping {
             return Err(Error::PluginStopping);
         }
@@ -651,7 +655,7 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
         result.kind,
         NativeActionResultKind::DocumentContextRestoreFailed
             | NativeActionResultKind::ExecutionBridgeFinalizationFailed
-            | NativeActionResultKind::EvaluatorSymbolsClearFailed
+            | NativeActionResultKind::ExecutionBridgeSymbolsClearFailed
     );
     let (completion, pending) = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
@@ -666,7 +670,7 @@ pub fn complete_native_action(job_id: MutationJobId, mut result: NativeActionRes
         }
 
         let settled_before_start = if result.kind == NativeActionResultKind::NotQuiescent
-            && job.execution_has_not_started()
+            && job.execution_has_not_handed_off_form()
         {
             if job.finish_cancel_before_start()
                 || job.expire_if_due(Instant::now())
@@ -940,7 +944,7 @@ pub fn begin_println(document_token: usize, database_token: usize) -> NativeValu
             return NativeValueWriter::inactive();
         }
         match &job.operation {
-            Operation::Execute { execution, .. } => execution.acquire_form_output(),
+            Operation::Execute { execution, .. } => execution.acquire_println_output(),
             Operation::Open { .. }
             | Operation::Save { .. }
             | Operation::Close { .. }
@@ -1024,7 +1028,7 @@ pub fn abandon_execution(job_id: MutationJobId, mut result: ExecutionStepResult)
     }
 }
 
-pub fn native_actions_need_wake() -> bool {
+pub fn try_claim_native_action_wake() -> bool {
     SCHEDULER
         .lock()
         .is_ok_and(|mut scheduler| scheduler.request_wake())
@@ -1186,13 +1190,13 @@ fn complete_operation(
         result.kind,
         NativeActionResultKind::DocumentContextRestoreFailed
             | NativeActionResultKind::ExecutionBridgeFinalizationFailed
-            | NativeActionResultKind::EvaluatorSymbolsClearFailed
+            | NativeActionResultKind::ExecutionBridgeSymbolsClearFailed
             | NativeActionResultKind::ExecutionBridgeFailed
     ) {
         return finalize(operation, documents, native_target);
     }
 
-    if result.kind == NativeActionResultKind::EvaluatorSymbolsClearFailed
+    if result.kind == NativeActionResultKind::ExecutionBridgeSymbolsClearFailed
         && let Operation::Execute { execution, .. } = operation
         && matches!(execution.outcome(), Some(ExecutionOutcome::Failure(_)))
     {
@@ -1211,7 +1215,7 @@ fn complete_operation(
             native_status: result.native_status,
             lisp_errno: 0,
             detail: std::mem::take(&mut result.native_detail),
-            evaluator_symbols_clear_status: 0,
+            bridge_symbols_clear_status: 0,
         });
         debug_assert!(recorded);
         return finalize(operation, documents, native_target);
@@ -1277,8 +1281,8 @@ fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Er
         NativeActionResultKind::ExecutionBridgeFinalizationFailed => {
             Err(Error::ExecutionBridgeFinalizationFailed(failure))
         }
-        NativeActionResultKind::EvaluatorSymbolsClearFailed => {
-            Err(Error::EvaluatorSymbolsClearFailed(failure))
+        NativeActionResultKind::ExecutionBridgeSymbolsClearFailed => {
+            Err(Error::ExecutionBridgeSymbolsClearFailed(failure))
         }
         NativeActionResultKind::ExecutionBridgeFailed => Err(Error::ExecutionBridgeFailed(failure)),
         kind => Err(Error::UnknownResult(kind.repr)),
@@ -1307,10 +1311,10 @@ impl MutationJob {
         }
     }
 
-    fn execution_has_not_started(&self) -> bool {
+    fn execution_has_not_handed_off_form(&self) -> bool {
         matches!(
             &self.operation,
-            Operation::Execute { execution, .. } if !execution.form_started()
+            Operation::Execute { execution, .. } if !execution.has_handed_off_form()
         )
     }
 
@@ -1331,7 +1335,7 @@ impl MutationJob {
     fn finish_cancel_before_start(&mut self) -> bool {
         match &mut self.operation {
             Operation::Execute { execution, .. }
-                if !execution.form_started() && execution.cancellation_requested() =>
+                if !execution.has_handed_off_form() && execution.cancellation_requested() =>
             {
                 execution.cancel_before_start()
             }
@@ -1452,7 +1456,7 @@ mod tests {
 
         replace_document_snapshot(vec![document(1, 101, false)]);
         complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
-        assert!(native_actions_need_wake());
+        assert!(try_claim_native_action_wake());
 
         let close_action = take_native_action();
         assert_eq!(close_action.kind, NativeActionKind::Close);
@@ -1858,7 +1862,7 @@ mod tests {
         replace_document_snapshot(vec![document(1, 101, false)]);
         complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(active.await.unwrap().is_ok());
-        assert!(!native_actions_need_wake());
+        assert!(!try_claim_native_action_wake());
         stop();
     }
 
@@ -1898,7 +1902,7 @@ mod tests {
         replace_document_snapshot(vec![document(1, 101, false)]);
         complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
         assert!(active.await.unwrap().is_ok());
-        assert!(!native_actions_need_wake());
+        assert!(!try_claim_native_action_wake());
         stop();
     }
 
@@ -2114,7 +2118,7 @@ mod tests {
         complete_native_action(action.job_id, result(NativeActionResultKind::Success));
         assert_eq!(output.next_chunk().await, None);
 
-        assert!(native_actions_need_wake());
+        assert!(try_claim_native_action_wake());
         let close_action = take_native_action();
         assert_eq!(close_action.kind, NativeActionKind::Close);
         replace_document_snapshot(Vec::new());
@@ -2250,7 +2254,7 @@ mod tests {
                 native_status: 42,
                 lisp_errno: 0,
                 detail: "could not clear the retained AutoLISP value".into(),
-                evaluator_symbols_clear_status: 0,
+                bridge_symbols_clear_status: 0,
             }
         ));
         assert_eq!(
@@ -2263,9 +2267,9 @@ mod tests {
         complete_native_action(
             action.job_id,
             NativeActionResult {
-                kind: NativeActionResultKind::EvaluatorSymbolsClearFailed,
+                kind: NativeActionResultKind::ExecutionBridgeSymbolsClearFailed,
                 native_status: 42,
-                native_detail: "reserved evaluator state remains".into(),
+                native_detail: "reserved execution bridge state remains".into(),
             },
         );
 
@@ -2459,7 +2463,7 @@ mod tests {
                 native_status: 42,
                 lisp_errno: 0,
                 detail: "undo begin failed".into(),
-                evaluator_symbols_clear_status: 0,
+                bridge_symbols_clear_status: 0,
             }
         ));
         assert_eq!(
@@ -2678,7 +2682,7 @@ mod tests {
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            evaluator_symbols_clear_status: 0,
+            bridge_symbols_clear_status: 0,
         }
     }
 

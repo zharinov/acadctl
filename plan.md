@@ -1,6 +1,6 @@
 # `acadctl eval`, `exec`, and drawing history
 
-Status: the installed private build runs document-scoped `eval`, `exec`, one-value `acadctl:println`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The current follow-up awaits its cleanup, naming, and independent spec audits before commit. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
+Status: the installed private build runs document-scoped `eval`, `exec`, one-value `acadctl:println`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The implementation and its post-commit first-principles naming pass are committed locally; cleanup and independent spec audits remain. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
 
 ## Current implementation checklist
 
@@ -8,7 +8,8 @@ Status: the installed private build runs document-scoped `eval`, `exec`, one-val
 - [x] Live document-scoped `exec`, `eval`, `acadctl:println`, readable values, Lisp diagnostics, and drawing rollback.
 - [x] Live drawing-wide `undo` and `redo`, including exact inactive-document routing and restoration of the prior active document.
 - [x] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates on macOS and AutoCAD 2027.
-- [ ] Commit the current one-value output and process-identity corrections, then complete the first-principles naming, cleanup, and independent spec audits.
+- [x] Commit the one-value output and process-identity corrections, then complete the first-principles naming reconciliation.
+- [ ] Complete the cleanup and independent spec audits.
 
 ## Design center
 
@@ -236,16 +237,16 @@ Admission requires all of the following:
 - The target can become active and accept the fixed document-context driver without prompting.
 - AutoCAD can open the required undo group with undo recording enabled.
 
-The pre-execution deadline is five seconds from server acceptance. It includes time behind earlier acadctl jobs and time waiting for AutoCAD or the document to become ready. The deadline is managed off the AutoCAD main thread; the main loop is never put to sleep for polling. Expiry removes the queued job and guarantees that none of its forms started.
+The execution-start deadline is five seconds from server acceptance. It includes time behind earlier acadctl jobs and time waiting for AutoCAD or the document to become ready. The deadline is managed off the AutoCAD main thread; the main loop is never put to sleep for polling. Expiry removes the queued job and guarantees that none of its forms were handed off.
 
-The deadline ends when the first form begins. There is no runtime timeout. AutoLISP can legitimately run a long command, display a modal interaction, or wait for user input, and there is no supported safe general cross-thread preemption mechanism.
+The deadline ends when Rust hands off the first `EvaluateForm` step. There is no runtime timeout. AutoLISP can legitimately run a long command, display a modal interaction, or wait for user input, and there is no supported safe general cross-thread preemption mechanism.
 
 A conceptual execution state is:
 
 ```rust
 enum ExecutionState {
     Validating,
-    Queued { admission_deadline: Instant },
+    Queued { execution_start_deadline: Instant },
     Running { next_form: usize },
     RollingBack,
     Succeeded,
@@ -395,7 +396,7 @@ enum DrawingOutcome {
 }
 ```
 
-`Accepted` means validation succeeded and the plugin owns the queued job; it does not mean the first form has started. The five-second admission deadline begins at acceptance.
+`Accepted` means validation succeeded and the plugin owns the queued job; it does not mean the first form has started. The five-second execution-start deadline begins at acceptance.
 
 Expected input, busy, AutoLISP, rollback, and cancellation outcomes are terminal execution events so that streamed output can precede them. Non-OK gRPC status is reserved for malformed protocol use, transport failure, or an internal service failure that cannot produce a normal terminal event.
 
@@ -846,9 +847,9 @@ A separate supervised task reads later client messages so an actual `Cancel` can
 
 ### 2026-08-14 — I-048: one timer driver owns first-form expiry and busy retry
 
-The five-second admission deadline remains authoritative until Rust hands out the first `Form` step, not merely until AutoCAD claims the batch callback. Deadline expiry, queued cancellation, and native claim or form handoff all transition scheduler state under the same mutex. Expiry can therefore win while the execution is queued, while `_UNDO Begin` is in flight, or between a successful Begin and the first form; once a form step wins, the deadline is permanently inactive. A queued expiry finishes output and the terminal result after removing the job, while an active pre-form expiry closes any positively opened empty undo group before reporting `NotStarted`.
+The five-second execution-start deadline remains authoritative until Rust hands out the first `EvaluateForm` step, not merely until AutoCAD claims the batch callback. Deadline expiry, queued cancellation, and native claim or form handoff all transition scheduler state under the same mutex. Expiry can therefore win while the execution is queued, while `_UNDO Begin` is in flight, or between a successful Begin and the first form; once a form step wins, the deadline is permanently inactive. A queued expiry finishes output and the terminal result after removing the job, while an active pre-form expiry closes any positively opened empty undo group before reporting `NotStarted`.
 
-One off-main-thread driver watches the earliest actionable admission deadline and the FIFO head's readiness retry. A retryable busy result keeps the same head, waits first 50 ms and then with bounded exponential backoff up to 500 ms, and can be advanced immediately by normalized document, command, or Lisp readiness events. The driver requests only the existing coalesced application callback; it never sleeps or polls on AutoCAD's main thread. One task per request, immediate callback retry, and using a notification as deadline truth were rejected because they add cancellation races, wake storms, or main-loop spin.
+One off-main-thread driver watches the earliest actionable execution-start deadline and the FIFO head's readiness retry. A retryable busy result keeps the same head, waits first 50 ms and then with bounded exponential backoff up to 500 ms, and can be advanced immediately by normalized document, command, or Lisp readiness events. The driver requests only the existing coalesced application callback; it never sleeps or polls on AutoCAD's main thread. One task per request, immediate callback retry, and using a notification as deadline truth were rejected because they add cancellation races, wake storms, or main-loop spin.
 
 ### 2026-08-14 — I-049: the response stream is ordered, directly backpressured, and cancellation-aware
 
@@ -1065,3 +1066,17 @@ An AutoCAD `lispCancelled` event can terminate the queued outer driver after `_U
 The claimed public println path revalidates the pending execution phase, target document, current and active document, and database generation before staging, reading, or clearing target execution state. An unclaimed begin discards only the ambient `acadctl:*value*` that the wrapper has just stored and returns `nil`. A mismatch after a writer was claimed invalidates that writer and enters the existing context-loss path without clearing state in another drawing.
 
 The exact installed AutoCAD 2027 build was interrupted with Escape while an infinite second form was running after creating a uniquely sized circle. The client returned AutoLISP's `Function cancelled` failure. AutoCAD then reported the undo-group bit clear and all seven reserved evaluator symbols `nil`; the marker circle was absent, and a fresh request in the same process succeeded. This closes host-level cancellation recovery for the tested build independently of cooperative CLI cancellation.
+
+### 2026-08-15 — I-077: names describe the final ownership and handoff boundaries
+
+This entry supersedes the architecture-significant vocabulary in I-071 and the output-path terms amended by I-074 and I-076. A fresh first-principles review of the committed implementation found the ownership split sound but identified names whose temporal or semantic scope became false in the final queued-driver architecture.
+
+C++ holds one `DocumentContextDispatch` from queueing through running and finalization; calling it pending during the latter phases hid cleanup-critical lifetime. Its methods are `queueDocumentContextDispatch`, `scheduleDocumentContextFinalizer`, and `finalizeDocumentContextDispatch`. Execution is the `ExecutionDriver` dispatch kind, and `advanceCallbackActive` plus `finishAdvanceCallback` describe the one `_advance-execution` callback fact rather than execution policy.
+
+The shared AutoLISP slots are execution-bridge symbols, not evaluator-only state. Native cleanup is therefore `clearExecutionBridgeSymbols`, its mechanical result is `LispBridgeStepResult`, retained-state evidence is `bridgeSymbolsMayBeRetained`, and the Rust/native failure is `ExecutionBridgeSymbolsClearFailed`. The actual private globals use `acadctl:*bridge-*` names; undefined failure sentinels use `_invalid-*`, and the loader temporary is `acadctl:*loader-directory*`. Only `acadctl:println` remains public.
+
+Explicit request output is the `Println` value-output kind and writer policy. `Form` was rejected because it was easily confused with the separate implicit eval form value. The RPC `ExecutionOutput.chunk` field likewise states that one transport event can contain only part of a printed value or line. The message remains `ExecutionOutput` because it is still one ordered output event.
+
+Rust's mutating wake transition is `try_claim_native_action_wake`, not a predicate. Poisoned scheduler access is `SchedulerStateUnavailable`. The first-form boundary is represented by `form_handed_off`, `has_handed_off_form`, and `execution_has_not_handed_off_form`, because Rust can prove that it yielded `EvaluateForm` but cannot claim native evaluation already began. The associated five-second timer is consequently the execution-start deadline, beginning at accepted admission and ending at that handoff.
+
+Message-scoped request fields remain `id`, and `NativeExecutionStep` and `NativeValueWriter` retain `Native` because they are opaque work objects crossing the CXX boundary. Renaming those objects or every request field was rejected as churn that would erase useful boundary context without changing ownership.

@@ -16,8 +16,8 @@
               acadctl:atom-text
               acadctl:text
               acadctl:text-offset)
-     (setq acadctl:value acadctl:*value*)
-     (setq acadctl:*value* nil)
+     (setq acadctl:value acadctl:*bridge-value*)
+     (setq acadctl:*bridge-value* nil)
      (setq acadctl:outcome
        (vl-catch-all-apply
          '(lambda ()
@@ -197,17 +197,17 @@
                   (setq acadctl:continue
                     ({{CALLBACK}} {{CYCLE}} nil)))
                 (T
-                  (acadctl:invalid-value-task)))
+                  (acadctl:_invalid-value-task)))
             T))
          '()))
-     (setq acadctl:*errno* (getvar "ERRNO"))
+     (setq acadctl:*bridge-errno* (getvar "ERRNO"))
      (if (vl-catch-all-error-p acadctl:outcome)
        (progn
-         (setq acadctl:*status* nil)
-         (setq acadctl:*error*
+         (setq acadctl:*bridge-status* nil)
+         (setq acadctl:*bridge-error*
            (vl-catch-all-error-message acadctl:outcome)))
        (progn
-         (setq acadctl:*status* T)
-         (setq acadctl:*error* nil)))))
-  (setq acadctl:*value* nil)
+         (setq acadctl:*bridge-status* T)
+         (setq acadctl:*bridge-error* nil)))))
+  (setq acadctl:*bridge-value* nil)
   (princ))

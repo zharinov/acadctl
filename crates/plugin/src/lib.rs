@@ -40,7 +40,7 @@ mod ffi {
         DocumentContextFailed,
         DocumentContextRestoreFailed,
         ExecutionBridgeFinalizationFailed,
-        EvaluatorSymbolsClearFailed,
+        ExecutionBridgeSymbolsClearFailed,
         ExecutionBridgeFailed,
     }
 
@@ -140,7 +140,7 @@ mod ffi {
         native_status: i32,
         lisp_errno: i32,
         detail: String,
-        evaluator_symbols_clear_status: i32,
+        bridge_symbols_clear_status: i32,
     }
 
     struct NativeValueEvent {
@@ -175,7 +175,7 @@ mod ffi {
 
         fn complete_native_action(job_id: u64, result: NativeActionResult);
 
-        fn native_actions_need_wake() -> bool;
+        fn try_claim_native_action_wake() -> bool;
 
         fn native_state_may_be_ready();
 
@@ -251,8 +251,8 @@ fn complete_native_action(job_id: u64, result: ffi::NativeActionResult) {
     scheduler::complete_native_action(job_id, result);
 }
 
-fn native_actions_need_wake() -> bool {
-    scheduler::native_actions_need_wake()
+fn try_claim_native_action_wake() -> bool {
+    scheduler::try_claim_native_action_wake()
 }
 
 fn native_state_may_be_ready() {
@@ -439,7 +439,7 @@ fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::E
         native_status: result.native_status,
         lisp_errno: result.lisp_errno,
         detail: result.detail,
-        evaluator_symbols_clear_status: result.evaluator_symbols_clear_status,
+        bridge_symbols_clear_status: result.bridge_symbols_clear_status,
     }
 }
 

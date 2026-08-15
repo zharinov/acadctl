@@ -150,7 +150,7 @@ async fn receive_response(
                     }
                 };
                 match wait_for_stdout(
-                    writer.write(output.text),
+                    writer.write(output.chunk),
                     interrupts,
                     cancellation_acknowledged,
                 )

@@ -256,10 +256,10 @@ impl ExecuteResponseState {
                             return Ok(Some(event));
                         }
                     }
-                    chunk = self.output.next_chunk() => {
-                        match chunk {
-                            Some(text) => return Ok(Some(server_event(
-                                execution_server_event::Event::Output(ExecutionOutput { text }),
+                    output = self.output.next_chunk() => {
+                        match output {
+                            Some(chunk) => return Ok(Some(server_event(
+                                execution_server_event::Event::Output(ExecutionOutput { chunk }),
                             ))),
                             None => self.output_done = true,
                         }
@@ -267,9 +267,9 @@ impl ExecuteResponseState {
                 }
             } else {
                 match self.output.next_chunk().await {
-                    Some(text) => {
+                    Some(chunk) => {
                         return Ok(Some(server_event(execution_server_event::Event::Output(
-                            ExecutionOutput { text },
+                            ExecutionOutput { chunk },
                         ))));
                     }
                     None => self.output_done = true,
@@ -447,13 +447,13 @@ fn scheduler_failure(error: SchedulerError) -> ExecutionFailure {
     let drawing_outcome = match &error {
         SchedulerError::DocumentContextRestoreFailed(_)
         | SchedulerError::ExecutionBridgeFinalizationFailed(_)
-        | SchedulerError::EvaluatorSymbolsClearFailed(_)
+        | SchedulerError::ExecutionBridgeSymbolsClearFailed(_)
         | SchedulerError::ExecutionBridgeFailed(_)
         | SchedulerError::ExecutionNotFinished
         | SchedulerError::NativeMutationStateUnknown
         | SchedulerError::Stopped
         | SchedulerError::UnknownResult(_) => DrawingOutcome::Unknown,
-        SchedulerError::StateUnavailable
+        SchedulerError::SchedulerStateUnavailable
         | SchedulerError::ScheduleFailed(_)
         | SchedulerError::PluginStopping
         | SchedulerError::DocumentNotFound(_)
@@ -1135,7 +1135,7 @@ mod tests {
             native_status: 0,
             lisp_errno: 0,
             detail: String::new(),
-            evaluator_symbols_clear_status: 0,
+            bridge_symbols_clear_status: 0,
         }
     }
 }

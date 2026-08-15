@@ -4,20 +4,20 @@
        (vl-catch-all-apply
          '(lambda ()
             (setq acadctl:forms
-              (read (strcat "(" acadctl:*source* "\n)")))
+              (read (strcat "(" acadctl:*bridge-source* "\n)")))
             (if (= (length acadctl:forms) 1)
               (list 'acadctl:ok (eval (car acadctl:forms)))
-              (acadctl:invalid-form-span)))
+              (acadctl:_invalid-form-span)))
          '()))
-     (setq acadctl:*errno* (getvar "ERRNO"))
+     (setq acadctl:*bridge-errno* (getvar "ERRNO"))
      (if (vl-catch-all-error-p acadctl:outcome)
        (progn
-         (setq acadctl:*status* nil)
-         (setq acadctl:*error*
+         (setq acadctl:*bridge-status* nil)
+         (setq acadctl:*bridge-error*
            (vl-catch-all-error-message acadctl:outcome)))
        (progn
-         (setq acadctl:*value* (cadr acadctl:outcome))
-         (setq acadctl:*status* T)
-         (setq acadctl:*error* nil)))))
-  (setq acadctl:*source* nil)
+         (setq acadctl:*bridge-value* (cadr acadctl:outcome))
+         (setq acadctl:*bridge-status* T)
+         (setq acadctl:*bridge-error* nil)))))
+  (setq acadctl:*bridge-source* nil)
   (princ))
