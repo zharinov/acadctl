@@ -4,6 +4,11 @@ use acadctl_lisp::{FormSpan, ScanError, ScanPosition};
 use bytes::Bytes;
 use output::{OutputSink, OutputStream};
 
+pub(crate) use crate::ffi::{
+    NativeExecutionStepKind as ExecutionStepKind, NativeExecutionStepResult as ExecutionStepResult,
+    NativeExecutionStepResultKind as ExecutionStepResultKind,
+};
+
 pub(crate) mod native_bridge;
 pub mod output;
 pub mod value;
@@ -174,40 +179,11 @@ pub enum DrawingOutcome {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionStepKind {
-    Invalid,
-    BeginUndoGroup,
-    EvaluateForm,
-    CommitUndoGroup,
-    EmitEvalValue,
-    ClearRetainedEvalValue,
-    CloseEmptyUndoGroup,
-    RollbackUndoGroup,
-    Done,
-}
-
 pub struct NativeExecutionStep {
     kind: ExecutionStepKind,
     source: Option<Bytes>,
     span: Option<FormSpan>,
     retain_value: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionStepResultKind {
-    Success,
-    LispError,
-    NativeError,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct ExecutionStepResult {
-    pub kind: ExecutionStepResultKind,
-    pub native_status: i32,
-    pub lisp_errno: i32,
-    pub detail: String,
-    pub bridge_symbols_clear_status: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

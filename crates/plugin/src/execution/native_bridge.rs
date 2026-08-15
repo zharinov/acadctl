@@ -1,4 +1,7 @@
 use super::{ExecutionStepResult, ExecutionStepResultKind, bounded_native_diagnostic};
+use crate::ffi::{
+    NativeBridgeCleanupPlan as BridgeCleanupPlan, NativeBridgeStepResult as BridgeStepResult,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LispStatus {
@@ -22,16 +25,6 @@ pub(crate) struct LispObservation {
     pub(crate) errno: Option<i32>,
     pub(crate) error: Option<NativeDiagnostic>,
     pub(crate) malformed_status: i32,
-}
-
-pub(crate) struct BridgeCleanupPlan {
-    pub(crate) result: ExecutionStepResult,
-    pub(crate) retain_value: bool,
-}
-
-pub(crate) struct BridgeStepResult {
-    pub(crate) result: ExecutionStepResult,
-    pub(crate) bridge_symbols_may_be_retained: bool,
 }
 
 pub(crate) fn interpret_lisp(

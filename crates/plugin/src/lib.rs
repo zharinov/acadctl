@@ -270,7 +270,7 @@ mod rpc_server;
 mod scheduler;
 
 use execution::NativeExecutionStep;
-use execution::native_bridge::{BridgeCleanupPlan, LispObservation, LispStatus, NativeDiagnostic};
+use execution::native_bridge::{LispObservation, LispStatus, NativeDiagnostic};
 use execution::value_bridge::{NativeValueWriter, ValueEvent, WriteResult};
 
 fn start_rpc_server() -> String {
@@ -314,27 +314,7 @@ fn take_execution_step(job_id: u64) -> Box<NativeExecutionStep> {
 }
 
 fn execution_step_kind(step: &NativeExecutionStep) -> ffi::NativeExecutionStepKind {
-    match step.kind() {
-        execution::ExecutionStepKind::Invalid => ffi::NativeExecutionStepKind::Invalid,
-        execution::ExecutionStepKind::BeginUndoGroup => {
-            ffi::NativeExecutionStepKind::BeginUndoGroup
-        }
-        execution::ExecutionStepKind::EvaluateForm => ffi::NativeExecutionStepKind::EvaluateForm,
-        execution::ExecutionStepKind::CommitUndoGroup => {
-            ffi::NativeExecutionStepKind::CommitUndoGroup
-        }
-        execution::ExecutionStepKind::EmitEvalValue => ffi::NativeExecutionStepKind::EmitEvalValue,
-        execution::ExecutionStepKind::ClearRetainedEvalValue => {
-            ffi::NativeExecutionStepKind::ClearRetainedEvalValue
-        }
-        execution::ExecutionStepKind::CloseEmptyUndoGroup => {
-            ffi::NativeExecutionStepKind::CloseEmptyUndoGroup
-        }
-        execution::ExecutionStepKind::RollbackUndoGroup => {
-            ffi::NativeExecutionStepKind::RollbackUndoGroup
-        }
-        execution::ExecutionStepKind::Done => ffi::NativeExecutionStepKind::Done,
-    }
+    step.kind()
 }
 
 fn execution_step_source(step: &NativeExecutionStep) -> &str {
@@ -390,7 +370,7 @@ fn interpret_lisp_observation(
         text: observation.error_text,
         truncated: observation.error_text_truncated,
     });
-    let plan = execution::native_bridge::interpret_lisp(
+    execution::native_bridge::interpret_lisp(
         LispObservation {
             command_status: observation.command_status,
             status,
@@ -402,19 +382,14 @@ fn interpret_lisp_observation(
             malformed_status: observation.malformed_status,
         },
         retain_value_on_success,
-    );
-
-    native_bridge_cleanup_plan(plan)
+    )
 }
 
 fn prepare_bridge_cleanup(
     result: ffi::NativeExecutionStepResult,
     retain_value_on_success: bool,
 ) -> ffi::NativeBridgeCleanupPlan {
-    native_bridge_cleanup_plan(execution::native_bridge::prepare_cleanup(
-        execution_step_result(result),
-        retain_value_on_success,
-    ))
+    execution::native_bridge::prepare_cleanup(result, retain_value_on_success)
 }
 
 fn complete_bridge_cleanup(
@@ -422,34 +397,15 @@ fn complete_bridge_cleanup(
     cleanup_status: i32,
     fallback_cleanup_status: i32,
 ) -> ffi::NativeBridgeStepResult {
-    let outcome = execution::native_bridge::complete_cleanup(
-        BridgeCleanupPlan {
-            result: execution_step_result(plan.result),
-            retain_value: plan.retain_value,
-        },
-        cleanup_status,
-        fallback_cleanup_status,
-    );
-
-    ffi::NativeBridgeStepResult {
-        result: native_execution_step_result(outcome.result),
-        bridge_symbols_may_be_retained: outcome.bridge_symbols_may_be_retained,
-    }
-}
-
-fn native_bridge_cleanup_plan(plan: BridgeCleanupPlan) -> ffi::NativeBridgeCleanupPlan {
-    ffi::NativeBridgeCleanupPlan {
-        result: native_execution_step_result(plan.result),
-        retain_value: plan.retain_value,
-    }
+    execution::native_bridge::complete_cleanup(plan, cleanup_status, fallback_cleanup_status)
 }
 
 fn complete_execution_step(job_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
-    scheduler::complete_execution_step(job_id, execution_step_result(result))
+    scheduler::complete_execution_step(job_id, result)
 }
 
 fn abandon_execution(job_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
-    scheduler::abandon_execution(job_id, execution_step_result(result))
+    scheduler::abandon_execution(job_id, result)
 }
 
 fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter> {
@@ -514,49 +470,6 @@ fn native_value_write_result(result: WriteResult) -> ffi::NativeValueWriteResult
         WriteResult::Finished => ffi::NativeValueWriteResult::Finished,
         WriteResult::InvalidSequence => ffi::NativeValueWriteResult::InvalidSequence,
         WriteResult::LimitExceeded => ffi::NativeValueWriteResult::LimitExceeded,
-    }
-}
-
-fn execution_step_result(result: ffi::NativeExecutionStepResult) -> execution::ExecutionStepResult {
-    let kind = match result.kind {
-        ffi::NativeExecutionStepResultKind::Success => execution::ExecutionStepResultKind::Success,
-        ffi::NativeExecutionStepResultKind::LispError => {
-            execution::ExecutionStepResultKind::LispError
-        }
-        ffi::NativeExecutionStepResultKind::NativeError => {
-            execution::ExecutionStepResultKind::NativeError
-        }
-        _ => execution::ExecutionStepResultKind::NativeError,
-    };
-
-    execution::ExecutionStepResult {
-        kind,
-        native_status: result.native_status,
-        lisp_errno: result.lisp_errno,
-        detail: result.detail,
-        bridge_symbols_clear_status: result.bridge_symbols_clear_status,
-    }
-}
-
-fn native_execution_step_result(
-    result: execution::ExecutionStepResult,
-) -> ffi::NativeExecutionStepResult {
-    let kind = match result.kind {
-        execution::ExecutionStepResultKind::Success => ffi::NativeExecutionStepResultKind::Success,
-        execution::ExecutionStepResultKind::LispError => {
-            ffi::NativeExecutionStepResultKind::LispError
-        }
-        execution::ExecutionStepResultKind::NativeError => {
-            ffi::NativeExecutionStepResultKind::NativeError
-        }
-    };
-
-    ffi::NativeExecutionStepResult {
-        kind,
-        native_status: result.native_status,
-        lisp_errno: result.lisp_errno,
-        detail: result.detail,
-        bridge_symbols_clear_status: result.bridge_symbols_clear_status,
     }
 }
 
