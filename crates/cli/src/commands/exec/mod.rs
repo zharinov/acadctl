@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -31,8 +30,8 @@ use super::{fail, query_error_message, request_error_message};
 const EXECUTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTION_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn run(id: String, file: Option<PathBuf>, mode: ExecMode) -> ExitCode {
-    let source = match crate::source::read(file.as_deref(), mode == ExecMode::Eval) {
+pub async fn run(id: String, source: crate::source::SourceSpec, mode: ExecMode) -> ExitCode {
+    let source = match crate::source::read(source, mode == ExecMode::Eval) {
         Ok(source) => source,
         Err(error) => {
             error.report();

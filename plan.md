@@ -29,8 +29,8 @@ AutoLISP remains fully capable code. `acadctl` is not a sandbox. Agent instructi
 
 | Command | Meaning | Successful stdout |
 | --- | --- | --- |
-| `acadctl eval <id> [file]` | Evaluate exactly one top-level AutoLISP form. | The form's readable value, followed by a newline. |
-| `acadctl exec <id> [file]` | Execute zero or more top-level AutoLISP forms as one batch. | Nothing. |
+| `acadctl eval <id> [FORM \| -f FILE]` | Evaluate exactly one top-level AutoLISP form. | The form's readable value, followed by a newline. |
+| `acadctl exec <id> [FORMS \| -f FILE]` | Execute zero or more top-level AutoLISP forms as one batch. | Nothing. |
 | `acadctl undo <id>` | Undo the drawing's last AutoCAD history step. | Nothing. |
 | `acadctl redo <id>` | Redo the drawing's next AutoCAD history step. | Nothing. |
 | `acadctl kill [pid] [--force]` | Terminate an AutoCAD instance, not an execution request. | Nothing. |
@@ -43,13 +43,14 @@ There is no public `cancel` command. Ctrl+C belongs to the foreground execution 
 
 ### Source selection
 
-The optional positional argument is always a file, never inline source.
+The optional positional argument is inline AutoLISP source.
 
-- No file argument reads stdin.
-- `-` explicitly selects stdin.
-- One other argument names a local file read by the CLI.
+- `eval <id> <FORM>` supplies exactly one form directly on the command line.
+- `exec <id> <FORMS>` supplies zero or more forms directly on the command line.
+- `-f <FILE>` and `--file <FILE>` read source from a local file and cannot be combined with inline source.
+- Omitting both inline source and a file reads stdin.
+- `-` has no special meaning and is accepted as inline source.
 - Extra positional arguments are command-line usage errors.
-- A literal file named `-` is addressed as `./-` or by another path containing a separator.
 
 When stdin is a terminal, the CLI prints a short instruction to stderr and collects a complete batch through EOF. It does not become a REPL and does not execute forms as they arrive. Command-by-command use means separate CLI invocations.
 
@@ -66,7 +67,7 @@ The CLI reads the complete source before contacting AutoCAD. This keeps input wa
 - There is no size override initially. A multi-megabyte AutoLISP batch indicates that the caller should split or redesign the work.
 - The file is read by the CLI and sent in memory. AutoCAD does not `load` the path, search its support paths, or reread a file that may have changed.
 
-The source name used in diagnostics is the supplied file path or `<stdin>`.
+The source name used in diagnostics is the supplied file path, `<stdin>`, or `<command-line>`.
 
 ### Empty input
 
@@ -1030,3 +1031,7 @@ Cycle detection renders `#<Cycle>`, and either the Lisp visitor or Rust printer 
 This entry narrows I-070 and supersedes I-077's incomplete ownership description. ObjectARX callback nesting, callback/end ordering, the observed undo-group state, a staged AutoLISP form, retained native symbols, and an active value writer are facts about resources whose lifetime exists inside AutoCAD. C++ records those facts next to the native resources and performs the corresponding fixed host operations. Exporting them through a setter-and-getter FFI state bag would add a second representation without moving any load-bearing decision to Rust.
 
 Rust owns the private bridge protocol and renders all three execution-bridge AutoLISP programs from that contract. C++ only reads or writes the Rust-named symbols and forwards the raw result-buffer shape, status codes, and explicitly bounded diagnostic text. Rust interprets that observation as success, Lisp failure, or native failure; decides value retention and cleanup reporting; and combines the final native resource observations into a separate operation-result and scheduler-quarantine decision. This distinction preserves a proved committed drawing outcome when only reserved symbols remain while still blocking later mutations until restart. C++ does not classify Lisp meaning or promote a dispatch to `ExecutionBridgeFinalizationFailed`.
+
+### 2026-08-15 — I-081: `eval` and `exec` accept inline source
+
+`eval` accepts one positional `<FORM>`, while `exec` accepts positional `<FORMS>`. `-f <FILE>` and `--file <FILE>` select a source file instead; omitting both source forms reads stdin. Inline source and a file cannot be combined, and `-` has no special stdin meaning. Inline input passes through the same size, UTF-8, U+0000, scanner, and mode-specific form-count validation as file and stdin input, and uses `<command-line>` as its diagnostic source name.

@@ -1,5 +1,5 @@
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 
@@ -13,6 +13,12 @@ pub struct SourceInput {
     pub bytes: Bytes,
 }
 
+pub enum SourceSpec {
+    Stdin,
+    CommandLine(String),
+    File(PathBuf),
+}
+
 #[derive(Debug)]
 pub enum SourceError {
     Message(String),
@@ -22,11 +28,13 @@ pub enum SourceError {
     },
 }
 
-pub fn read(file: Option<&Path>, eval: bool) -> Result<SourceInput, SourceError> {
-    match file {
-        None => read_stdin(eval),
-        Some(path) if path == Path::new("-") => read_stdin(eval),
-        Some(path) => read_file(path, eval),
+pub fn read(source: SourceSpec, eval: bool) -> Result<SourceInput, SourceError> {
+    match source {
+        SourceSpec::Stdin => read_stdin(eval),
+        SourceSpec::CommandLine(source) => {
+            validate("<command-line>".into(), source.into_bytes(), eval)
+        }
+        SourceSpec::File(path) => read_file(&path, eval),
     }
 }
 
@@ -199,6 +207,15 @@ mod tests {
                 if source_name == "script.lsp" && error.line == 2 && error.column == 3
         ));
         assert!(validate("script.lsp".into(), Vec::new(), false).is_ok());
+    }
+
+    #[test]
+    fn validates_command_line_source_with_its_diagnostic_name() {
+        assert!(matches!(
+            read(SourceSpec::CommandLine("\n  (unfinished".into()), false),
+            Err(SourceError::Scan { source_name, error })
+                if source_name == "<command-line>" && error.line == 2 && error.column == 3
+        ));
     }
 
     #[test]
