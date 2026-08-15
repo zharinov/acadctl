@@ -248,7 +248,7 @@ impl fmt::Display for Error {
             ),
             Self::EvaluatorSymbolsClearFailed(failure) => failure.fmt_with_context(
                 formatter,
-                "Could not clear the reserved AutoLISP evaluator state",
+                "Could not clear the reserved AutoLISP evaluator symbols",
             ),
             Self::ExecutionBridgeFailed(failure) => {
                 failure.fmt_with_context(formatter, "The AutoLISP execution bridge failed")
@@ -500,21 +500,6 @@ impl ExecutionCompletion {
             OperationOutcome::Document(_) | OperationOutcome::Closed => {
                 Err(Error::ExecutionNotFinished)
             }
-        }
-    }
-}
-
-#[cfg(test)]
-pub async fn execute(id: String, execution: Execution) -> Result<ExecutionOutcome, Error> {
-    match submit_operation(Operation::Execute {
-        id,
-        execution: Box::new(execution),
-    })
-    .await?
-    {
-        OperationOutcome::Execution(outcome) => Ok(outcome),
-        OperationOutcome::Document(_) | OperationOutcome::Closed => {
-            Err(Error::ExecutionNotFinished)
         }
     }
 }
@@ -1572,18 +1557,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drives_a_batch_through_one_native_execution_lease() {
+    async fn keeps_one_mutation_job_active_across_a_batch() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution = Execution::new(
+        let (execution, output) = Execution::new(
             ExecutionMode::Exec,
             "batch.lsp".into(),
             "first\nsecond".into(),
         )
         .unwrap();
-        let execution = execution.0;
-        let pending = tokio::spawn(execute(id.clone(), execution));
+        let (_output, pending) = spawn_test_execution(id.clone(), execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1626,9 +1610,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1649,11 +1633,10 @@ mod tests {
         assert!(writer.active());
         assert_eq!(writer.write(ValueEvent::BeginString), WriteResult::Continue);
         assert_eq!(
-            writer.write(ValueEvent::StringChunk("created: ")),
+            writer.write(ValueEvent::StringChunk("created: 3")),
             WriteResult::Continue
         );
         assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
-        assert_eq!(writer.write(ValueEvent::Integer(3)), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
 
         assert!(complete_execution_step(action.job_id, step_success()));
@@ -1683,9 +1666,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1743,9 +1726,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, _output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (_output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1798,9 +1781,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, _output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (_output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1856,9 +1839,9 @@ mod tests {
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id.clone(), execution));
+        let (mut output, pending) = spawn_test_execution(id.clone(), execution, output);
         tokio::task::yield_now().await;
         let job_id = SCHEDULER
             .lock()
@@ -1890,9 +1873,9 @@ mod tests {
         let save_action = take_native_action();
         assert_eq!(save_action.kind, NativeActionKind::Save);
 
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let queued = tokio::spawn(execute(id, execution));
+        let (mut output, queued) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
         let job_id = SCHEDULER
             .lock()
@@ -1924,9 +1907,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         wake_failed(42);
@@ -1942,9 +1925,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -1983,9 +1966,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2016,9 +1999,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2055,9 +2038,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id, execution));
+        let (mut output, pending) = spawn_test_execution(id, execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2088,29 +2071,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_an_unpolled_execution_future_closes_output_without_admission() {
+    async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-
-        let unpolled = execute(id, execution);
-        drop(unpolled);
-
-        assert_eq!(output.next_chunk().await, None);
-        assert!(SCHEDULER.lock().unwrap().idle());
-        stop();
-    }
-
-    #[tokio::test]
-    async fn dropped_execution_waiter_does_not_release_its_native_lease() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id.clone();
-        let (execution, mut output) =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let executing = tokio::spawn(execute(id.clone(), execution));
+        let (mut output, executing) = spawn_test_execution(id.clone(), execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2157,14 +2124,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_cleanup_failure_amends_a_terminal_execution_outcome() {
+    async fn document_context_restore_failure_amends_a_terminal_execution_outcome() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let execution = Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into())
-            .unwrap()
-            .0;
-        let pending = tokio::spawn(execute(id.clone(), execution));
+        let (execution, output) =
+            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "ok".into()).unwrap();
+        let (_output, pending) = spawn_test_execution(id.clone(), execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2247,9 +2213,9 @@ mod tests {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
         let id = list().unwrap()[0].id.clone();
-        let (execution, _output) =
+        let (execution, output) =
             Execution::new(ExecutionMode::Eval, "inspect.lsp".into(), "form".into()).unwrap();
-        let pending = tokio::spawn(execute(id.clone(), execution));
+        let (_output, pending) = spawn_test_execution(id.clone(), execution, output);
         tokio::task::yield_now().await;
 
         let action = take_native_action();
@@ -2683,6 +2649,19 @@ mod tests {
     ) -> Result<ExecutionAdmission, Error> {
         let reservation = try_reserve_execution().ok_or(Error::ExecutionCapacity)?;
         admit_execution(id, execution, output, reservation)
+    }
+
+    fn spawn_test_execution(
+        id: String,
+        execution: Execution,
+        output: OutputStream,
+    ) -> (
+        OutputStream,
+        tokio::task::JoinHandle<Result<ExecutionOutcome, Error>>,
+    ) {
+        let admission = admit_test_execution(id, execution, output).unwrap();
+        let (_, output, completion) = admission.into_parts();
+        (output, tokio::spawn(completion.wait()))
     }
 
     fn result(kind: NativeActionResultKind) -> NativeActionResult {

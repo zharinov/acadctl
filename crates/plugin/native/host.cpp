@@ -125,9 +125,11 @@ acadctl::NativeActionResult nativeFailure(
     acadctl::NativeActionResultKind kind, Acad::ErrorStatus status);
 
 acadctl::NativeActionResult bridgeFailure(
-    acadctl::NativeActionResultKind kind, int status, const char *detail);
+    acadctl::NativeActionResultKind kind, int status);
 
 int acadctlAdvanceExecution() noexcept;
+int acadctlBeginPrintln() noexcept;
+int acadctlFinishPrintln() noexcept;
 
 enum class UndoGroupState { Inactive, Active, Unknown };
 
@@ -163,14 +165,15 @@ private:
 
   void scheduleExecutionDispatchFinalizer();
 
-  void queuedHistoryCommandTerminated(const ACHAR *commandName,
-                                      bool cancelled);
+  void queuedHistoryCommandTerminated(const ACHAR *commandName);
 
   void queuedExecutionDriverStarted(const ACHAR *firstLine);
 
   void queuedExecutionDriverTerminated(bool cancelled);
 
-  void failExecutionDriver(bool cancelled);
+  void recoverCancelledExecutionDriver();
+
+  void failExecutionDriver();
 
   void finishExecutionCallback(bool evaluateStagedForm);
 
@@ -206,6 +209,8 @@ private:
   static void finalizeDocumentDispatch(void *data);
 
   friend int acadctlAdvanceExecution() noexcept;
+  friend int acadctlBeginPrintln() noexcept;
+  friend int acadctlFinishPrintln() noexcept;
 
   void publishDocumentSnapshot();
 
@@ -280,13 +285,13 @@ private:
     }
 
     void commandCancelled(const ACHAR *commandName) override {
-      bridge_.queuedHistoryCommandTerminated(commandName, true);
+      bridge_.queuedHistoryCommandTerminated(commandName);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
 
     void commandFailed(const ACHAR *commandName) override {
-      bridge_.queuedHistoryCommandTerminated(commandName, false);
+      bridge_.queuedHistoryCommandTerminated(commandName);
       bridge_.refreshDocumentSnapshotIfStale();
       acadctl::native_state_may_be_ready();
     }
@@ -348,8 +353,8 @@ acadctl::NativeActionResult nativeFailure(
 }
 
 acadctl::NativeActionResult bridgeFailure(
-    acadctl::NativeActionResultKind kind, int status, const char *detail) {
-  return {kind, status, rust::String(detail)};
+    acadctl::NativeActionResultKind kind, int status) {
+  return {kind, status, rust::String()};
 }
 
 acadctl::NativeExecutionStepResult stepSuccess() {
@@ -357,10 +362,9 @@ acadctl::NativeExecutionStepResult stepSuccess() {
           rust::String(), 0};
 }
 
-acadctl::NativeExecutionStepResult stepNativeFailure(int status,
-                                                      const char *detail) {
+acadctl::NativeExecutionStepResult stepNativeFailure(int status) {
   return {acadctl::NativeExecutionStepResultKind::NativeError, status, 0,
-          rust::String(detail), 0};
+          rust::String(), 0};
 }
 
 struct ResbufDeleter {
@@ -373,16 +377,18 @@ struct ResbufDeleter {
 
 using ResbufPtr = std::unique_ptr<resbuf, ResbufDeleter>;
 
-constexpr int kPrintlnFunctionCode = 1;
+constexpr int kBeginPrintlnFunctionCode = 1;
 constexpr int kEvalValueEventFunctionCode = 2;
 constexpr int kAdvanceExecutionFunctionCode = 3;
+constexpr int kFinishPrintlnFunctionCode = 4;
 constexpr std::size_t kWideValueChunkUnits = 4096;
 
-thread_local acadctl::NativeValueWriter *activeEvalValueWriter = nullptr;
+thread_local acadctl::NativeValueWriter *activeValueWriter = nullptr;
 
 std::size_t boundedWideChunkLength(const ACHAR *text);
-rust::String boundedDiagnostic(const ACHAR *text, const char *fallback);
+rust::String boundedDiagnostic(const ACHAR *text);
 int integerValue(const resbuf *value);
+int clearSymbol(const ACHAR *name);
 bool matchesExecutionContext(AcApDocument *document,
                              std::size_t databaseToken,
                              AcApDocument *expectedActive);
@@ -404,26 +410,6 @@ bool writeValueKind(acadctl::NativeValueWriter &writer,
   return writeValueEvent(writer, valueEvent(kind));
 }
 
-bool writeTextEvent(acadctl::NativeValueWriter &writer,
-                    acadctl::NativeValueEventKind kind,
-                    const ACHAR *text) {
-  if (!text) {
-    return writeValueKind(writer, acadctl::NativeValueEventKind::Invalid);
-  }
-  for (const ACHAR *cursor = text; *cursor != 0;) {
-    const std::size_t length = boundedWideChunkLength(cursor);
-    const AcString chunk(cursor, static_cast<Adesk::UInt32>(length));
-    const char *utf8 = chunk.utf8Ptr();
-    if (!utf8 ||
-        !writeValueEvent(writer, valueEvent(kind),
-                         rust::Str(utf8, std::strlen(utf8)))) {
-      return false;
-    }
-    cursor += length;
-  }
-  return true;
-}
-
 std::size_t boundedWideChunkLength(const ACHAR *text) {
   std::size_t length = 0;
   while (length < kWideValueChunkUnits && text[length] != 0) {
@@ -442,14 +428,14 @@ std::size_t boundedWideChunkLength(const ACHAR *text) {
   return length;
 }
 
-rust::String boundedDiagnostic(const ACHAR *text, const char *fallback) {
+rust::String boundedDiagnostic(const ACHAR *text) {
   if (!text) {
-    return rust::String(fallback);
+    return rust::String();
   }
 
   const std::size_t captureUnits = acadctl::native_diagnostic_capture_units();
   if (captureUnits < 2) {
-    return rust::String(fallback);
+    return rust::String();
   }
   std::size_t length = 0;
   while (length < captureUnits && text[length] != 0) {
@@ -470,7 +456,7 @@ rust::String boundedDiagnostic(const ACHAR *text, const char *fallback) {
   const AcString captured(text, static_cast<Adesk::UInt32>(length));
   const char *utf8 = captured.utf8Ptr();
   if (!utf8) {
-    return rust::String(fallback);
+    return rust::String();
   }
   std::string bounded(utf8);
   const std::size_t byteLimit = captureUnits - 1;
@@ -478,152 +464,6 @@ rust::String boundedDiagnostic(const ACHAR *text, const char *fallback) {
     bounded.resize(byteLimit + 1, ' ');
   }
   return rust::String(bounded);
-}
-
-bool writeString(acadctl::NativeValueWriter &writer, const ACHAR *text) {
-  if (!text) {
-    return writeValueKind(writer, acadctl::NativeValueEventKind::Invalid);
-  }
-  if (!writeValueKind(writer, acadctl::NativeValueEventKind::BeginString)) {
-    return false;
-  }
-
-  if (!writeTextEvent(writer,
-                      acadctl::NativeValueEventKind::StringChunk, text)) {
-    return false;
-  }
-  return writeValueKind(writer, acadctl::NativeValueEventKind::EndString);
-}
-
-bool writeEntity(acadctl::NativeValueWriter &writer, const ads_name name) {
-  acadctl::NativeValueEvent event =
-      valueEvent(acadctl::NativeValueEventKind::Entity);
-  AcDbObjectId objectId;
-  if (acdbGetObjectId(objectId, name) != Acad::eOk || objectId.isNull()) {
-    return writeValueEvent(writer, event);
-  }
-
-  ACHAR handleText[AcDbHandle::kStrSiz]{};
-  if (!objectId.handle().getIntoAsciiBuffer(handleText)) {
-    return writeValueEvent(writer, event);
-  }
-  const AcString utf8Handle(handleText);
-  event.has_payload = true;
-  return writeValueEvent(writer, event, rust::Str(utf8Handle.utf8Ptr()));
-}
-
-bool writeResbufNode(acadctl::NativeValueWriter &writer,
-                     const resbuf &node) {
-  switch (node.restype) {
-  case RTLB:
-    return writeValueKind(writer, acadctl::NativeValueEventKind::BeginList);
-  case RTLE:
-    return writeValueKind(writer, acadctl::NativeValueEventKind::EndList);
-  case RTDOTE:
-    return writeValueKind(writer, acadctl::NativeValueEventKind::Dot);
-  case RTNIL:
-    return writeValueKind(writer, acadctl::NativeValueEventKind::Nil);
-  case RTT:
-    return writeValueKind(writer, acadctl::NativeValueEventKind::True);
-  case RTVOID:
-    return writeValueKind(writer, acadctl::NativeValueEventKind::Void);
-  case RTSHORT: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Integer);
-    event.integer = node.resval.rint;
-    return writeValueEvent(writer, event);
-  }
-  case RTLONG: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Integer);
-    event.integer = node.resval.rlong;
-    return writeValueEvent(writer, event);
-  }
-  case RTINT64: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Integer);
-    event.integer = node.resval.mnInt64;
-    return writeValueEvent(writer, event);
-  }
-  case RTREAL:
-  case RTANG:
-  case RTORINT: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Real);
-    event.real = node.resval.rreal;
-    return writeValueEvent(writer, event);
-  }
-  case RTPOINT: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Point2);
-    event.x = node.resval.rpoint[0];
-    event.y = node.resval.rpoint[1];
-    return writeValueEvent(writer, event);
-  }
-  case RT3DPOINT: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Point3);
-    event.x = node.resval.rpoint[0];
-    event.y = node.resval.rpoint[1];
-    event.z = node.resval.rpoint[2];
-    return writeValueEvent(writer, event);
-  }
-  case RTSTR:
-    return writeString(writer, node.resval.rstring);
-  case RTENAME:
-    return writeEntity(writer, node.resval.rlname);
-  case RTPICKS:
-    return writeValueKind(writer,
-                          acadctl::NativeValueEventKind::SelectionSet);
-  default: {
-    acadctl::NativeValueEvent event =
-        valueEvent(acadctl::NativeValueEventKind::Unsupported);
-    event.native_type = static_cast<std::uint32_t>(
-        static_cast<std::int32_t>(node.restype));
-    event.has_payload = true;
-    return writeValueEvent(writer, event);
-  }
-  }
-}
-
-void writeResbufSequence(acadctl::NativeValueWriter &writer,
-                         const resbuf *head) {
-  const resbuf *slow = head;
-  const resbuf *fast = head;
-  for (const resbuf *node = head; node; node = node->rbnext) {
-    if (!writeResbufNode(writer, *node)) {
-      return;
-    }
-
-    slow = slow ? slow->rbnext : nullptr;
-    fast = fast && fast->rbnext ? fast->rbnext->rbnext : nullptr;
-    if (slow && slow == fast) {
-      writeValueKind(writer, acadctl::NativeValueEventKind::Invalid);
-      return;
-    }
-  }
-}
-
-int acadctlPrintln() noexcept {
-  try {
-    AcApDocument *document = acDocManager->curDocument();
-    AcDbDatabase *database = document ? document->database() : nullptr;
-    rust::Box<acadctl::NativeValueWriter> writer = acadctl::begin_println(
-        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
-        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(database)));
-    if (acadctl::value_writer_active(*writer)) {
-      writeResbufSequence(*writer, acedGetArgs());
-    }
-    const int returnStatus = acedRetNil();
-    if (returnStatus != RTNORM) {
-      writeValueKind(*writer, acadctl::NativeValueEventKind::Invalid);
-    }
-    acadctl::finish_value_writer(std::move(writer));
-    return returnStatus == RTNORM ? RSRSLT : RSERR;
-  } catch (...) {
-    syslog(LOG_ERR, "acadctl:println bridge failed unexpectedly");
-    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-  }
 }
 
 acadctl::NativeLispValueEvent
@@ -730,19 +570,19 @@ bool writePrivateValueEvent(acadctl::NativeValueWriter &writer,
 int acadctlEvalValueEvent() noexcept {
   try {
     bool keepGoing = false;
-    if (activeEvalValueWriter) {
+    if (activeValueWriter) {
       keepGoing =
-          writePrivateValueEvent(*activeEvalValueWriter, acedGetArgs());
+          writePrivateValueEvent(*activeValueWriter, acedGetArgs());
     }
     const int returnStatus = keepGoing ? acedRetT() : acedRetNil();
-    if (returnStatus != RTNORM && activeEvalValueWriter) {
-      writeValueKind(*activeEvalValueWriter,
+    if (returnStatus != RTNORM && activeValueWriter) {
+      writeValueKind(*activeValueWriter,
                      acadctl::NativeValueEventKind::Invalid);
     }
     return returnStatus == RTNORM ? RSRSLT : RSERR;
   } catch (...) {
-    if (activeEvalValueWriter) {
-      writeValueKind(*activeEvalValueWriter,
+    if (activeValueWriter) {
+      writeValueKind(*activeValueWriter,
                      acadctl::NativeValueEventKind::Invalid);
     }
     return acedRetNil() == RTNORM ? RSRSLT : RSERR;
@@ -762,9 +602,9 @@ int defineLispFunction(const ACHAR *name, int code, int (*callback)()) {
 }
 
 int defineLispFunctions() {
-  int status = defineLispFunction(ACRX_T("acadctl:println"),
-                                  kPrintlnFunctionCode,
-                                  &acadctlPrintln);
+  int status = defineLispFunction(ACRX_T("acadctl:_begin-println"),
+                                  kBeginPrintlnFunctionCode,
+                                  &acadctlBeginPrintln);
   if (status == RTNORM) {
     status = defineLispFunction(ACRX_T("acadctl:_value-event"),
                                 kEvalValueEventFunctionCode,
@@ -775,27 +615,43 @@ int defineLispFunctions() {
                                 kAdvanceExecutionFunctionCode,
                                 &acadctlAdvanceExecution);
   }
+  if (status == RTNORM) {
+    status = defineLispFunction(ACRX_T("acadctl:_finish-println"),
+                                kFinishPrintlnFunctionCode,
+                                &acadctlFinishPrintln);
+  }
   if (status != RTNORM) {
+    acedUndef(ACRX_T("acadctl:_finish-println"),
+              kFinishPrintlnFunctionCode);
+    acedUndef(ACRX_T("acadctl:_advance-execution"),
+              kAdvanceExecutionFunctionCode);
     acedUndef(ACRX_T("acadctl:_value-event"),
               kEvalValueEventFunctionCode);
-    acedUndef(ACRX_T("acadctl:println"), kPrintlnFunctionCode);
+    acedUndef(ACRX_T("acadctl:_begin-println"),
+              kBeginPrintlnFunctionCode);
   }
   return status;
 }
 
 int undefineLispFunctions() {
+  const int finishStatus =
+      acedUndef(ACRX_T("acadctl:_finish-println"),
+                kFinishPrintlnFunctionCode);
   const int executionStatus =
       acedUndef(ACRX_T("acadctl:_advance-execution"),
                 kAdvanceExecutionFunctionCode);
   const int privateStatus =
       acedUndef(ACRX_T("acadctl:_value-event"),
                 kEvalValueEventFunctionCode);
-  const int publicStatus =
-      acedUndef(ACRX_T("acadctl:println"), kPrintlnFunctionCode);
+  const int beginStatus = acedUndef(ACRX_T("acadctl:_begin-println"),
+                                   kBeginPrintlnFunctionCode);
+  if (finishStatus != RTNORM) {
+    return finishStatus;
+  }
   if (executionStatus != RTNORM) {
     return executionStatus;
   }
-  return privateStatus != RTNORM ? privateStatus : publicStatus;
+  return privateStatus != RTNORM ? privateStatus : beginStatus;
 }
 
 int putStringSymbol(const ACHAR *name, const AcString &text) {
@@ -853,7 +709,7 @@ UndoGroupState observeUndoGroup(int &status) {
                                 : UndoGroupState::Inactive;
 }
 
-int clearEvaluationSymbols(bool includeValue = true) {
+int clearEvaluatorSymbols(bool includeValue = true) {
   int firstFailure = RTNORM;
   for (const ACHAR *name : {ACRX_T("acadctl:*source*"),
                             ACRX_T("acadctl:*staged-form*"),
@@ -874,36 +730,34 @@ int clearEvaluationSymbols(bool includeValue = true) {
   return firstFailure;
 }
 
-struct ReservedStateStepResult {
+struct EvaluatorSymbolsStepResult {
   acadctl::NativeExecutionStepResult result;
-  bool reservedStateRetained;
+  bool evaluatorSymbolsMayBeRetained;
 };
 
-ReservedStateStepResult finishEvaluation(
+EvaluatorSymbolsStepResult finishEvaluation(
     acadctl::NativeExecutionStepResult result, bool retainValue) {
   const bool successful =
       result.kind == acadctl::NativeExecutionStepResultKind::Success;
   const int cleanupStatus =
-      clearEvaluationSymbols(!(successful && retainValue));
+      clearEvaluatorSymbols(!(successful && retainValue));
   if (cleanupStatus == RTNORM) {
     return {std::move(result), successful && retainValue};
   }
-  const bool reservedStateStillRetained =
-      clearEvaluationSymbols() != RTNORM;
+  const bool evaluatorSymbolsMayBeRetained =
+      clearEvaluatorSymbols() != RTNORM;
   result.evaluator_symbols_clear_status = cleanupStatus;
-  return {std::move(result), reservedStateStillRetained};
+  return {std::move(result), evaluatorSymbolsMayBeRetained};
 }
 
-ReservedStateStepResult stageEvaluation(rust::Str source,
+EvaluatorSymbolsStepResult stageEvaluation(rust::Str source,
                                         const AcString &evaluatorText,
                                         bool retainValue) {
   const AcString pending(ACRX_T("pending"));
-  const int clearStatus = clearEvaluationSymbols();
+  const int clearStatus = clearEvaluatorSymbols();
   if (clearStatus != RTNORM) {
-    return {stepNativeFailure(
-                clearStatus,
-                "could not clear the reserved AutoLISP evaluator state"),
-            clearEvaluationSymbols() != RTNORM};
+    return {stepNativeFailure(clearStatus),
+            clearEvaluatorSymbols() != RTNORM};
   }
   {
     const AcString form(source.data(), AcString::Utf8,
@@ -912,16 +766,13 @@ ReservedStateStepResult stageEvaluation(rust::Str source,
         putStringSymbol(ACRX_T("acadctl:*staged-form*"), evaluatorText) !=
             RTNORM ||
         putStringSymbol(ACRX_T("acadctl:*status*"), pending) != RTNORM) {
-      return finishEvaluation(
-          stepNativeFailure(RTERROR,
-                            "could not stage the AutoLISP form in memory"),
-          retainValue);
+      return finishEvaluation(stepNativeFailure(RTERROR), retainValue);
     }
   }
   return {stepSuccess(), true};
 }
 
-ReservedStateStepResult collectEvaluation(bool retainValue) {
+EvaluatorSymbolsStepResult collectEvaluation(bool retainValue) {
   int statusResult = RTERROR;
   ResbufPtr status = getSymbol(ACRX_T("acadctl:*status*"), statusResult);
   const bool nilStatus =
@@ -929,10 +780,7 @@ ReservedStateStepResult collectEvaluation(bool retainValue) {
       (statusResult == RTNORM && !status) ||
       (statusResult == RTNORM && status && status->restype == RTNIL);
   if (statusResult != RTNORM && !nilStatus) {
-    return finishEvaluation(
-        stepNativeFailure(statusResult,
-                          "the evaluator did not publish a result"),
-        retainValue);
+    return finishEvaluation(stepNativeFailure(statusResult), retainValue);
   }
 
   int errnoResult = RTERROR;
@@ -944,19 +792,15 @@ ReservedStateStepResult collectEvaluation(bool retainValue) {
     return finishEvaluation(stepSuccess(), retainValue);
   }
   if (!nilStatus) {
-    return finishEvaluation(
-        stepNativeFailure(RTERROR,
-                          "the evaluator published an invalid result tag"),
-        retainValue);
+    return finishEvaluation(stepNativeFailure(RTERROR), retainValue);
   }
 
   int errorResult = RTERROR;
   ResbufPtr error = getSymbol(ACRX_T("acadctl:*error*"), errorResult);
-  rust::String detail("AutoLISP evaluation failed");
+  rust::String detail;
   if (errorResult == RTNORM && error && error->restype == RTSTR &&
       error->resval.rstring) {
-    detail = boundedDiagnostic(error->resval.rstring,
-                               "AutoLISP evaluation failed");
+    detail = boundedDiagnostic(error->resval.rstring);
   }
   return finishEvaluation(
       {acadctl::NativeExecutionStepResultKind::LispError, 0, lispErrnoValue,
@@ -966,8 +810,7 @@ ReservedStateStepResult collectEvaluation(bool retainValue) {
 
 acadctl::NativeExecutionStepResult valueVisitorOutcome(int commandStatus) {
   if (commandStatus != RTNORM) {
-    return stepNativeFailure(commandStatus,
-                             "AutoCAD rejected the eval value visitor");
+    return stepNativeFailure(commandStatus);
   }
 
   int statusResult = RTERROR;
@@ -977,15 +820,13 @@ acadctl::NativeExecutionStepResult valueVisitorOutcome(int commandStatus) {
       (statusResult == RTNORM && !status) ||
       (statusResult == RTNORM && status && status->restype == RTNIL);
   if (statusResult != RTNORM && !nilStatus) {
-    return stepNativeFailure(statusResult,
-                             "the eval value visitor did not publish a result");
+    return stepNativeFailure(statusResult);
   }
   if (!nilStatus && status && status->restype == RTT) {
     return stepSuccess();
   }
   if (!nilStatus) {
-    return stepNativeFailure(
-        RTERROR, "the eval value visitor published an invalid result tag");
+    return stepNativeFailure(RTERROR);
   }
 
   int errnoResult = RTERROR;
@@ -994,26 +835,25 @@ acadctl::NativeExecutionStepResult valueVisitorOutcome(int commandStatus) {
       errnoResult == RTNORM ? integerValue(lispErrno.get()) : 0;
   int errorResult = RTERROR;
   ResbufPtr error = getSymbol(ACRX_T("acadctl:*error*"), errorResult);
-  rust::String detail("AutoLISP eval value traversal failed");
+  rust::String detail;
   if (errorResult == RTNORM && error && error->restype == RTSTR &&
       error->resval.rstring) {
-    detail = boundedDiagnostic(error->resval.rstring,
-                               "AutoLISP eval value traversal failed");
+    detail = boundedDiagnostic(error->resval.rstring);
   }
   return {acadctl::NativeExecutionStepResultKind::LispError, 0,
           lispErrnoValue, std::move(detail), 0};
 }
 
-ReservedStateStepResult finishEvalValueEmission(
+EvaluatorSymbolsStepResult finishEvalValueEmission(
     acadctl::NativeExecutionStepResult result) {
-  const int cleanupStatus = clearEvaluationSymbols();
+  const int cleanupStatus = clearEvaluatorSymbols();
   if (cleanupStatus == RTNORM) {
     return {std::move(result), false};
   }
-  const bool reservedStateStillRetained =
-      clearEvaluationSymbols() != RTNORM;
+  const bool evaluatorSymbolsMayBeRetained =
+      clearEvaluatorSymbols() != RTNORM;
   result.evaluator_symbols_clear_status = cleanupStatus;
-  return {std::move(result), reservedStateStillRetained};
+  return {std::move(result), evaluatorSymbolsMayBeRetained};
 }
 
 struct UndoCommandResult {
@@ -1028,21 +868,13 @@ UndoCommandResult runUndoCommand(const ACHAR *option,
   int observationStatus = RTERROR;
   const UndoGroupState state = observeUndoGroup(observationStatus);
   if (commandStatus != RTNORM) {
-    return {stepNativeFailure(commandStatus, "the UNDO command failed"),
-            state};
+    return {stepNativeFailure(commandStatus), state};
   }
   if (state == UndoGroupState::Unknown) {
-    return {stepNativeFailure(observationStatus,
-                              "could not read AutoCAD's undo state"),
-            state};
+    return {stepNativeFailure(observationStatus), state};
   }
   if (state != expectedState) {
-    return {stepNativeFailure(
-                RTERROR,
-                expectedState == UndoGroupState::Active
-                    ? "AutoCAD did not open the requested undo group"
-                    : "AutoCAD did not close the requested undo group"),
-            state};
+    return {stepNativeFailure(RTERROR), state};
   }
   return {stepSuccess(), state};
 }
@@ -1050,10 +882,7 @@ UndoCommandResult runUndoCommand(const ACHAR *option,
 UndoCommandResult rollbackUndoGroup(UndoGroupState state,
                                     bool executionUndoGroupMayHaveStarted) {
   if (!executionUndoGroupMayHaveStarted || state == UndoGroupState::Unknown) {
-    return {stepNativeFailure(
-                RTERROR,
-                "the execution undo group could not be identified for rollback"),
-            state};
+    return {stepNativeFailure(RTERROR), state};
   }
 
   UndoCommandResult end{stepSuccess(), state};
@@ -1068,13 +897,10 @@ UndoCommandResult rollbackUndoGroup(UndoGroupState state,
   int observationStatus = RTERROR;
   const UndoGroupState finalState = observeUndoGroup(observationStatus);
   if (status != RTNORM) {
-    return {stepNativeFailure(status, "the U command failed"), finalState};
+    return {stepNativeFailure(status), finalState};
   }
   if (finalState != UndoGroupState::Inactive) {
-    return {stepNativeFailure(
-                observationStatus,
-                "could not prove that rollback closed the execution undo group"),
-            finalState};
+    return {stepNativeFailure(observationStatus), finalState};
   }
   if (end.result.kind !=
       acadctl::NativeExecutionStepResultKind::Success) {
@@ -1084,7 +910,8 @@ UndoCommandResult rollbackUndoGroup(UndoGroupState state,
 }
 
 bool matchesDatabase(AcApDocument *document, std::size_t databaseToken) {
-  return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(
+  return document &&
+         static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(
              document->database())) == databaseToken;
 }
 
@@ -1106,7 +933,7 @@ int clearEvaluatorSymbolsIfSafe(AcApDocument *document,
   if (!matchesExecutionContext(document, databaseToken, expectedActive)) {
     return RTREJ;
   }
-  const int cleanupStatus = clearEvaluationSymbols();
+  const int cleanupStatus = clearEvaluatorSymbols();
   if (cleanupStatus == RTNORM) {
     evaluatorSymbolsMayBeRetained = false;
   }
@@ -1120,30 +947,21 @@ acadctl::NativeActionResult abandonLostExecutionContext(
     bool &evaluatorSymbolsMayBeRetained) {
   const int cleanupStatus = clearEvaluatorSymbolsIfSafe(
       document, databaseToken, expectedActive, evaluatorSymbolsMayBeRetained);
-  const char *detail =
-      cleanupStatus == RTNORM
-          ? "the target document context changed during execution"
-          : cleanupStatus == RTREJ
-                ? "the target document context changed and its retained AutoLISP value could not be cleared safely"
-                : "the target document context changed and retained-value cleanup failed";
   const bool quarantine =
       undoGroupMayBeOpen || evaluatorSymbolsMayBeRetained;
   if (!acadctl::abandon_execution(
           jobId,
-          stepNativeFailure(cleanupStatus == RTNORM ? RTERROR : cleanupStatus,
-                            detail))) {
+          stepNativeFailure(cleanupStatus == RTNORM ? RTERROR : cleanupStatus))) {
     return bridgeFailure(
         quarantine
             ? acadctl::NativeActionResultKind::ExecutionBridgeFinalizationFailed
             : acadctl::NativeActionResultKind::ExecutionBridgeFailed,
-        RTERROR,
-        "Rust could not terminalize an execution after context loss");
+        RTERROR);
   }
   return quarantine
              ? bridgeFailure(
                    acadctl::NativeActionResultKind::ExecutionBridgeFinalizationFailed,
-                   RTERROR,
-                   "context loss left native execution state unproved")
+                   RTERROR)
              : result(acadctl::NativeActionResultKind::Success);
 }
 
@@ -1416,8 +1234,7 @@ bool ObjectArxBridge::queueDocumentDispatch(
     acadctl::NativeActionResult &failure) {
   if (pendingDocumentDispatch_) {
     failure = bridgeFailure(
-        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR,
-        "a native document action is already pending");
+        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
     return false;
   }
 
@@ -1434,8 +1251,7 @@ bool ObjectArxBridge::queueDocumentDispatch(
     break;
   default:
     failure = bridgeFailure(
-        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR,
-        "Rust requested an unsupported native document action");
+        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
     return false;
   }
 
@@ -1452,8 +1268,7 @@ bool ObjectArxBridge::queueDocumentDispatch(
   if (kind == PendingDocumentDispatch::Kind::Execute) {
     if (!lispFunctionsDefined(target)) {
       failure = bridgeFailure(
-          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
-          "acadctl AutoLISP functions are unavailable in the target drawing");
+          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
       return false;
     }
     if (!target->database()->undoRecording()) {
@@ -1485,8 +1300,7 @@ bool ObjectArxBridge::queueDocumentDispatch(
   }
   if (pendingInput < 0) {
     failure = bridgeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
-                            RTERROR,
-                            "could not read AutoCAD's pending command input");
+                            RTERROR);
     return false;
   }
 
@@ -1556,7 +1370,7 @@ void ObjectArxBridge::scheduleDocumentDispatchFinalizer() {
 }
 
 void ObjectArxBridge::queuedHistoryCommandTerminated(
-    const ACHAR *commandName, bool cancelled) {
+    const ACHAR *commandName) {
   if (!pendingDocumentDispatch_ ||
       pendingDocumentDispatch_->phase != PendingDocumentDispatch::Phase::Queued ||
       !commandName) {
@@ -1578,9 +1392,7 @@ void ObjectArxBridge::queuedHistoryCommandTerminated(
   }
 
   pendingDocumentDispatch_->dispatchResult = bridgeFailure(
-      acadctl::NativeActionResultKind::HistoryFailed, RTERROR,
-      cancelled ? "AutoCAD cancelled the queued history command"
-                : "AutoCAD failed the queued history command");
+      acadctl::NativeActionResultKind::HistoryFailed, RTERROR);
   scheduleDocumentDispatchFinalizer();
 }
 
@@ -1612,13 +1424,13 @@ void ObjectArxBridge::queuedExecutionDriverStarted(const ACHAR *firstLine) {
   }
 
   if (pending.lispDepth == std::numeric_limits<std::uint32_t>::max()) {
-    failExecutionDriver(false);
+    failExecutionDriver();
     return;
   }
   ++pending.lispDepth;
 }
 
-void ObjectArxBridge::failExecutionDriver(bool cancelled) {
+void ObjectArxBridge::failExecutionDriver() {
   if (!pendingDocumentDispatch_ ||
       pendingDocumentDispatch_->kind != PendingDocumentDispatch::Kind::Execute ||
       pendingDocumentDispatch_->phase ==
@@ -1628,7 +1440,7 @@ void ObjectArxBridge::failExecutionDriver(bool cancelled) {
 
   PendingDocumentDispatch &pending = *pendingDocumentDispatch_;
   if (pending.valueWriter) {
-    activeEvalValueWriter = nullptr;
+    activeValueWriter = nullptr;
     rust::Box<acadctl::NativeValueWriter> writer =
         std::move(*pending.valueWriter);
     pending.valueWriter.reset();
@@ -1637,10 +1449,93 @@ void ObjectArxBridge::failExecutionDriver(bool cancelled) {
 
   pending.dispatchResult = bridgeFailure(
       acadctl::NativeActionResultKind::ExecutionBridgeFailed,
-      RTERROR,
-      cancelled ? "AutoCAD cancelled the queued execution action"
-                : "AutoCAD terminated the queued execution action prematurely");
+      RTERROR);
   scheduleExecutionDispatchFinalizer();
+}
+
+void ObjectArxBridge::recoverCancelledExecutionDriver() {
+  if (!pendingDocumentDispatch_ ||
+      pendingDocumentDispatch_->kind != PendingDocumentDispatch::Kind::Execute ||
+      pendingDocumentDispatch_->phase ==
+          PendingDocumentDispatch::Phase::Finalizing) {
+    return;
+  }
+
+  PendingDocumentDispatch &pending = *pendingDocumentDispatch_;
+  if (pending.valueWriter) {
+    writeValueKind(**pending.valueWriter,
+                   acadctl::NativeValueEventKind::Invalid);
+    activeValueWriter = nullptr;
+    rust::Box<acadctl::NativeValueWriter> writer =
+        std::move(*pending.valueWriter);
+    pending.valueWriter.reset();
+    acadctl::finish_value_writer(std::move(writer));
+  }
+
+  AcApDocument *target = document(pending.documentToken);
+  if (!target ||
+      !matchesExecutionContext(target, pending.databaseToken, target)) {
+    pending.evaluatorSymbolsMayBeRetained =
+        pending.evaluatorSymbolsMayBeRetained ||
+        pending.stagedFormKind !=
+            PendingDocumentDispatch::StagedFormKind::None;
+    pending.dispatchResult = abandonLostExecutionContext(
+        pending.jobId, target, pending.databaseToken, target,
+        pending.undoGroup != UndoGroupState::Inactive,
+        pending.evaluatorSymbolsMayBeRetained);
+    scheduleExecutionDispatchFinalizer();
+    return;
+  }
+
+  bool interruptedStepRecorded = false;
+  if (pending.stagedFormKind ==
+      PendingDocumentDispatch::StagedFormKind::Evaluator) {
+    acadctl::NativeExecutionStepResult interrupted =
+        stepNativeFailure(RTERROR);
+    const int cleanupStatus = clearEvaluatorSymbols();
+    pending.evaluatorSymbolsMayBeRetained = cleanupStatus != RTNORM;
+    interrupted.evaluator_symbols_clear_status =
+        cleanupStatus == RTNORM ? 0 : cleanupStatus;
+    pending.stagedFormKind = PendingDocumentDispatch::StagedFormKind::None;
+    interruptedStepRecorded =
+        acadctl::complete_execution_step(pending.jobId,
+                                         std::move(interrupted));
+  } else if (pending.stagedFormKind ==
+             PendingDocumentDispatch::StagedFormKind::ValueVisitor) {
+    EvaluatorSymbolsStepResult interrupted =
+        finishEvalValueEmission(stepNativeFailure(RTERROR));
+    pending.evaluatorSymbolsMayBeRetained =
+        interrupted.evaluatorSymbolsMayBeRetained;
+    pending.stagedFormKind = PendingDocumentDispatch::StagedFormKind::None;
+    interruptedStepRecorded = acadctl::complete_execution_step(
+        pending.jobId, std::move(interrupted.result));
+  }
+
+  if (!interruptedStepRecorded) {
+    interruptedStepRecorded = acadctl::abandon_execution(
+        pending.jobId, stepNativeFailure(RTERROR));
+  }
+  if (!interruptedStepRecorded) {
+    pending.dispatchResult = bridgeFailure(
+        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
+    scheduleExecutionDispatchFinalizer();
+    return;
+  }
+
+  pending.phase = PendingDocumentDispatch::Phase::Queued;
+  pending.driverExitReady = false;
+  pending.driverStarted = false;
+  pending.driverEnded = false;
+  pending.callbackActive = false;
+  pending.lispDepth = 0;
+  const Acad::ErrorStatus scheduleStatus = acDocManager->sendStringToExecute(
+      target, kExecutionDriverInvocation, true, false, false);
+  if (scheduleStatus != Acad::eOk) {
+    pending.dispatchResult = nativeFailure(
+        acadctl::NativeActionResultKind::DocumentContextFailed,
+        scheduleStatus);
+    scheduleExecutionDispatchFinalizer();
+  }
 }
 
 void ObjectArxBridge::scheduleExecutionDispatchFinalizer() {
@@ -1650,12 +1545,12 @@ void ObjectArxBridge::scheduleExecutionDispatchFinalizer() {
   }
 
   PendingDocumentDispatch &pending = *pendingDocumentDispatch_;
-  const bool cleanupUnproved =
+  const bool bridgeFinalizationUnproved =
       pending.undoGroup != UndoGroupState::Inactive ||
       pending.evaluatorSymbolsMayBeRetained ||
       pending.stagedFormKind != PendingDocumentDispatch::StagedFormKind::None ||
       pending.valueWriter.has_value();
-  if (cleanupUnproved &&
+  if (bridgeFinalizationUnproved &&
       pending.dispatchResult.kind !=
           acadctl::NativeActionResultKind::DocumentContextRestoreFailed) {
     pending.dispatchResult.kind =
@@ -1677,7 +1572,7 @@ void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
 
   PendingDocumentDispatch &pending = *pendingDocumentDispatch_;
   if (cancelled) {
-    failExecutionDriver(true);
+    recoverCancelledExecutionDriver();
     return;
   }
   if (pending.lispDepth > 1) {
@@ -1689,7 +1584,7 @@ void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
   if (pending.driverExitReady) {
     scheduleExecutionDispatchFinalizer();
   } else if (!pending.callbackActive) {
-    failExecutionDriver(false);
+    failExecutionDriver();
   }
 }
 
@@ -1710,7 +1605,143 @@ void ObjectArxBridge::finishExecutionCallback(
   if (!evaluateStagedForm && pending.driverExitReady) {
     scheduleExecutionDispatchFinalizer();
   } else {
-    failExecutionDriver(false);
+    failExecutionDriver();
+  }
+}
+
+int acadctlBeginPrintln() noexcept {
+  ObjectArxBridge *bridge = ObjectArxBridge::commandBridge_;
+  try {
+    if (!bridge || !bridge->pendingDocumentDispatch_ ||
+        bridge->pendingDocumentDispatch_->kind !=
+            ObjectArxBridge::PendingDocumentDispatch::Kind::Execute ||
+        bridge->pendingDocumentDispatch_->phase !=
+            ObjectArxBridge::PendingDocumentDispatch::Phase::Running ||
+        bridge->pendingDocumentDispatch_->stagedFormKind !=
+            ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::Evaluator ||
+        bridge->pendingDocumentDispatch_->valueWriter || activeValueWriter) {
+      clearSymbol(ACRX_T("acadctl:*value*"));
+      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+    }
+
+    ObjectArxBridge::PendingDocumentDispatch &pending =
+        *bridge->pendingDocumentDispatch_;
+    AcApDocument *document = bridge->document(pending.documentToken);
+    if (!document ||
+        !matchesExecutionContext(document, pending.databaseToken, document)) {
+      pending.dispatchResult = abandonLostExecutionContext(
+          pending.jobId, document, pending.databaseToken, document,
+          pending.undoGroup != UndoGroupState::Inactive,
+          pending.evaluatorSymbolsMayBeRetained);
+      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+    }
+    AcDbDatabase *database = document->database();
+    rust::Box<acadctl::NativeValueWriter> writer = acadctl::begin_println(
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
+        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(database)));
+    if (!acadctl::value_writer_active(*writer)) {
+      acadctl::finish_value_writer(std::move(writer));
+      clearSymbol(ACRX_T("acadctl:*value*"));
+      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+    }
+
+    const rust::Str visitor = acadctl::eval_value_visitor_source();
+    const AcString visitorText(
+        visitor.data(), AcString::Utf8,
+        static_cast<Adesk::UInt32>(visitor.size()));
+    const AcString visitorPending(ACRX_T("pending"));
+    int preparationStatus = putStringSymbol(
+        ACRX_T("acadctl:*staged-form*"), visitorText);
+    if (preparationStatus == RTNORM) {
+      preparationStatus = putStringSymbol(
+          ACRX_T("acadctl:*status*"), visitorPending);
+    }
+    if (preparationStatus != RTNORM) {
+      writeValueKind(*writer, acadctl::NativeValueEventKind::Invalid);
+      acadctl::finish_value_writer(std::move(writer));
+      clearSymbol(ACRX_T("acadctl:*value*"));
+      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+    }
+
+    pending.valueWriter.emplace(std::move(writer));
+    activeValueWriter = &**pending.valueWriter;
+    const int returnStatus = acedRetT();
+    if (returnStatus != RTNORM) {
+      writeValueKind(**pending.valueWriter,
+                     acadctl::NativeValueEventKind::Invalid);
+      activeValueWriter = nullptr;
+      rust::Box<acadctl::NativeValueWriter> retained =
+          std::move(*pending.valueWriter);
+      pending.valueWriter.reset();
+      acadctl::finish_value_writer(std::move(retained));
+      clearSymbol(ACRX_T("acadctl:*value*"));
+    }
+    return returnStatus == RTNORM ? RSRSLT : RSERR;
+  } catch (...) {
+    activeValueWriter = nullptr;
+    clearSymbol(ACRX_T("acadctl:*value*"));
+    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+  }
+}
+
+int acadctlFinishPrintln() noexcept {
+  ObjectArxBridge *bridge = ObjectArxBridge::commandBridge_;
+  try {
+    if (!bridge || !bridge->pendingDocumentDispatch_ ||
+        bridge->pendingDocumentDispatch_->kind !=
+            ObjectArxBridge::PendingDocumentDispatch::Kind::Execute ||
+        bridge->pendingDocumentDispatch_->phase !=
+            ObjectArxBridge::PendingDocumentDispatch::Phase::Running ||
+        bridge->pendingDocumentDispatch_->stagedFormKind !=
+            ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::Evaluator ||
+        !bridge->pendingDocumentDispatch_->valueWriter) {
+      activeValueWriter = nullptr;
+      clearSymbol(ACRX_T("acadctl:*value*"));
+      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+    }
+
+    ObjectArxBridge::PendingDocumentDispatch &pending =
+        *bridge->pendingDocumentDispatch_;
+    AcApDocument *document = bridge->document(pending.documentToken);
+    if (!document ||
+        !matchesExecutionContext(document, pending.databaseToken, document)) {
+      writeValueKind(**pending.valueWriter,
+                     acadctl::NativeValueEventKind::Invalid);
+      activeValueWriter = nullptr;
+      rust::Box<acadctl::NativeValueWriter> writer =
+          std::move(*pending.valueWriter);
+      pending.valueWriter.reset();
+      acadctl::finish_value_writer(std::move(writer));
+      pending.dispatchResult = abandonLostExecutionContext(
+          pending.jobId, document, pending.databaseToken, document,
+          pending.undoGroup != UndoGroupState::Inactive,
+          pending.evaluatorSymbolsMayBeRetained);
+      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
+    }
+    if (valueVisitorOutcome(RTNORM).kind !=
+        acadctl::NativeExecutionStepResultKind::Success) {
+      writeValueKind(**pending.valueWriter,
+                     acadctl::NativeValueEventKind::Invalid);
+    }
+    if (clearSymbol(ACRX_T("acadctl:*value*")) != RTNORM) {
+      writeValueKind(**pending.valueWriter,
+                     acadctl::NativeValueEventKind::Invalid);
+    }
+    const int returnStatus = acedRetNil();
+    if (returnStatus != RTNORM) {
+      writeValueKind(**pending.valueWriter,
+                     acadctl::NativeValueEventKind::Invalid);
+    }
+    activeValueWriter = nullptr;
+    rust::Box<acadctl::NativeValueWriter> writer =
+        std::move(*pending.valueWriter);
+    pending.valueWriter.reset();
+    acadctl::finish_value_writer(std::move(writer));
+    return returnStatus == RTNORM ? RSRSLT : RSERR;
+  } catch (...) {
+    activeValueWriter = nullptr;
+    clearSymbol(ACRX_T("acadctl:*value*"));
+    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
   }
 }
 
@@ -1750,8 +1781,7 @@ int acadctlAdvanceExecution() noexcept {
           Acad::eInvalidContext);
     } else if (!bridge->lispFunctionsDefined(target)) {
       pending.dispatchResult = bridgeFailure(
-          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
-          "acadctl AutoLISP functions are unavailable in the target drawing");
+          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
     } else if (!target->database()->undoRecording()) {
       pending.dispatchResult =
           result(acadctl::NativeActionResultKind::UndoDisabled);
@@ -1767,9 +1797,19 @@ int acadctlAdvanceExecution() noexcept {
 
       if (pending.stagedFormKind ==
           ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::Evaluator) {
-        ReservedStateStepResult evaluation = collectEvaluation(
+        if (pending.valueWriter) {
+          writeValueKind(**pending.valueWriter,
+                         acadctl::NativeValueEventKind::Invalid);
+          activeValueWriter = nullptr;
+          rust::Box<acadctl::NativeValueWriter> writer =
+              std::move(*pending.valueWriter);
+          pending.valueWriter.reset();
+          acadctl::finish_value_writer(std::move(writer));
+        }
+        EvaluatorSymbolsStepResult evaluation = collectEvaluation(
             pending.retainValue);
-        pending.evaluatorSymbolsMayBeRetained = evaluation.reservedStateRetained;
+        pending.evaluatorSymbolsMayBeRetained =
+            evaluation.evaluatorSymbolsMayBeRetained;
         pending.stagedFormKind =
             ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::None;
 
@@ -1781,22 +1821,21 @@ int acadctlAdvanceExecution() noexcept {
           evaluation.result = stepNativeFailure(
               pending.undoGroup == UndoGroupState::Unknown
                   ? observationStatus
-                  : RTERROR,
-              "the execution undo group changed during AutoLISP evaluation");
+                  : RTERROR);
         }
         if (!acadctl::complete_execution_step(
                 pending.jobId, std::move(evaluation.result))) {
           pending.dispatchResult = bridgeFailure(
               acadctl::NativeActionResultKind::ExecutionBridgeFailed,
-              RTERROR, "Rust rejected an AutoLISP form result");
+              RTERROR);
         }
       } else if (pending.stagedFormKind ==
                  ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::ValueVisitor) {
-        activeEvalValueWriter = nullptr;
-        ReservedStateStepResult emission = finishEvalValueEmission(
+        activeValueWriter = nullptr;
+        EvaluatorSymbolsStepResult emission = finishEvalValueEmission(
             valueVisitorOutcome(RTNORM));
         pending.evaluatorSymbolsMayBeRetained =
-            emission.reservedStateRetained;
+            emission.evaluatorSymbolsMayBeRetained;
         pending.stagedFormKind =
             ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::None;
         if (pending.valueWriter) {
@@ -1809,7 +1848,7 @@ int acadctlAdvanceExecution() noexcept {
                 pending.jobId, std::move(emission.result))) {
           pending.dispatchResult = bridgeFailure(
               acadctl::NativeActionResultKind::ExecutionBridgeFailed,
-              RTERROR, "Rust rejected an eval value result");
+              RTERROR);
         }
       }
 
@@ -1842,18 +1881,16 @@ int acadctlAdvanceExecution() noexcept {
                 pending.undoGroup != UndoGroupState::Inactive) {
               pending.dispatchResult = bridgeFailure(
                   acadctl::NativeActionResultKind::ExecutionBridgeFinalizationFailed,
-                  RTERROR,
-                  "the execution undo group could not be closed");
+                  RTERROR);
             }
           }
           if (pending.evaluatorSymbolsMayBeRetained) {
-            const int cleanupStatus = clearEvaluationSymbols();
+            const int cleanupStatus = clearEvaluatorSymbols();
             pending.evaluatorSymbolsMayBeRetained = cleanupStatus != RTNORM;
             if (pending.evaluatorSymbolsMayBeRetained) {
               pending.dispatchResult = bridgeFailure(
                   acadctl::NativeActionResultKind::EvaluatorSymbolsClearFailed,
-                  cleanupStatus,
-                  "reserved AutoLISP evaluator state could not be cleared");
+                  cleanupStatus);
             }
           }
           break;
@@ -1861,7 +1898,7 @@ int acadctlAdvanceExecution() noexcept {
         if (kind == acadctl::NativeExecutionStepKind::Invalid) {
           pending.dispatchResult = bridgeFailure(
               acadctl::NativeActionResultKind::ExecutionBridgeFailed,
-              RTERROR, "Rust returned an invalid execution step");
+              RTERROR);
           break;
         }
 
@@ -1878,11 +1915,11 @@ int acadctlAdvanceExecution() noexcept {
           break;
         case acadctl::NativeExecutionStepKind::EvaluateForm: {
           pending.formAttempted = true;
-          ReservedStateStepResult staging = stageEvaluation(
+          EvaluatorSymbolsStepResult staging = stageEvaluation(
               acadctl::execution_step_source(*step), evaluatorText,
               acadctl::execution_step_retain_value(*step));
           pending.evaluatorSymbolsMayBeRetained =
-              staging.reservedStateRetained;
+              staging.evaluatorSymbolsMayBeRetained;
           if (staging.result.kind ==
               acadctl::NativeExecutionStepResultKind::Success) {
             pending.stagedFormKind =
@@ -1909,12 +1946,10 @@ int acadctlAdvanceExecution() noexcept {
           pending.undoGroup = undoTransition.state;
           break;
         case acadctl::NativeExecutionStepKind::ClearRetainedEvalValue: {
-          const int cleanupStatus = clearEvaluationSymbols();
+          const int cleanupStatus = clearEvaluatorSymbols();
           stepResult = cleanupStatus == RTNORM
                            ? stepSuccess()
-                           : stepNativeFailure(
-                                 cleanupStatus,
-                                 "could not clear the retained AutoLISP value");
+                           : stepNativeFailure(cleanupStatus);
           pending.evaluatorSymbolsMayBeRetained = cleanupStatus != RTNORM;
           break;
         }
@@ -1925,16 +1960,16 @@ int acadctlAdvanceExecution() noexcept {
                   pending.databaseToken);
           if (!acadctl::value_writer_active(*writer)) {
             acadctl::finish_value_writer(std::move(writer));
-            ReservedStateStepResult emission =
+            EvaluatorSymbolsStepResult emission =
                 finishEvalValueEmission(stepSuccess());
             stepResult = std::move(emission.result);
             pending.evaluatorSymbolsMayBeRetained =
-                emission.reservedStateRetained;
+                emission.evaluatorSymbolsMayBeRetained;
             break;
           }
 
           const AcString visitorPending(ACRX_T("pending"));
-          int preparationStatus = clearEvaluationSymbols(false);
+          int preparationStatus = clearEvaluatorSymbols(false);
           if (preparationStatus == RTNORM) {
             preparationStatus = putStringSymbol(
                 ACRX_T("acadctl:*staged-form*"), visitorText);
@@ -1943,25 +1978,22 @@ int acadctlAdvanceExecution() noexcept {
             preparationStatus = putStringSymbol(
                 ACRX_T("acadctl:*status*"), visitorPending);
           }
-          if (preparationStatus != RTNORM || activeEvalValueWriter) {
+          if (preparationStatus != RTNORM || activeValueWriter) {
             writeValueKind(*writer,
                            acadctl::NativeValueEventKind::Invalid);
             acadctl::finish_value_writer(std::move(writer));
-            ReservedStateStepResult emission = finishEvalValueEmission(
-                stepNativeFailure(
-                    preparationStatus == RTNORM ? RTERROR
-                                                : preparationStatus,
-                    preparationStatus == RTNORM
-                        ? "an eval value visitor was already active"
-                        : "could not prepare the eval value visitor"));
+            EvaluatorSymbolsStepResult emission = finishEvalValueEmission(
+                stepNativeFailure(preparationStatus == RTNORM
+                                      ? RTERROR
+                                      : preparationStatus));
             stepResult = std::move(emission.result);
             pending.evaluatorSymbolsMayBeRetained =
-                emission.reservedStateRetained;
+                emission.evaluatorSymbolsMayBeRetained;
             break;
           }
 
           pending.valueWriter.emplace(std::move(writer));
-          activeEvalValueWriter = &**pending.valueWriter;
+          activeValueWriter = &**pending.valueWriter;
           pending.stagedFormKind =
               ObjectArxBridge::PendingDocumentDispatch::StagedFormKind::ValueVisitor;
           pending.evaluatorSymbolsMayBeRetained = true;
@@ -1980,25 +2012,23 @@ int acadctlAdvanceExecution() noexcept {
                                                std::move(stepResult))) {
           pending.dispatchResult = bridgeFailure(
               acadctl::NativeActionResultKind::ExecutionBridgeFailed,
-              RTERROR, "Rust rejected a native execution step result");
+              RTERROR);
         }
       }
     }
   } catch (...) {
     pending.dispatchResult = bridgeFailure(
-        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR,
-        "the native execution bridge threw an exception");
+        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
   }
 
   const int returnStatus = evaluateStagedForm ? acedRetT() : acedRetNil();
   if (returnStatus != RTNORM) {
     pending.dispatchResult = bridgeFailure(
-        acadctl::NativeActionResultKind::ExecutionBridgeFailed, returnStatus,
-        "the execution bridge could not return to AutoLISP");
+        acadctl::NativeActionResultKind::ExecutionBridgeFailed, returnStatus);
     evaluateStagedForm = false;
   }
   if (!evaluateStagedForm && pending.valueWriter) {
-    activeEvalValueWriter = nullptr;
+    activeValueWriter = nullptr;
     rust::Box<acadctl::NativeValueWriter> writer =
         std::move(*pending.valueWriter);
     pending.valueWriter.reset();
@@ -2044,8 +2074,7 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
           result(acadctl::NativeActionResultKind::NotQuiescent);
     } else if (undoState == UndoGroupState::Unknown) {
       pending.dispatchResult = bridgeFailure(
-          acadctl::NativeActionResultKind::HistoryFailed, undoStatus,
-          "could not read AutoCAD's undo state");
+          acadctl::NativeActionResultKind::HistoryFailed, undoStatus);
     } else {
       const int status = acedCommandS(
           RTSTR,
@@ -2063,8 +2092,7 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
             result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
       } else if (status != RTNORM) {
         pending.dispatchResult = bridgeFailure(
-            acadctl::NativeActionResultKind::HistoryFailed, status,
-            "AutoCAD rejected the history command");
+            acadctl::NativeActionResultKind::HistoryFailed, status);
       }
     }
   }

@@ -20,12 +20,14 @@ cxx = "1.0.199"
 cxx-build = "1.0.199"
 futures-util = "0.3.31"
 hyper-util = { version = "0.1.17", features = ["tokio"] }
+libc = "0.2.183"
 nanoid = "0.4.0"
+objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "libc"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSAppleEventDescriptor", "NSDate", "NSError", "NSPathUtilities", "NSString", "alloc", "libc", "objc2-core-services"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSPathUtilities", "NSString", "alloc"] }
 prost = "0.14.1"
 protoc-bin-vendored = "3.2.0"
-sysinfo = "0.39.6"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

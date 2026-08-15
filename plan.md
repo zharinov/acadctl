@@ -1,6 +1,6 @@
 # `acadctl eval`, `exec`, and drawing history
 
-Status: implementation and live verification are complete for the current macOS and AutoCAD 2027 target. The installed private build runs document-scoped `eval`, `exec`, `acadctl:println`, rollback, drawing-wide undo and redo, and exact process termination. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
+Status: the installed private build runs document-scoped `eval`, `exec`, one-value `acadctl:println`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The current follow-up awaits its cleanup, naming, and independent spec audits before commit. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
 
 ## Current implementation checklist
 
@@ -8,7 +8,7 @@ Status: implementation and live verification are complete for the current macOS 
 - [x] Live document-scoped `exec`, `eval`, `acadctl:println`, readable values, Lisp diagnostics, and drawing rollback.
 - [x] Live drawing-wide `undo` and `redo`, including exact inactive-document routing and restoration of the prior active document.
 - [x] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates on macOS and AutoCAD 2027.
-- [x] Final static checks, implementation commit, first-principles naming sweep, and reconciled cleanup commit.
+- [ ] Commit the current one-value output and process-identity corrections, then complete the first-principles naming, cleanup, and independent spec audits.
 
 ## Design center
 
@@ -90,7 +90,7 @@ Examples of implicit results:
 | `(setq count 12)` | `12` | Empty |
 | `(defun twice (x) (* x 2))` | `TWICE` | Empty |
 | `nil` | `nil` | Empty |
-| `(acadctl:println "created: " count)` | `created: 12`, then `nil` | `created: 12` |
+| `(acadctl:println (strcat "created: " (itoa count)))` | `created: 12`, then `nil` | `created: 12` |
 
 `eval` is intended for inspection and composition, but it is not read-only. `exec` is intended for definitions, commands, and batches where implicit Lisp return values would be noise.
 
@@ -143,18 +143,16 @@ Exact form spans are necessary for three reasons: sequential execution, cancella
 The `acadctl:` symbol prefix is reserved for this tool. The only documented source-output function is:
 
 ```lisp
-(acadctl:println "created: " count)
+(acadctl:println (strcat "created: " (itoa count)))
 ```
 
 Its contract is:
 
-- Any number of arguments.
-- Arguments are concatenated without an implicit separator.
+- Exactly one argument.
 - Ordinary values use familiar `princ`-style display semantics; strings are not quoted.
 - Opaque values use the stable acadctl display forms described below.
-- Exactly one newline is added after all arguments.
+- Exactly one newline is added after the value.
 - The CLI forwards each received line immediately and flushes stdout; buffering does not wait for request completion.
-- No arguments produce one blank line.
 - Output is routed only to the client owning the active `eval` or `exec` request.
 - The function returns `nil`.
 - Outside an active request, it has no effect and still returns `nil`.
@@ -162,7 +160,7 @@ Its contract is:
 
 Standard AutoLISP `princ`, `prin1`, `print`, `prompt`, and related functions are not replaced or captured. They retain their normal AutoCAD command-line behavior. This preserves existing Lisp expectations and keeps the user's AutoCAD console separate from the request's stdout.
 
-No automatic label, prefix, or request ID is added to output. Callers can include their own labels as ordinary arguments.
+No automatic label, prefix, or request ID is added to output. Callers can construct one string when they want a label beside another value.
 
 ### Value printers
 
@@ -175,10 +173,10 @@ Both modes use stable forms for opaque values, including when an opaque value is
 
 ```text
 #<Entity 5A2>
-#<SelectionSet 7>
+#<SelectionSet>
 #<VlaObject IAcadLine>
 #<File>
-#<Function foo>
+#<Function>
 ```
 
 Type names use PascalCase. A payload appears only when it is useful. These forms are displays, not new readable AutoLISP literals.
@@ -306,7 +304,7 @@ This choice avoids stopping between forms after non-undoable Lisp or external ef
 
 `acadctl kill` is the explicit process-level escape hatch:
 
-- If `pid` is omitted, exactly one acadctl-enabled AutoCAD process must exist; otherwise selection fails and the available processes are reported.
+- If `pid` is omitted, exactly one AutoCAD process must exist; otherwise selection fails and the available processes are reported. Plugin availability is irrelevant.
 - Without `--force`, it requests normal application termination and waits up to five seconds.
 - A graceful request that does not finish in five seconds fails without escalation.
 - With `--force`, it immediately terminates the OS process even if the plugin and AutoCAD main loop are unresponsive.
@@ -337,16 +335,16 @@ There is no `--force`, count, unknown barrier, safe-history mode, reactor trace 
 The first client message is the complete request. `Cancel` is the only valid later client message:
 
 ```rust
-enum ExecuteClientMessage {
+enum ExecutionClientMessage {
     Request(ExecutionRequest),
-    Cancel,
+    Cancel(ExecutionCancelRequest),
 }
 
 struct ExecutionRequest {
     document_id: String,
     mode: ExecutionMode,
     source_name: String,
-    source: String,
+    source: Bytes,
 }
 
 enum ExecutionMode {
@@ -354,23 +352,33 @@ enum ExecutionMode {
     Exec,
 }
 
-enum ExecuteServerEvent {
+enum ExecutionServerEvent {
     Accepted,
     Output { text: String },
+    CancelAcknowledgement(ExecutionCancelAcknowledgement),
     Finished(ExecutionOutcome),
 }
 
 enum ExecutionOutcome {
-    Success { value: Option<String> },
+    Success,
     Failure(ExecutionFailure),
     Cancelled,
+}
+
+struct ExecutionCancelAcknowledgement {
+    disposition: ExecutionCancelDisposition,
+}
+
+enum ExecutionCancelDisposition {
+    Accepted,
+    TooLate,
 }
 
 struct ExecutionFailure {
     message: String,
     form_index: Option<usize>,
     location: Option<SourceLocation>,
-    drawing_outcome: DrawingFailureOutcome,
+    drawing_outcome: DrawingOutcome,
 }
 
 struct SourceLocation {
@@ -379,9 +387,10 @@ struct SourceLocation {
     column: usize,
 }
 
-enum DrawingFailureOutcome {
+enum DrawingOutcome {
     NotStarted,
     RolledBack,
+    Committed,
     Unknown,
 }
 ```
@@ -447,7 +456,7 @@ Source remains in memory. A temporary `.lsp` file, `load`, command-line paste, o
 | Replace or wrap standard `princ`, `print`, or `prompt` | Existing AutoLISP must keep its familiar AutoCAD behavior. Agents opt into request output with one explicit function. |
 | Name the function `acadctl:tap` | Clojure's `tap>` distributes live values to handlers and interactive tooling; this API emits text. |
 | Name the function `acadctl:print` | The chosen behavior always appends a newline and is therefore `println` semantics. |
-| Give `println` a label argument or automatic prefix | Variadic concatenation already lets callers write any label, without forcing a formatting protocol. |
+| Give `println` a label argument or automatic prefix | Callers can construct the one value they want to display, normally with `strcat`, without forcing a formatting protocol. |
 | Use Clojure-like `#Type[...]` or AutoCAD's all-caps tags | AutoLISP/Common Lisp-style `#<Type payload>` is more native, and PascalCase is easier to read. |
 | Treat every displayed object identity as reusable | AutoCAD does not expose a uniform persistent lookup for selection sets, COM wrappers, files, or functions. Entity handles are the deliberate reusable exception. |
 | Use a supported ObjectARX reader/AST API | No such general API is exposed. |
@@ -491,7 +500,7 @@ The design depends on behavior that documentation alone does not establish stron
 | Disconnect survival | An accepted job outlives its RPC sink, stops buffering after disconnect, and reaches a terminal internal state without leaking queue entries. | Disconnect semantics are corrected before streaming execution ships. |
 | Drawing history | One fixed `U` or `REDO` executes in the exact requested document, affects the same history visible to the user, reports native absence/failure honestly, and restores the prior current/active context. | `undo` and `redo` do not ship until routing and context restoration are exact. |
 | Source limit | A 4 MiB source is accepted with protocol overhead, a source one byte larger is rejected by both sides, and no transport default creates a smaller accidental limit. | Transport limits are aligned with the application contract. |
-| Process termination | Graceful termination respects the five-second wait and never escalates; forced termination targets only the selected PID. | `kill` remains unavailable until process selection and termination are exact. |
+| Process termination | Graceful termination respects the five-second wait and never escalates; forced termination acts only after the retained platform process identity still resolves to the same AutoCAD instance. | `kill` remains unavailable until process selection and termination are exact. |
 
 The implementation remains a narrow native bridge for routing, fixed AutoCAD operations, evaluation, undo grouping, rollback, and lifecycle observation. Rust owns scanning, queueing, state, protocol, formatting, and policy. No protocol-version field or native history state machine is introduced.
 
@@ -983,7 +992,7 @@ Database observation failure is durable and fail-closed. C++ reports a typed att
 
 ### 2026-08-14 — I-068: undo and redo are ordinary drawing-wide AutoCAD history
 
-I-062 through I-067 are superseded as product architecture. The live trace work proved why a provenance layer is the wrong abstraction: ObjectARX exposes no supported stable top-record identity, explicit groups can create records without database mutation, and the observed details are sensitive to host behavior rather than an acadctl domain guarantee. Maintaining an owned suffix would add a second, partial model of history that users already understand as drawing-wide AutoCAD state.
+I-062 through I-067 and the safe-history implementation claims in I-003 and I-004 are superseded as product architecture. The live trace work proved why a provenance layer is the wrong abstraction: ObjectARX exposes no supported stable top-record identity, explicit groups can create records without database mutation, and the observed details are sensitive to host behavior rather than an acadctl domain guarantee. Maintaining an owned suffix would add a second, partial model of history that users already understand as drawing-wide AutoCAD state.
 
 `acadctl undo <id>` and `acadctl redo <id>` therefore perform exactly one ordinary drawing history action, regardless of whether the affected step came from the user, an acadctl execution, or another integration. They have no force flag, count, provenance, ownership claim, revision, trace predicate, or repair sequence. Rust owns the single FIFO operation, direction, exact document-generation target, RPC result, and diagnostic policy. C++ only establishes the physical document context, issues fixed `_.U` or `_.REDO`, restores context, and reports raw status.
 
@@ -1028,3 +1037,31 @@ Live AutoCAD 2027 testing closed the remaining current-platform gates. Cancellat
 A source of exactly 4 MiB crossed the real CLI, RPC, plugin scanner, and evaluator boundary successfully; one byte more was rejected locally with the specified diagnostic. A deliberately single 4 MiB string reached AutoLISP and produced AutoLISP's own `string too long on input` error, confirming that the application source limit is not falsely presented as a guarantee that every host reader form is valid. Busy admission was already proven in I-069: an action issued while AutoCAD was still completing a document command failed without cancelling that work and succeeded after quiescence.
 
 Process testing used disposable drawings. A saved drawing closed through graceful `acadctl kill` in about 2.5 seconds. With unsaved `test.dwg`, graceful kill waited the full five seconds, returned failure, and left the same process alive; only a later explicit `--force` terminated that exact PID. A separate forced request also terminated the prior exact process and subsequent selection refused the now-absent PID. The Windows CLI path compiles with the pinned target, but native Windows runtime and console-signal behavior remain a platform-specific validation task rather than evidence inferred from the macOS run.
+
+### 2026-08-15 — I-074: public `acadctl:println` accepts one value and reuses the Rust-owned visitor
+
+This entry supersedes I-010 and the public direct-argument traversal described in I-035 and I-038. Live AutoCAD 2027 proved that the external-function argument boundary rejects ordinary symbols, error objects, files, and functions before the registered callback can normalize them. A dotted pair can also arrive in a legacy result-buffer shape that is not safely streamable without retaining or pre-scanning composite state. AutoLISP does not support a user-defined variadic formal list, so neither the direct native walker nor a variadic Lisp replacement provides the promised arbitrary-value contract.
+
+The public function is therefore a fixed-arity AutoLISP wrapper that accepts exactly one value. It stores that value in the reserved evaluator slot, asks a private native callback to claim the current form writer, evaluates the existing Rust-generated iterative value visitor, and calls a second private callback to finish the writer and publish `nil`. The same visitor protocol now normalizes explicit display output and the post-commit readable eval value; Rust still owns event codes, payload validation, formatting, output routing, backpressure, cancellation, and the exactly-one-root rule. C++ only stages the bounded visitor source and holds the writer for the wrapper's dynamic lifetime. An interrupted wrapper leaves that writer on the pending document dispatch so the next execution callback or terminal cleanup can fail and release the correct form lease.
+
+Callers that want a label and value on one line construct one value, normally with `strcat`, `itoa`, or another ordinary AutoLISP conversion. Zero or multiple arguments produce AutoLISP's normal arity errors. Outside an active request the wrapper returns `nil` without visiting or emitting its argument. Whole-value rendering, a C++ composite walker, undocumented result-buffer fields, multiple private event schemas, and a second Lisp formatter remain rejected.
+
+The exact installed build printed a string, symbol, nested dotted list, caught error, file, function, entity, and selection set through this path. It also returned `nil` without output outside a request, reported ordinary too-few and too-many argument errors, preserved implicit readable eval output, and rolled back a mutation before a failing later form.
+
+### 2026-08-15 — I-075: process termination retains platform identity; explicit force uses `SIGKILL` on macOS
+
+This entry supersedes the process mechanics in I-005 and I-072 and narrows I-073's evidence to the current implementation. A numeric PID is only a lookup key and can be reused after selection, so discovery returns a CLI-owned platform process object that survives through selection, termination, and exit observation. `ls`, document targeting, and `kill` share that discovery policy instead of maintaining separate basename and termination registries.
+
+On macOS, discovery retains an `NSRunningApplication` whose bundle identifier is exactly `com.autodesk.AutoCAD` followed by a decimal release number. Graceful termination uses that object's normal application request so AutoCAD can perform its save-and-close lifecycle; the CLI waits five seconds and never escalates automatically. Explicit `--force` immediately re-resolves the PID and requires the same retained application identity before sending `SIGKILL`, then waits until the retained identity is terminated or no longer owns that PID. `NSRunningApplication.forceTerminate()` was rejected after a live call returned success while AutoCAD remained running. The current explicit-force path terminated the disposable instance and a read-only process check found no remaining AutoCAD process.
+
+On Windows, discovery retains a query-and-synchronize process handle and creation time. Graceful window closure and an explicit force reopen are accepted only while the retained handle and creation time still identify the same process; the termination-capable handle is then used for `TerminateProcess`. The path cross-compiles, but basename-only `acad.exe` product classification and real console/process behavior remain Windows runtime gates rather than cross-platform claims.
+
+### 2026-08-15 — I-076: host-cancelled Lisp resumes the Rust-owned unwind
+
+This entry supersedes I-041's description of a visitor writer whose native lifetime is limited to one synchronous command and refines I-070's unconditional quarantine rule for premature driver termination. The public one-value wrapper crosses several registered-function callbacks, so its owned writer remains on the pending document dispatch for that wrapper's dynamic lifetime. A thread-local borrowed pointer only makes the currently retained writer reachable to the private value-event callback; it carries no routing identity or independent lifetime. The finish callback and every interruption path invalidate and release the writer before the dispatch can settle.
+
+An AutoCAD `lispCancelled` event can terminate the queued outer driver after `_UNDO _Begin` without returning through the normal evaluator checkpoint. Treating that event as an ordinary bridge failure would leave the drawing group and reserved evaluator state outside Rust's unwind. The native bridge therefore records the interrupted evaluator or value visitor as a failed Rust step, clears evaluator symbols only in the proved target context, and queues the same fixed outer driver again. The existing Rust execution state then chooses `ClearRetainedEvalValue`, `RollbackUndoGroup`, and terminal cleanup exactly as it does for an ordinary form failure. If the interrupted step cannot be correlated, the bridge abandons it into the Rust failure state; if exact context or rescheduling cannot be proved, finalization fails closed and quarantines further mutation instead of guessing at cleanup.
+
+The claimed public println path revalidates the pending execution phase, target document, current and active document, and database generation before staging, reading, or clearing target execution state. An unclaimed begin discards only the ambient `acadctl:*value*` that the wrapper has just stored and returns `nil`. A mismatch after a writer was claimed invalidates that writer and enters the existing context-loss path without clearing state in another drawing.
+
+The exact installed AutoCAD 2027 build was interrupted with Escape while an infinite second form was running after creating a uniquely sized circle. The client returned AutoLISP's `Function cancelled` failure. AutoCAD then reported the undo-group bit clear and all seven reserved evaluator symbols `nil`; the marker circle was absent, and a fresh request in the same process succeeded. This closes host-level cancellation recovery for the tested build independently of cooperative CLI cancellation.

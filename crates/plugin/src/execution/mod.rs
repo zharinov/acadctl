@@ -10,6 +10,8 @@ pub mod value_bridge;
 pub(crate) mod visitor;
 
 pub const FORM_EVALUATOR_SOURCE: &str = include_str!("../../lisp/form-evaluator.lsp");
+#[cfg(test)]
+const EXECUTION_DRIVER_SOURCE: &str = include_str!("../../lisp/execution-driver.lsp");
 
 pub(crate) fn bound_diagnostic(message: &mut String) {
     const SUFFIX: &str = "... [truncated]";
@@ -865,7 +867,7 @@ impl Execution {
     }
 
     pub fn record_bridge_finalization_failure(&mut self, result: ExecutionStepResult) -> bool {
-        let cleanup = result.into_message("the native execution lease could not be released");
+        let cleanup = result.into_message("the execution bridge could not be finalized safely");
         let Some(outcome) = self.outcome.take() else {
             return false;
         };
@@ -1014,7 +1016,7 @@ impl ExecutionStepResult {
     fn evaluator_symbols_clear_message(&self) -> Option<String> {
         (self.evaluator_symbols_clear_status != 0).then(|| {
             format!(
-                "could not clear the reserved AutoLISP evaluator state (native status {})",
+                "could not clear the reserved AutoLISP evaluator symbols (native status {})",
                 self.evaluator_symbols_clear_status
             )
         })
@@ -1160,6 +1162,11 @@ mod tests {
     }
 
     #[test]
+    fn embedded_execution_driver_contains_two_complete_definitions() {
+        assert_eq!(acadctl_lisp::validate(EXECUTION_DRIVER_SOURCE), Ok(2));
+    }
+
+    #[test]
     fn yields_exact_forms_then_commits() {
         let mut execution = Execution::new(
             ExecutionMode::Exec,
@@ -1300,7 +1307,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "value visitor failed; could not clear the reserved AutoLISP evaluator state (native status -5001)"
+            "value visitor failed; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
     }
@@ -1320,7 +1327,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP evaluator state (native status -5001)"
+            "the AutoLISP evaluator did not emit its result value; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
     }
@@ -1411,7 +1418,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "bad argument type; could not clear the reserved AutoLISP evaluator state (native status -5001)"
+            "bad argument type; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }
@@ -1793,7 +1800,7 @@ mod tests {
         };
         assert_eq!(
             failure.message,
-            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP evaluator state (native status -5001)"
+            "the AutoLISP output bridge emitted an invalid value sequence; could not clear the reserved AutoLISP evaluator symbols (native status -5001)"
         );
         assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
     }

@@ -43,15 +43,16 @@ pub enum ValueEvent<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RootPolicy {
-    Any,
-    ExactlyOne,
+enum WriterPolicy {
+    Inactive,
+    FormValue,
+    EvalValue,
 }
 
 pub struct NativeValueWriter {
     printer: Option<ValuePrinter>,
     lease: Option<ValueOutputLease>,
-    root_policy: RootPolicy,
+    policy: WriterPolicy,
     result: WriteResult,
 }
 
@@ -60,31 +61,31 @@ impl NativeValueWriter {
         Self {
             printer: None,
             lease: None,
-            root_policy: RootPolicy::Any,
+            policy: WriterPolicy::Inactive,
             result: WriteResult::Inactive,
         }
     }
 
     pub(crate) fn println(lease: ValueOutputLease) -> Self {
-        Self::new(lease, PrintMode::Display, RootPolicy::Any)
+        Self::new(lease, PrintMode::Display, WriterPolicy::FormValue)
     }
 
     pub(crate) fn eval_value(lease: ValueOutputLease) -> Self {
-        Self::new(lease, PrintMode::Readable, RootPolicy::ExactlyOne)
+        Self::new(lease, PrintMode::Readable, WriterPolicy::EvalValue)
     }
 
-    fn new(lease: ValueOutputLease, mode: PrintMode, root_policy: RootPolicy) -> Self {
+    fn new(lease: ValueOutputLease, mode: PrintMode, policy: WriterPolicy) -> Self {
         let sink = lease.output_sink();
         let status = sink.emit("");
         let result = emit_result(status);
         let mut writer = Self {
             printer: (status == EmitResult::Written).then(|| ValuePrinter::new(sink, mode)),
             lease: Some(lease),
-            root_policy,
+            policy,
             result,
         };
         if status != EmitResult::Written {
-            let failure = output_failure(root_policy, status);
+            let failure = output_failure(policy, status);
             writer.retire(failure, result);
         }
         writer
@@ -153,7 +154,7 @@ impl NativeValueWriter {
                 WriteResult::InvalidSequence,
             );
         };
-        if self.root_policy == RootPolicy::ExactlyOne && printer.root_values() != 1 {
+        if self.policy != WriterPolicy::Inactive && printer.root_values() != 1 {
             return self.fail(
                 ValueBridgeFailure::InvalidSequence,
                 WriteResult::InvalidSequence,
@@ -180,10 +181,7 @@ impl NativeValueWriter {
                 WriteResult::LimitExceeded,
             ),
             Err(PrintError::Output(result)) => {
-                self.retire(
-                    output_failure(self.root_policy, result),
-                    emit_result(result),
-                );
+                self.retire(output_failure(self.policy, result), emit_result(result));
                 self.result
             }
         }
@@ -213,10 +211,10 @@ const fn emit_result(result: EmitResult) -> WriteResult {
     }
 }
 
-const fn output_failure(root_policy: RootPolicy, result: EmitResult) -> Option<ValueBridgeFailure> {
-    match (root_policy, result) {
+const fn output_failure(policy: WriterPolicy, result: EmitResult) -> Option<ValueBridgeFailure> {
+    match (policy, result) {
         (_, EmitResult::Finished) => Some(ValueBridgeFailure::OutputFinished),
-        (RootPolicy::ExactlyOne, EmitResult::Cancelled) => {
+        (WriterPolicy::EvalValue, EmitResult::Cancelled) => {
             Some(ValueBridgeFailure::PostCommitCancelled)
         }
         _ => None,
@@ -232,7 +230,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn concatenates_any_number_of_println_roots() {
+    async fn prints_exactly_one_display_value() {
         let (io, mut stream) = execution_io();
         let terminal = io.output_sink();
         let mut writer = NativeValueWriter::println(form_lease(&io));
@@ -243,7 +241,6 @@ mod tests {
             WriteResult::Continue
         );
         assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
-        assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
         assert_eq!(
             io.close_value_output(super::super::ValueOutputKind::Form),
@@ -251,7 +248,34 @@ mod tests {
         );
         terminal.finish();
 
-        assert_eq!(collect(&mut stream).await, "created: 12\n");
+        assert_eq!(collect(&mut stream).await, "created: \n");
+    }
+
+    #[test]
+    fn println_requires_exactly_one_root() {
+        let (empty_io, _stream) = execution_io();
+        let empty = NativeValueWriter::println(form_lease(&empty_io));
+        assert_eq!(empty.finish(), WriteResult::InvalidSequence);
+        assert_eq!(
+            empty_io.close_value_output(super::super::ValueOutputKind::Form),
+            Some(ValueBridgeFailure::InvalidSequence)
+        );
+
+        let (multiple_io, _stream) = execution_io();
+        let mut multiple = NativeValueWriter::println(form_lease(&multiple_io));
+        assert_eq!(
+            multiple.write(ValueEvent::Integer(1)),
+            WriteResult::Continue
+        );
+        assert_eq!(
+            multiple.write(ValueEvent::Integer(2)),
+            WriteResult::Continue
+        );
+        assert_eq!(multiple.finish(), WriteResult::InvalidSequence);
+        assert_eq!(
+            multiple_io.close_value_output(super::super::ValueOutputKind::Form),
+            Some(ValueBridgeFailure::InvalidSequence)
+        );
     }
 
     #[test]
