@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package acadctl;
 
-service DocumentService {
+service DocService {
   rpc List(ListRequest) returns (ListResponse);
   rpc Open(OpenRequest) returns (OpenResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -11,14 +11,14 @@ service DocumentService {
   rpc Close(CloseRequest) returns (CloseResponse);
 }
 
-service ExecutionService {
-  rpc Execute(stream ExecutionClientMessage) returns (stream ExecutionServerEvent);
+service ExecService {
+  rpc Execute(stream ExecClientMessage) returns (stream ExecServerEvent);
 }
 
 message ListRequest {}
 
 message ListResponse {
-  repeated Document documents = 1;
+  repeated Doc documents = 1;
 }
 
 message OpenRequest {
@@ -26,7 +26,7 @@ message OpenRequest {
 }
 
 message OpenResponse {
-  Document document = 1;
+  Doc document = 1;
 }
 
 message SaveRequest {
@@ -34,7 +34,7 @@ message SaveRequest {
 }
 
 message SaveResponse {
-  Document document = 1;
+  Doc document = 1;
 }
 
 message HistoryRequest {
@@ -42,7 +42,7 @@ message HistoryRequest {
 }
 
 message HistoryResponse {
-  Document document = 1;
+  Doc document = 1;
 }
 
 message CloseRequest {
@@ -52,70 +52,70 @@ message CloseRequest {
 
 message CloseResponse {}
 
-message ExecutionClientMessage {
+message ExecClientMessage {
   oneof message {
-    ExecutionRequest request = 1;
-    ExecutionCancelRequest cancel = 2;
+    ExecRequest request = 1;
+    ExecCancelRequest cancel = 2;
   }
 }
 
-message ExecutionRequest {
+message ExecRequest {
   string document_id = 1;
-  ExecutionMode mode = 2;
+  ExecMode mode = 2;
   string source_name = 3;
   bytes source = 4;
 }
 
-enum ExecutionMode {
-  EXECUTION_MODE_UNSPECIFIED = 0;
-  EXECUTION_MODE_EVAL = 1;
-  EXECUTION_MODE_EXEC = 2;
+enum ExecMode {
+  EXEC_MODE_UNSPECIFIED = 0;
+  EXEC_MODE_EVAL = 1;
+  EXEC_MODE_EXEC = 2;
 }
 
-message ExecutionCancelRequest {}
+message ExecCancelRequest {}
 
-message ExecutionServerEvent {
+message ExecServerEvent {
   oneof event {
-    ExecutionAccepted accepted = 1;
-    ExecutionOutput output = 2;
-    ExecutionFinished finished = 3;
-    ExecutionCancelAcknowledgement cancel_acknowledgement = 4;
+    ExecAccepted accepted = 1;
+    ExecOutput output = 2;
+    ExecFinished finished = 3;
+    ExecCancelAcknowledgement cancel_acknowledgement = 4;
   }
 }
 
-message ExecutionAccepted {}
+message ExecAccepted {}
 
-message ExecutionOutput {
+message ExecOutput {
   string chunk = 1;
 }
 
-message ExecutionFinished {
-  ExecutionOutcome outcome = 1;
+message ExecFinished {
+  ExecOutcome outcome = 1;
 }
 
-message ExecutionOutcome {
+message ExecOutcome {
   oneof outcome {
-    ExecutionSuccess success = 1;
-    ExecutionFailure failure = 2;
-    ExecutionCancelled cancelled = 3;
+    ExecSuccess success = 1;
+    ExecFailure failure = 2;
+    ExecCancelled cancelled = 3;
   }
 }
 
-message ExecutionSuccess {}
+message ExecSuccess {}
 
-message ExecutionCancelled {}
+message ExecCancelled {}
 
-message ExecutionCancelAcknowledgement {
-  ExecutionCancelDisposition disposition = 1;
+message ExecCancelAcknowledgement {
+  ExecCancelDisposition disposition = 1;
 }
 
-enum ExecutionCancelDisposition {
-  EXECUTION_CANCEL_DISPOSITION_UNSPECIFIED = 0;
-  EXECUTION_CANCEL_DISPOSITION_ACCEPTED = 1;
-  EXECUTION_CANCEL_DISPOSITION_TOO_LATE = 2;
+enum ExecCancelDisposition {
+  EXEC_CANCEL_DISPOSITION_UNSPECIFIED = 0;
+  EXEC_CANCEL_DISPOSITION_ACCEPTED = 1;
+  EXEC_CANCEL_DISPOSITION_TOO_LATE = 2;
 }
 
-message ExecutionFailure {
+message ExecFailure {
   string message = 1;
   optional uint64 form_index = 2;
   SourceLocation location = 3;
@@ -136,7 +136,7 @@ enum DrawingOutcome {
   DRAWING_OUTCOME_UNKNOWN = 4;
 }
 
-message Document {
+message Doc {
   string id = 1;
   string display_name = 2;
   optional string file_path = 3;

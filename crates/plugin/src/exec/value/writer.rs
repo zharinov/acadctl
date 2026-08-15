@@ -1,5 +1,5 @@
-use super::value::{PrintError, ValuePrinter};
-use super::{ValueBridgeFailure, ValueOutputLease};
+use super::super::{ValueBridgeFailure, ValueOutputLease};
+use super::printer::{PrintError, ValuePrinter};
 
 pub use crate::ffi::NativeValueWriteResult as WriteResult;
 
@@ -183,8 +183,8 @@ const fn write_failure(result: WriteResult) -> Option<ValueBridgeFailure> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::super::output::{OutputStream, channel};
-    use super::super::{ExecutionIo, ValueBridgeState};
+    use super::super::super::output::{OutputStream, channel};
+    use super::super::super::{ExecIo, ValueBridgeState};
     use super::*;
 
     #[test]
@@ -258,10 +258,10 @@ mod tests {
         assert_eq!(io.close_value_output(), Some(ValueBridgeFailure::Abandoned));
     }
 
-    fn execution_io() -> (Arc<ExecutionIo>, OutputStream) {
+    fn execution_io() -> (Arc<ExecIo>, OutputStream) {
         let (output, stream) = channel();
         (
-            Arc::new(ExecutionIo {
+            Arc::new(ExecIo {
                 output,
                 bridge: Mutex::new(ValueBridgeState::default()),
             }),
@@ -269,7 +269,7 @@ mod tests {
         )
     }
 
-    fn eval_value_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
+    fn eval_value_lease(io: &Arc<ExecIo>) -> ValueOutputLease {
         io.begin_value_output();
         io.acquire_value_output()
             .expect("eval value output is open")

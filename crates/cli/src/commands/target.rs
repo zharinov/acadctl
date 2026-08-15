@@ -1,8 +1,8 @@
-use acadctl_rpc::{DocumentId, ProcessId};
+use acadctl_rpc::{DocId, ProcessId};
 
 pub struct Target {
     pub process_id: ProcessId,
-    pub document_id: DocumentId,
+    pub document_id: DocId,
 }
 
 pub fn resolve(target: &str) -> Result<Target, String> {
@@ -38,6 +38,6 @@ mod tests {
     fn parses_and_normalizes_composite_targets() {
         let target = resolve("00fa5:32f3").unwrap();
         assert_eq!(target.process_id, ProcessId::new(0xFA5).unwrap());
-        assert_eq!(target.document_id, DocumentId::new(0x32F3));
+        assert_eq!(target.document_id, DocId::new(0x32F3));
     }
 }

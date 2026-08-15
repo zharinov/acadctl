@@ -1,5 +1,5 @@
 mod commands;
-mod instances;
+mod instance;
 mod source;
 
 use std::path::PathBuf;
@@ -56,9 +56,9 @@ enum Command {
         discard: bool,
     },
     /// Evaluate one AutoLISP form and print its value.
-    Eval(ExecutionArgs),
+    Eval(ExecArgs),
     /// Execute an AutoLISP batch without implicit value output.
-    Exec(ExecutionArgs),
+    Exec(ExecArgs),
     /// Terminate an AutoCAD instance.
     Kill {
         /// Target AutoCAD process when more than one instance is running.
@@ -71,7 +71,7 @@ enum Command {
 }
 
 #[derive(Args)]
-struct ExecutionArgs {
+struct ExecArgs {
     /// Document target shown by `acadctl ps`.
     id: String,
 
@@ -93,20 +93,10 @@ async fn main() -> ExitCode {
         }
         Command::Close { id, discard } => commands::close::run(id, discard).await,
         Command::Eval(arguments) => {
-            commands::execute::run(
-                arguments.id,
-                arguments.file,
-                acadctl_rpc::ExecutionMode::Eval,
-            )
-            .await
+            commands::exec::run(arguments.id, arguments.file, acadctl_rpc::ExecMode::Eval).await
         }
         Command::Exec(arguments) => {
-            commands::execute::run(
-                arguments.id,
-                arguments.file,
-                acadctl_rpc::ExecutionMode::Exec,
-            )
-            .await
+            commands::exec::run(arguments.id, arguments.file, acadctl_rpc::ExecMode::Exec).await
         }
         Command::Kill { pid, force } => commands::kill::run(pid, force).await,
     }

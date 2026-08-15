@@ -151,7 +151,7 @@ private:
 
 static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 
-struct DocumentSubscription {
+struct DocSubscription {
   AcApDocument *document;
   AcDbDatabase *database;
   AcDbDatabase *retiredDatabase;
@@ -218,11 +218,11 @@ private:
 
   void finishAdvanceCallback(AdvanceCompletion completion);
 
-  struct DocumentContextDispatch {
+  struct DocContextDispatch {
     enum class Phase { Queued, Running, Finalizing };
-    enum class Kind { Undo, Redo, ExecutionDriver };
+    enum class Kind { Undo, Redo, ExecDriver };
     enum class StagedFormKind { None, Evaluator, ValueVisitor };
-    enum class ExecutionDriverLifecycle {
+    enum class ExecDriverLifecycle {
       AwaitingStart,
       Running,
       InCallback,
@@ -246,14 +246,14 @@ private:
     bool retainValue = false;
     bool bridgeSymbolsMayBeRetained = false;
     bool terminalCleanupFailed = false;
-    ExecutionDriverLifecycle driverLifecycle =
-        ExecutionDriverLifecycle::AwaitingStart;
+    ExecDriverLifecycle driverLifecycle =
+        ExecDriverLifecycle::AwaitingStart;
     std::uint32_t lispDepth = 0;
     std::optional<rust::Box<acadctl::NativeValueWriter>> valueWriter;
   };
 
-  static acadctl::NativeExecutionFinalizationObservation
-  finalizationObservation(const DocumentContextDispatch &dispatch);
+  static acadctl::NativeExecFinalizationObservation
+  finalizationObservation(const DocContextDispatch &dispatch);
 
   static void runQueuedHistoryCommand();
 
@@ -269,13 +269,13 @@ private:
 
   void drainDatabaseChanges();
 
-  void drainDatabaseChanges(DocumentSubscription &subscription);
+  void drainDatabaseChanges(DocSubscription &subscription);
 
   void eraseDatabaseReactor(DatabaseReactor *reactor);
 
-  void detachDatabaseReactor(DocumentSubscription &subscription);
+  void detachDatabaseReactor(DocSubscription &subscription);
 
-  void refreshSubscription(DocumentSubscription &subscription);
+  void refreshSubscription(DocSubscription &subscription);
 
   void databaseWillBeDestroyed(AcDbDatabase *database);
 
@@ -285,9 +285,9 @@ private:
 
   void unsubscribe(AcApDocument *document);
 
-  class DocumentReactor final : public AcApDocManagerReactor {
+  class DocReactor final : public AcApDocManagerReactor {
   public:
-    explicit DocumentReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
+    explicit DocReactor(ObjectArxBridge &bridge) : bridge_(bridge) {}
 
     void documentCreated(AcApDocument *document) override {
       bridge_.subscribe(document);
@@ -379,14 +379,14 @@ private:
     ObjectArxBridge &bridge_;
   };
 
-  std::vector<DocumentSubscription> subscriptions_;
+  std::vector<DocSubscription> subscriptions_;
   std::vector<std::unique_ptr<DatabaseReactor>> databaseReactors_;
-  DocumentReactor documentReactor_;
+  DocReactor documentReactor_;
   EditorReactor editorReactor_;
   std::atomic<bool> documentSnapshotStale_{false};
   bool databaseReactorOwnershipUncertain_ = false;
   bool historyCommandRegistered_ = false;
-  std::optional<DocumentContextDispatch> documentContextDispatch_;
+  std::optional<DocContextDispatch> documentContextDispatch_;
 
   static ObjectArxBridge *commandBridge_;
 };
@@ -407,13 +407,13 @@ acadctl::NativeActionResult bridgeFailure(
   return {kind, status, rust::String()};
 }
 
-acadctl::NativeExecutionStepResult stepSuccess() {
-  return {acadctl::NativeExecutionStepResultKind::Success, 0, 0,
+acadctl::NativeExecStepResult stepSuccess() {
+  return {acadctl::NativeExecStepResultKind::Success, 0, 0,
           rust::String(), 0};
 }
 
-acadctl::NativeExecutionStepResult stepNativeFailure(int status) {
-  return {acadctl::NativeExecutionStepResultKind::NativeError, status, 0,
+acadctl::NativeExecStepResult stepNativeFailure(int status) {
+  return {acadctl::NativeExecStepResultKind::NativeError, status, 0,
           rust::String(), 0};
 }
 
@@ -843,7 +843,7 @@ finishEvaluation(acadctl::NativeBridgeCleanupPlan plan) {
 }
 
 acadctl::NativeBridgeStepResult
-finishEvaluation(acadctl::NativeExecutionStepResult result,
+finishEvaluation(acadctl::NativeExecStepResult result,
                  bool retainValueOnSuccess) {
   return finishEvaluation(acadctl::prepare_bridge_cleanup(
       std::move(result), retainValueOnSuccess));
@@ -932,7 +932,7 @@ acadctl::NativeBridgeCleanupPlan valueVisitorOutcome(int commandStatus) {
 }
 
 struct UndoCommandResult {
-  acadctl::NativeExecutionStepResult result;
+  acadctl::NativeExecStepResult result;
   UndoGroupState state;
 };
 
@@ -988,7 +988,7 @@ UndoCommandResult rollbackUndoGroup(UndoGroupState state,
   }
 
   if (end.result.kind !=
-      acadctl::NativeExecutionStepResultKind::Success) {
+      acadctl::NativeExecStepResultKind::Success) {
     return {std::move(end.result), finalState};
   }
 
@@ -1040,7 +1040,7 @@ acadctl::NativeActionResult abandonLostExecutionContext(
   if (!acadctl::abandon_execution(
           jobId,
           stepNativeFailure(cleanupStatus == RTNORM ? RTERROR : cleanupStatus))) {
-    return bridgeFailure(acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+    return bridgeFailure(acadctl::NativeActionResultKind::ExecBridgeFailed,
                          RTERROR);
   }
 
@@ -1120,7 +1120,7 @@ bool ObjectArxBridge::stop() {
     historyCommandRegistered_ = false;
   }
 
-  for (DocumentSubscription &subscription : subscriptions_) {
+  for (DocSubscription &subscription : subscriptions_) {
     detachDatabaseReactor(subscription);
   }
 
@@ -1164,9 +1164,9 @@ void ObjectArxBridge::processNextAction() {
       actionResult =
           matchesDatabase(target, action.database_token)
               ? save(target)
-              : result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
+              : result(acadctl::NativeActionResultKind::DocGenerationChanged);
     } else {
-      actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+      actionResult = result(acadctl::NativeActionResultKind::DocGone);
     }
 
     break;
@@ -1175,15 +1175,15 @@ void ObjectArxBridge::processNextAction() {
       actionResult =
           matchesDatabase(target, action.database_token)
               ? close(target, action.discard)
-              : result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
+              : result(acadctl::NativeActionResultKind::DocGenerationChanged);
     } else {
-      actionResult = result(acadctl::NativeActionResultKind::DocumentGone);
+      actionResult = result(acadctl::NativeActionResultKind::DocGone);
     }
 
     break;
   case acadctl::NativeActionKind::Undo:
   case acadctl::NativeActionKind::Redo:
-  case acadctl::NativeActionKind::QueueExecutionDriver:
+  case acadctl::NativeActionKind::QueueExecDriver:
     if (queueDocumentContextDispatch(action, actionResult)) {
       return;
     }
@@ -1210,7 +1210,7 @@ void ObjectArxBridge::setLispFunctionsDefined(AcApDocument *document,
 
   const auto subscription =
       std::find_if(subscriptions_.begin(), subscriptions_.end(),
-                   [document](const DocumentSubscription &candidate) {
+                   [document](const DocSubscription &candidate) {
                      return candidate.document == document;
                    });
 
@@ -1228,7 +1228,7 @@ void ObjectArxBridge::setLispFunctionsDefined(AcApDocument *document,
 AcApDocument *ObjectArxBridge::document(std::size_t token) {
   const auto subscription = std::find_if(
       subscriptions_.begin(), subscriptions_.end(),
-      [token](const DocumentSubscription &candidate) {
+      [token](const DocSubscription &candidate) {
         return static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(
                    candidate.document)) == token;
       });
@@ -1240,7 +1240,7 @@ AcApDocument *ObjectArxBridge::document(std::size_t token) {
 bool ObjectArxBridge::lispFunctionsDefined(AcApDocument *document) const {
   const auto subscription =
       std::find_if(subscriptions_.begin(), subscriptions_.end(),
-                   [document](const DocumentSubscription &candidate) {
+                   [document](const DocSubscription &candidate) {
                      return candidate.document == document;
                    });
 
@@ -1354,26 +1354,26 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     acadctl::NativeActionResult &failure) {
   if (documentContextDispatch_) {
     failure = bridgeFailure(
-        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
+        acadctl::NativeActionResultKind::DocContextFailed, RTERROR);
 
     return false;
   }
 
-  DocumentContextDispatch::Kind kind;
+  DocContextDispatch::Kind kind;
 
   switch (action.kind) {
   case acadctl::NativeActionKind::Undo:
-    kind = DocumentContextDispatch::Kind::Undo;
+    kind = DocContextDispatch::Kind::Undo;
     break;
   case acadctl::NativeActionKind::Redo:
-    kind = DocumentContextDispatch::Kind::Redo;
+    kind = DocContextDispatch::Kind::Redo;
     break;
-  case acadctl::NativeActionKind::QueueExecutionDriver:
-    kind = DocumentContextDispatch::Kind::ExecutionDriver;
+  case acadctl::NativeActionKind::QueueExecDriver:
+    kind = DocContextDispatch::Kind::ExecDriver;
     break;
   default:
     failure = bridgeFailure(
-        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
+        acadctl::NativeActionResultKind::DocContextFailed, RTERROR);
 
     return false;
   }
@@ -1381,22 +1381,22 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   AcApDocument *target = document(action.document_token);
 
   if (!target) {
-    failure = result(acadctl::NativeActionResultKind::DocumentGone);
+    failure = result(acadctl::NativeActionResultKind::DocGone);
 
     return false;
   }
 
   if (!matchesDatabase(target, action.database_token)) {
     failure =
-        result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
+        result(acadctl::NativeActionResultKind::DocGenerationChanged);
 
     return false;
   }
 
-  if (kind == DocumentContextDispatch::Kind::ExecutionDriver) {
+  if (kind == DocContextDispatch::Kind::ExecDriver) {
     if (!lispFunctionsDefined(target)) {
       failure = bridgeFailure(
-          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
+          acadctl::NativeActionResultKind::ExecBridgeFailed, RTERROR);
 
       return false;
     }
@@ -1411,7 +1411,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   AcApDocument *previousActive = acDocManager->mdiActiveDocument();
 
   if (!previousActive) {
-    failure = nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
+    failure = nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
                             Acad::eNoDocument);
 
     return false;
@@ -1440,13 +1440,13 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   }
 
   if (pendingInput < 0) {
-    failure = bridgeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
+    failure = bridgeFailure(acadctl::NativeActionResultKind::DocContextFailed,
                             RTERROR);
 
     return false;
   }
 
-  documentContextDispatch_.emplace(DocumentContextDispatch{
+  documentContextDispatch_.emplace(DocContextDispatch{
       action.job_id,
       action.document_token,
       action.database_token,
@@ -1455,12 +1455,12 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
       kind,
       restorePreviousActive,
       result(acadctl::NativeActionResultKind::Success),
-      DocumentContextDispatch::Phase::Queued,
+      DocContextDispatch::Phase::Queued,
   });
 
   nativeActionCallbacksOutstanding.fetch_add(1, std::memory_order_seq_cst);
   const ACHAR *invocation =
-      kind == DocumentContextDispatch::Kind::ExecutionDriver
+      kind == DocContextDispatch::Kind::ExecDriver
           ? bridgeProtocol().executionDriverInvocation.kACharPtr()
           : kHistoryCommandInvocation;
   const Acad::ErrorStatus scheduleStatus =
@@ -1473,7 +1473,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
 
   nativeActionCallbacksOutstanding.fetch_sub(1, std::memory_order_seq_cst);
   documentContextDispatch_.reset();
-  failure = nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
+  failure = nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
                           scheduleStatus);
 
   Acad::ErrorStatus restoreStatus = Acad::eOk;
@@ -1487,7 +1487,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
       acDocManager->mdiActiveDocument() != previousActive ||
       acDocManager->curDocument() != previousActive) {
     failure = nativeFailure(
-        acadctl::NativeActionResultKind::DocumentContextRestoreFailed,
+        acadctl::NativeActionResultKind::DocContextRestoreFailed,
         restoreStatus == Acad::eOk ? Acad::eInvalidContext : restoreStatus);
   }
 
@@ -1499,8 +1499,8 @@ void ObjectArxBridge::scheduleDocumentContextFinalizer() {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *documentContextDispatch_;
-  dispatch.phase = DocumentContextDispatch::Phase::Finalizing;
+  DocContextDispatch &dispatch = *documentContextDispatch_;
+  dispatch.phase = DocContextDispatch::Phase::Finalizing;
   const Acad::ErrorStatus scheduleStatus =
       acDocManager->beginExecuteInApplicationContext(finalizeDocumentContextDispatch,
                                                      nullptr);
@@ -1510,12 +1510,12 @@ void ObjectArxBridge::scheduleDocumentContextFinalizer() {
   }
 
   dispatch.dispatchResult = nativeFailure(
-      acadctl::NativeActionResultKind::DocumentContextRestoreFailed, scheduleStatus);
+      acadctl::NativeActionResultKind::DocContextRestoreFailed, scheduleStatus);
   const std::uint64_t jobId = dispatch.jobId;
   acadctl::NativeActionResult dispatchResult = std::move(dispatch.dispatchResult);
   const bool executionDriver =
-      dispatch.kind == DocumentContextDispatch::Kind::ExecutionDriver;
-  const acadctl::NativeExecutionFinalizationObservation observation =
+      dispatch.kind == DocContextDispatch::Kind::ExecDriver;
+  const acadctl::NativeExecFinalizationObservation observation =
       finalizationObservation(dispatch);
   documentContextDispatch_.reset();
   if (executionDriver) {
@@ -1530,13 +1530,13 @@ void ObjectArxBridge::scheduleDocumentContextFinalizer() {
 void ObjectArxBridge::queuedHistoryCommandTerminated(
     const ACHAR *commandName) {
   if (!documentContextDispatch_ ||
-      documentContextDispatch_->phase != DocumentContextDispatch::Phase::Queued ||
+      documentContextDispatch_->phase != DocContextDispatch::Phase::Queued ||
       !commandName) {
     return;
   }
 
   if (documentContextDispatch_->kind ==
-      DocumentContextDispatch::Kind::ExecutionDriver) {
+      DocContextDispatch::Kind::ExecDriver) {
     return;
   }
 
@@ -1560,22 +1560,22 @@ void ObjectArxBridge::queuedHistoryCommandTerminated(
 void ObjectArxBridge::queuedExecutionDriverStarted(const ACHAR *firstLine) {
   if (!documentContextDispatch_ ||
       (documentContextDispatch_->phase !=
-           DocumentContextDispatch::Phase::Queued &&
+           DocContextDispatch::Phase::Queued &&
        documentContextDispatch_->phase !=
-           DocumentContextDispatch::Phase::Running) ||
-      documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
+           DocContextDispatch::Phase::Running) ||
+      documentContextDispatch_->kind != DocContextDispatch::Kind::ExecDriver ||
       !firstLine) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *documentContextDispatch_;
+  DocContextDispatch &dispatch = *documentContextDispatch_;
 
   if (dispatch.driverLifecycle !=
-      DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart) {
+      DocContextDispatch::ExecDriverLifecycle::AwaitingStart) {
     if (dispatch.driverLifecycle ==
-            DocumentContextDispatch::ExecutionDriverLifecycle::EndedDuringCallback ||
+            DocContextDispatch::ExecDriverLifecycle::EndedDuringCallback ||
         dispatch.driverLifecycle ==
-            DocumentContextDispatch::ExecutionDriverLifecycle::Finalizing) {
+            DocContextDispatch::ExecDriverLifecycle::Finalizing) {
       return;
     }
 
@@ -1604,36 +1604,36 @@ void ObjectArxBridge::queuedExecutionDriverStarted(const ACHAR *firstLine) {
   }
 
   dispatch.driverLifecycle =
-      DocumentContextDispatch::ExecutionDriverLifecycle::Running;
+      DocContextDispatch::ExecDriverLifecycle::Running;
   dispatch.lispDepth = 1;
 }
 
 void ObjectArxBridge::failExecutionDriver() {
   if (!documentContextDispatch_ ||
-      documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
+      documentContextDispatch_->kind != DocContextDispatch::Kind::ExecDriver ||
       documentContextDispatch_->phase ==
-          DocumentContextDispatch::Phase::Finalizing) {
+          DocContextDispatch::Phase::Finalizing) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *documentContextDispatch_;
+  DocContextDispatch &dispatch = *documentContextDispatch_;
   finishValueWriter(dispatch.valueWriter, false);
 
   dispatch.dispatchResult = bridgeFailure(
-      acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+      acadctl::NativeActionResultKind::ExecBridgeFailed,
       RTERROR);
   scheduleExecutionDispatchFinalizer();
 }
 
 void ObjectArxBridge::recoverCancelledExecutionDriver() {
   if (!documentContextDispatch_ ||
-      documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
+      documentContextDispatch_->kind != DocContextDispatch::Kind::ExecDriver ||
       documentContextDispatch_->phase ==
-          DocumentContextDispatch::Phase::Finalizing) {
+          DocContextDispatch::Phase::Finalizing) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *documentContextDispatch_;
+  DocContextDispatch &dispatch = *documentContextDispatch_;
   finishValueWriter(dispatch.valueWriter, true);
 
   AcApDocument *target = document(dispatch.documentToken);
@@ -1642,7 +1642,7 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
       !matchesExecutionContext(target, dispatch.databaseToken, target)) {
     dispatch.bridgeSymbolsMayBeRetained =
         dispatch.bridgeSymbolsMayBeRetained ||
-        dispatch.stagedFormKind != DocumentContextDispatch::StagedFormKind::None;
+        dispatch.stagedFormKind != DocContextDispatch::StagedFormKind::None;
     dispatch.dispatchResult = abandonLostExecutionContext(
         dispatch.jobId, target, dispatch.databaseToken, target,
         dispatch.bridgeSymbolsMayBeRetained);
@@ -1654,22 +1654,22 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
   bool interruptedStepRecorded = false;
 
   if (dispatch.stagedFormKind ==
-      DocumentContextDispatch::StagedFormKind::Evaluator) {
+      DocContextDispatch::StagedFormKind::Evaluator) {
     acadctl::NativeBridgeStepResult interrupted =
         finishEvaluation(stepNativeFailure(RTERROR), false);
     dispatch.bridgeSymbolsMayBeRetained =
         interrupted.bridge_symbols_may_be_retained;
-    dispatch.stagedFormKind = DocumentContextDispatch::StagedFormKind::None;
+    dispatch.stagedFormKind = DocContextDispatch::StagedFormKind::None;
     interruptedStepRecorded =
         acadctl::complete_execution_step(dispatch.jobId,
                                          std::move(interrupted.result));
   } else if (dispatch.stagedFormKind ==
-             DocumentContextDispatch::StagedFormKind::ValueVisitor) {
+             DocContextDispatch::StagedFormKind::ValueVisitor) {
     acadctl::NativeBridgeStepResult interrupted =
         finishEvaluation(stepNativeFailure(RTERROR), false);
     dispatch.bridgeSymbolsMayBeRetained =
         interrupted.bridge_symbols_may_be_retained;
-    dispatch.stagedFormKind = DocumentContextDispatch::StagedFormKind::None;
+    dispatch.stagedFormKind = DocContextDispatch::StagedFormKind::None;
     interruptedStepRecorded = acadctl::complete_execution_step(
         dispatch.jobId, std::move(interrupted.result));
   }
@@ -1681,15 +1681,15 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
 
   if (!interruptedStepRecorded) {
     dispatch.dispatchResult = bridgeFailure(
-        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
+        acadctl::NativeActionResultKind::ExecBridgeFailed, RTERROR);
     scheduleExecutionDispatchFinalizer();
 
     return;
   }
 
-  dispatch.phase = DocumentContextDispatch::Phase::Queued;
+  dispatch.phase = DocContextDispatch::Phase::Queued;
   dispatch.driverLifecycle =
-      DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart;
+      DocContextDispatch::ExecDriverLifecycle::AwaitingStart;
   dispatch.lispDepth = 0;
   const Acad::ErrorStatus scheduleStatus = acDocManager->sendStringToExecute(
       target, bridgeProtocol().executionDriverInvocation.kACharPtr(), true,
@@ -1697,7 +1697,7 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
 
   if (scheduleStatus != Acad::eOk) {
     dispatch.dispatchResult = nativeFailure(
-        acadctl::NativeActionResultKind::DocumentContextFailed,
+        acadctl::NativeActionResultKind::DocContextFailed,
         scheduleStatus);
     scheduleExecutionDispatchFinalizer();
   }
@@ -1705,30 +1705,30 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
 
 void ObjectArxBridge::scheduleExecutionDispatchFinalizer() {
   if (!documentContextDispatch_ ||
-      documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver) {
+      documentContextDispatch_->kind != DocContextDispatch::Kind::ExecDriver) {
     return;
   }
 
   documentContextDispatch_->driverLifecycle =
-      DocumentContextDispatch::ExecutionDriverLifecycle::Finalizing;
+      DocContextDispatch::ExecDriverLifecycle::Finalizing;
   scheduleDocumentContextFinalizer();
 }
 
 void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
   if (!documentContextDispatch_ ||
       (documentContextDispatch_->phase !=
-           DocumentContextDispatch::Phase::Queued &&
+           DocContextDispatch::Phase::Queued &&
        documentContextDispatch_->phase !=
-           DocumentContextDispatch::Phase::Running) ||
-      documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
+           DocContextDispatch::Phase::Running) ||
+      documentContextDispatch_->kind != DocContextDispatch::Kind::ExecDriver ||
       documentContextDispatch_->driverLifecycle ==
-          DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart ||
+          DocContextDispatch::ExecDriverLifecycle::AwaitingStart ||
       documentContextDispatch_->driverLifecycle ==
-          DocumentContextDispatch::ExecutionDriverLifecycle::Finalizing) {
+          DocContextDispatch::ExecDriverLifecycle::Finalizing) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *documentContextDispatch_;
+  DocContextDispatch &dispatch = *documentContextDispatch_;
 
   if (cancelled) {
     recoverCancelledExecutionDriver();
@@ -1745,11 +1745,11 @@ void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
   dispatch.lispDepth = 0;
 
   if (dispatch.driverLifecycle ==
-      DocumentContextDispatch::ExecutionDriverLifecycle::InCallback) {
+      DocContextDispatch::ExecDriverLifecycle::InCallback) {
     dispatch.driverLifecycle =
-        DocumentContextDispatch::ExecutionDriverLifecycle::EndedDuringCallback;
+        DocContextDispatch::ExecDriverLifecycle::EndedDuringCallback;
   } else if (dispatch.driverLifecycle ==
-             DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingEnd) {
+             DocContextDispatch::ExecDriverLifecycle::AwaitingEnd) {
     scheduleExecutionDispatchFinalizer();
   } else {
     failExecutionDriver();
@@ -1758,26 +1758,26 @@ void ObjectArxBridge::queuedExecutionDriverTerminated(bool cancelled) {
 
 void ObjectArxBridge::finishAdvanceCallback(AdvanceCompletion completion) {
   if (!documentContextDispatch_ ||
-      documentContextDispatch_->kind != DocumentContextDispatch::Kind::ExecutionDriver ||
+      documentContextDispatch_->kind != DocContextDispatch::Kind::ExecDriver ||
       documentContextDispatch_->phase ==
-          DocumentContextDispatch::Phase::Finalizing) {
+          DocContextDispatch::Phase::Finalizing) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *documentContextDispatch_;
+  DocContextDispatch &dispatch = *documentContextDispatch_;
   if (dispatch.driverLifecycle ==
-      DocumentContextDispatch::ExecutionDriverLifecycle::EndedDuringCallback) {
+      DocContextDispatch::ExecDriverLifecycle::EndedDuringCallback) {
     if (completion == AdvanceCompletion::ExitReady) {
       scheduleExecutionDispatchFinalizer();
     } else {
       failExecutionDriver();
     }
   } else if (dispatch.driverLifecycle ==
-             DocumentContextDispatch::ExecutionDriverLifecycle::InCallback) {
+             DocContextDispatch::ExecDriverLifecycle::InCallback) {
     dispatch.driverLifecycle =
         completion == AdvanceCompletion::ExitReady
-            ? DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingEnd
-            : DocumentContextDispatch::ExecutionDriverLifecycle::Running;
+            ? DocContextDispatch::ExecDriverLifecycle::AwaitingEnd
+            : DocContextDispatch::ExecDriverLifecycle::Running;
   } else {
     failExecutionDriver();
   }
@@ -1788,52 +1788,52 @@ int acadctlAdvanceExecution() noexcept {
 
   if (!bridge || !bridge->documentContextDispatch_ ||
       (bridge->documentContextDispatch_->phase !=
-           ObjectArxBridge::DocumentContextDispatch::Phase::Queued &&
+           ObjectArxBridge::DocContextDispatch::Phase::Queued &&
        bridge->documentContextDispatch_->phase !=
-           ObjectArxBridge::DocumentContextDispatch::Phase::Running) ||
+           ObjectArxBridge::DocContextDispatch::Phase::Running) ||
       bridge->documentContextDispatch_->kind !=
-          ObjectArxBridge::DocumentContextDispatch::Kind::ExecutionDriver) {
+          ObjectArxBridge::DocContextDispatch::Kind::ExecDriver) {
     return acedRetNil() == RTNORM ? RSRSLT : RSERR;
   }
 
-  ObjectArxBridge::DocumentContextDispatch &dispatch =
+  ObjectArxBridge::DocContextDispatch &dispatch =
       *bridge->documentContextDispatch_;
 
   if (dispatch.driverLifecycle ==
-      ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::AwaitingStart) {
+      ObjectArxBridge::DocContextDispatch::ExecDriverLifecycle::AwaitingStart) {
     dispatch.driverLifecycle =
-        ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::Running;
+        ObjectArxBridge::DocContextDispatch::ExecDriverLifecycle::Running;
     dispatch.lispDepth = 1;
   }
 
   if (dispatch.driverLifecycle !=
-      ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::Running) {
+      ObjectArxBridge::DocContextDispatch::ExecDriverLifecycle::Running) {
     bridge->failExecutionDriver();
 
     return acedRetNil() == RTNORM ? RSRSLT : RSERR;
   }
 
-  dispatch.phase = ObjectArxBridge::DocumentContextDispatch::Phase::Running;
+  dispatch.phase = ObjectArxBridge::DocContextDispatch::Phase::Running;
   dispatch.driverLifecycle =
-      ObjectArxBridge::DocumentContextDispatch::ExecutionDriverLifecycle::InCallback;
+      ObjectArxBridge::DocContextDispatch::ExecDriverLifecycle::InCallback;
   bool evaluateStagedForm = false;
   try {
     AcApDocument *target = bridge->document(dispatch.documentToken);
 
     if (!target) {
       dispatch.dispatchResult =
-          result(acadctl::NativeActionResultKind::DocumentGone);
+          result(acadctl::NativeActionResultKind::DocGone);
     } else if (!matchesDatabase(target, dispatch.databaseToken)) {
       dispatch.dispatchResult =
-          result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
+          result(acadctl::NativeActionResultKind::DocGenerationChanged);
     } else if (acDocManager->mdiActiveDocument() != target ||
                acDocManager->curDocument() != target) {
       dispatch.dispatchResult = nativeFailure(
-          acadctl::NativeActionResultKind::DocumentContextFailed,
+          acadctl::NativeActionResultKind::DocContextFailed,
           Acad::eInvalidContext);
     } else if (!bridge->lispFunctionsDefined(target)) {
       dispatch.dispatchResult = bridgeFailure(
-          acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
+          acadctl::NativeActionResultKind::ExecBridgeFailed, RTERROR);
     } else if (!target->database()->undoRecording()) {
       dispatch.dispatchResult =
           result(acadctl::NativeActionResultKind::UndoDisabled);
@@ -1848,20 +1848,20 @@ int acadctlAdvanceExecution() noexcept {
           static_cast<Adesk::UInt32>(visitor.size()));
 
       if (dispatch.stagedFormKind ==
-          ObjectArxBridge::DocumentContextDispatch::StagedFormKind::Evaluator) {
+          ObjectArxBridge::DocContextDispatch::StagedFormKind::Evaluator) {
         finishValueWriter(dispatch.valueWriter, true);
         acadctl::NativeBridgeStepResult evaluation =
             finishEvaluation(collectEvaluation(dispatch.retainValue));
         dispatch.bridgeSymbolsMayBeRetained =
             evaluation.bridge_symbols_may_be_retained;
         dispatch.stagedFormKind =
-            ObjectArxBridge::DocumentContextDispatch::StagedFormKind::None;
+            ObjectArxBridge::DocContextDispatch::StagedFormKind::None;
 
         int observationStatus = RTERROR;
         dispatch.undoGroup = observeUndoGroup(observationStatus);
 
         if (evaluation.result.kind ==
-                acadctl::NativeExecutionStepResultKind::Success &&
+                acadctl::NativeExecStepResultKind::Success &&
             dispatch.undoGroup != UndoGroupState::Active) {
           evaluation.result = stepNativeFailure(
               dispatch.undoGroup == UndoGroupState::Unknown
@@ -1872,24 +1872,24 @@ int acadctlAdvanceExecution() noexcept {
         if (!acadctl::complete_execution_step(
                 dispatch.jobId, std::move(evaluation.result))) {
           dispatch.dispatchResult = bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+              acadctl::NativeActionResultKind::ExecBridgeFailed,
               RTERROR);
         }
       } else if (dispatch.stagedFormKind ==
-                 ObjectArxBridge::DocumentContextDispatch::StagedFormKind::ValueVisitor) {
+                 ObjectArxBridge::DocContextDispatch::StagedFormKind::ValueVisitor) {
         activeValueWriter = nullptr;
         acadctl::NativeBridgeStepResult emission =
             finishEvaluation(valueVisitorOutcome(RTNORM));
         dispatch.bridgeSymbolsMayBeRetained =
             emission.bridge_symbols_may_be_retained;
         dispatch.stagedFormKind =
-            ObjectArxBridge::DocumentContextDispatch::StagedFormKind::None;
+            ObjectArxBridge::DocContextDispatch::StagedFormKind::None;
         finishValueWriter(dispatch.valueWriter, false);
 
         if (!acadctl::complete_execution_step(
                 dispatch.jobId, std::move(emission.result))) {
           dispatch.dispatchResult = bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+              acadctl::NativeActionResultKind::ExecBridgeFailed,
               RTERROR);
         }
       }
@@ -1904,12 +1904,12 @@ int acadctlAdvanceExecution() noexcept {
           break;
         }
 
-        rust::Box<acadctl::NativeExecutionStep> step =
+        rust::Box<acadctl::NativeExecStep> step =
             acadctl::take_execution_step(dispatch.jobId);
-        const acadctl::NativeExecutionStepKind kind =
+        const acadctl::NativeExecStepKind kind =
             acadctl::execution_step_kind(*step);
 
-        if (kind == acadctl::NativeExecutionStepKind::Done) {
+        if (kind == acadctl::NativeExecStepKind::Done) {
           if (dispatch.undoGroup != UndoGroupState::Inactive) {
             UndoCommandResult cleanup =
                 dispatch.formHandedOff
@@ -1921,11 +1921,11 @@ int acadctlAdvanceExecution() noexcept {
             dispatch.undoGroup = cleanup.state;
 
             if (cleanup.result.kind !=
-                    acadctl::NativeExecutionStepResultKind::Success ||
+                    acadctl::NativeExecStepResultKind::Success ||
                 dispatch.undoGroup != UndoGroupState::Inactive) {
               dispatch.terminalCleanupFailed = true;
               dispatch.dispatchResult = bridgeFailure(
-                  acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+                  acadctl::NativeActionResultKind::ExecBridgeFailed,
                   cleanup.result.native_status == 0
                       ? RTERROR
                       : cleanup.result.native_status);
@@ -1939,7 +1939,7 @@ int acadctlAdvanceExecution() noexcept {
             if (dispatch.bridgeSymbolsMayBeRetained) {
               dispatch.terminalCleanupFailed = true;
               dispatch.dispatchResult = bridgeFailure(
-                  acadctl::NativeActionResultKind::ExecutionBridgeSymbolsClearFailed,
+                  acadctl::NativeActionResultKind::ExecBridgeSymbolsClearFailed,
                   cleanupStatus);
             }
           }
@@ -1947,18 +1947,18 @@ int acadctlAdvanceExecution() noexcept {
           break;
         }
 
-        if (kind == acadctl::NativeExecutionStepKind::Invalid) {
+        if (kind == acadctl::NativeExecStepKind::Invalid) {
           dispatch.dispatchResult = bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+              acadctl::NativeActionResultKind::ExecBridgeFailed,
               RTERROR);
           break;
         }
 
-        acadctl::NativeExecutionStepResult stepResult = stepSuccess();
+        acadctl::NativeExecStepResult stepResult = stepSuccess();
         UndoCommandResult undoTransition{stepSuccess(), dispatch.undoGroup};
 
         switch (kind) {
-        case acadctl::NativeExecutionStepKind::BeginUndoGroup:
+        case acadctl::NativeExecStepKind::BeginUndoGroup:
           undoTransition =
               runUndoCommand(ACRX_T("_Begin"), UndoGroupState::Active);
           stepResult = std::move(undoTransition.result);
@@ -1966,7 +1966,7 @@ int acadctlAdvanceExecution() noexcept {
           dispatch.executionUndoGroupMayHaveStarted =
               dispatch.undoGroup != UndoGroupState::Inactive;
           break;
-        case acadctl::NativeExecutionStepKind::EvaluateForm: {
+        case acadctl::NativeExecStepKind::EvaluateForm: {
           dispatch.formHandedOff = true;
           const bool retainValue =
               acadctl::execution_step_retain_value(*step);
@@ -1977,9 +1977,9 @@ int acadctlAdvanceExecution() noexcept {
               staging.bridge_symbols_may_be_retained;
 
           if (staging.result.kind ==
-              acadctl::NativeExecutionStepResultKind::Success) {
+              acadctl::NativeExecStepResultKind::Success) {
             dispatch.stagedFormKind =
-                ObjectArxBridge::DocumentContextDispatch::StagedFormKind::Evaluator;
+                ObjectArxBridge::DocContextDispatch::StagedFormKind::Evaluator;
             dispatch.retainValue = retainValue;
             evaluateStagedForm = true;
             break;
@@ -1989,20 +1989,20 @@ int acadctlAdvanceExecution() noexcept {
           break;
         }
 
-        case acadctl::NativeExecutionStepKind::CommitUndoGroup:
-        case acadctl::NativeExecutionStepKind::CloseEmptyUndoGroup:
+        case acadctl::NativeExecStepKind::CommitUndoGroup:
+        case acadctl::NativeExecStepKind::CloseEmptyUndoGroup:
           undoTransition =
               runUndoCommand(ACRX_T("_End"), UndoGroupState::Inactive);
           stepResult = std::move(undoTransition.result);
           dispatch.undoGroup = undoTransition.state;
           break;
-        case acadctl::NativeExecutionStepKind::RollbackUndoGroup:
+        case acadctl::NativeExecStepKind::RollbackUndoGroup:
           undoTransition = rollbackUndoGroup(
               dispatch.undoGroup, dispatch.executionUndoGroupMayHaveStarted);
           stepResult = std::move(undoTransition.result);
           dispatch.undoGroup = undoTransition.state;
           break;
-        case acadctl::NativeExecutionStepKind::ClearRetainedEvalValue: {
+        case acadctl::NativeExecStepKind::ClearRetainedEvalValue: {
           const int cleanupStatus = clearExecutionBridgeSymbols();
           stepResult = cleanupStatus == RTNORM
                            ? stepSuccess()
@@ -2011,7 +2011,7 @@ int acadctlAdvanceExecution() noexcept {
           break;
         }
 
-        case acadctl::NativeExecutionStepKind::EmitEvalValue: {
+        case acadctl::NativeExecStepKind::EmitEvalValue: {
           rust::Box<acadctl::NativeValueWriter> writer =
               acadctl::begin_eval_value(
                   dispatch.jobId, dispatch.documentToken,
@@ -2057,14 +2057,14 @@ int acadctlAdvanceExecution() noexcept {
           dispatch.valueWriter.emplace(std::move(writer));
           activeValueWriter = &**dispatch.valueWriter;
           dispatch.stagedFormKind =
-              ObjectArxBridge::DocumentContextDispatch::StagedFormKind::ValueVisitor;
+              ObjectArxBridge::DocContextDispatch::StagedFormKind::ValueVisitor;
           dispatch.bridgeSymbolsMayBeRetained = true;
           evaluateStagedForm = true;
           break;
         }
 
-        case acadctl::NativeExecutionStepKind::Invalid:
-        case acadctl::NativeExecutionStepKind::Done:
+        case acadctl::NativeExecStepKind::Invalid:
+        case acadctl::NativeExecStepKind::Done:
           break;
         }
 
@@ -2075,21 +2075,21 @@ int acadctlAdvanceExecution() noexcept {
         if (!acadctl::complete_execution_step(dispatch.jobId,
                                                std::move(stepResult))) {
           dispatch.dispatchResult = bridgeFailure(
-              acadctl::NativeActionResultKind::ExecutionBridgeFailed,
+              acadctl::NativeActionResultKind::ExecBridgeFailed,
               RTERROR);
         }
       }
     }
   } catch (...) {
     dispatch.dispatchResult = bridgeFailure(
-        acadctl::NativeActionResultKind::ExecutionBridgeFailed, RTERROR);
+        acadctl::NativeActionResultKind::ExecBridgeFailed, RTERROR);
   }
 
   const int returnStatus = evaluateStagedForm ? acedRetT() : acedRetNil();
 
   if (returnStatus != RTNORM) {
     dispatch.dispatchResult = bridgeFailure(
-        acadctl::NativeActionResultKind::ExecutionBridgeFailed, returnStatus);
+        acadctl::NativeActionResultKind::ExecBridgeFailed, returnStatus);
     evaluateStagedForm = false;
   }
 
@@ -2113,29 +2113,29 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
 
   if (!bridge || !bridge->documentContextDispatch_ ||
       bridge->documentContextDispatch_->phase !=
-          DocumentContextDispatch::Phase::Queued) {
+          DocContextDispatch::Phase::Queued) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *bridge->documentContextDispatch_;
+  DocContextDispatch &dispatch = *bridge->documentContextDispatch_;
 
-  if (dispatch.kind == DocumentContextDispatch::Kind::ExecutionDriver) {
+  if (dispatch.kind == DocContextDispatch::Kind::ExecDriver) {
     return;
   }
 
-  dispatch.phase = DocumentContextDispatch::Phase::Running;
+  dispatch.phase = DocContextDispatch::Phase::Running;
   AcApDocument *target = bridge->document(dispatch.documentToken);
 
   if (!target) {
     dispatch.dispatchResult =
-        result(acadctl::NativeActionResultKind::DocumentGone);
+        result(acadctl::NativeActionResultKind::DocGone);
   } else if (!matchesDatabase(target, dispatch.databaseToken)) {
     dispatch.dispatchResult =
-        result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
+        result(acadctl::NativeActionResultKind::DocGenerationChanged);
   } else if (acDocManager->mdiActiveDocument() != target ||
              acDocManager->curDocument() != target) {
     dispatch.dispatchResult = nativeFailure(
-        acadctl::NativeActionResultKind::DocumentContextFailed,
+        acadctl::NativeActionResultKind::DocContextFailed,
         Acad::eInvalidContext);
   } else {
     int undoStatus = RTERROR;
@@ -2150,7 +2150,7 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
     } else {
       const int status = acedCommandS(
           RTSTR,
-          dispatch.kind == DocumentContextDispatch::Kind::Redo
+          dispatch.kind == DocContextDispatch::Kind::Redo
               ? ACRX_T("_.REDO")
               : ACRX_T("_.U"),
           RTNONE);
@@ -2158,11 +2158,11 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
       if (acDocManager->mdiActiveDocument() != target ||
           acDocManager->curDocument() != target) {
         dispatch.dispatchResult = nativeFailure(
-            acadctl::NativeActionResultKind::DocumentContextFailed,
+            acadctl::NativeActionResultKind::DocContextFailed,
             Acad::eInvalidContext);
       } else if (!matchesDatabase(target, dispatch.databaseToken)) {
         dispatch.dispatchResult =
-            result(acadctl::NativeActionResultKind::DocumentGenerationChanged);
+            result(acadctl::NativeActionResultKind::DocGenerationChanged);
       } else if (status != RTNORM) {
         dispatch.dispatchResult = bridgeFailure(
             acadctl::NativeActionResultKind::HistoryFailed, status);
@@ -2173,13 +2173,13 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
   bridge->scheduleDocumentContextFinalizer();
 }
 
-acadctl::NativeExecutionFinalizationObservation
+acadctl::NativeExecFinalizationObservation
 ObjectArxBridge::finalizationObservation(
-    const DocumentContextDispatch &dispatch) {
+    const DocContextDispatch &dispatch) {
   return {
       dispatch.undoGroup != UndoGroupState::Inactive,
       dispatch.bridgeSymbolsMayBeRetained,
-      dispatch.stagedFormKind != DocumentContextDispatch::StagedFormKind::None,
+      dispatch.stagedFormKind != DocContextDispatch::StagedFormKind::None,
       dispatch.valueWriter.has_value(),
       dispatch.terminalCleanupFailed,
   };
@@ -2191,11 +2191,11 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void *) {
 
   if (!bridge || !bridge->documentContextDispatch_ ||
       bridge->documentContextDispatch_->phase !=
-          DocumentContextDispatch::Phase::Finalizing) {
+          DocContextDispatch::Phase::Finalizing) {
     return;
   }
 
-  DocumentContextDispatch &dispatch = *bridge->documentContextDispatch_;
+  DocContextDispatch &dispatch = *bridge->documentContextDispatch_;
 
   if (dispatch.restorePreviousActive) {
     AcApDocument *previousActive =
@@ -2210,7 +2210,7 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void *) {
         acDocManager->mdiActiveDocument() != previousActive ||
         acDocManager->curDocument() != previousActive) {
       dispatch.dispatchResult = nativeFailure(
-          acadctl::NativeActionResultKind::DocumentContextRestoreFailed,
+          acadctl::NativeActionResultKind::DocContextRestoreFailed,
           restoreStatus == Acad::eOk ? Acad::eInvalidContext : restoreStatus);
     }
   }
@@ -2219,8 +2219,8 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void *) {
   const std::uint64_t jobId = dispatch.jobId;
   acadctl::NativeActionResult dispatchResult = std::move(dispatch.dispatchResult);
   const bool executionDriver =
-      dispatch.kind == DocumentContextDispatch::Kind::ExecutionDriver;
-  const acadctl::NativeExecutionFinalizationObservation observation =
+      dispatch.kind == DocContextDispatch::Kind::ExecDriver;
+  const acadctl::NativeExecFinalizationObservation observation =
       finalizationObservation(dispatch);
   bridge->documentContextDispatch_.reset();
   if (executionDriver) {
@@ -2233,9 +2233,9 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void *) {
 }
 
 void ObjectArxBridge::publishDocumentSnapshot() {
-  rust::Vec<acadctl::NativeDocumentSnapshot> states;
+  rust::Vec<acadctl::NativeDocSnapshot> states;
 
-  for (DocumentSubscription &subscription : subscriptions_) {
+  for (DocSubscription &subscription : subscriptions_) {
     refreshSubscription(subscription);
 
     if (!subscription.database) {
@@ -2245,7 +2245,7 @@ void ObjectArxBridge::publishDocumentSnapshot() {
     AcApDocument *document = subscription.document;
     const bool named = document->isNamedDrawing();
     const AcString name(named ? document->fileName() : document->docTitle());
-    states.push_back(acadctl::NativeDocumentSnapshot{
+    states.push_back(acadctl::NativeDocSnapshot{
         static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
         static_cast<std::size_t>(
             reinterpret_cast<std::uintptr_t>(subscription.database)),
@@ -2276,13 +2276,13 @@ void ObjectArxBridge::refreshDocumentSnapshotIfStale() {
 }
 
 void ObjectArxBridge::drainDatabaseChanges() {
-  for (DocumentSubscription &subscription : subscriptions_) {
+  for (DocSubscription &subscription : subscriptions_) {
     drainDatabaseChanges(subscription);
   }
 }
 
 void ObjectArxBridge::drainDatabaseChanges(
-    DocumentSubscription &subscription) {
+    DocSubscription &subscription) {
   if (subscription.databaseReactor &&
       subscription.databaseReactor->takeChanged()) {
     documentSnapshotStale_.store(true, std::memory_order_relaxed);
@@ -2300,7 +2300,7 @@ void ObjectArxBridge::eraseDatabaseReactor(DatabaseReactor *reactor) {
 }
 
 void ObjectArxBridge::detachDatabaseReactor(
-    DocumentSubscription &subscription) {
+    DocSubscription &subscription) {
   if (!subscription.databaseReactor) {
     return;
   }
@@ -2335,7 +2335,7 @@ void ObjectArxBridge::detachDatabaseReactor(
   subscription.databaseReactor = nullptr;
 }
 
-void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
+void ObjectArxBridge::refreshSubscription(DocSubscription &subscription) {
   if (subscription.databaseReactor &&
       subscription.databaseReactor->databaseGone()) {
     AcDbDatabase *retiredDatabase = subscription.database;
@@ -2398,7 +2398,7 @@ void ObjectArxBridge::refreshSubscription(DocumentSubscription &subscription) {
 void ObjectArxBridge::subscribe(AcApDocument *document) {
   const auto alreadySubscribed =
       std::find_if(subscriptions_.begin(), subscriptions_.end(),
-                   [document](const DocumentSubscription &subscription) {
+                   [document](const DocSubscription &subscription) {
                      return subscription.document == document;
                    });
 
@@ -2407,14 +2407,14 @@ void ObjectArxBridge::subscribe(AcApDocument *document) {
   }
 
   subscriptions_.push_back(
-      DocumentSubscription{document, nullptr, nullptr, false, nullptr});
+      DocSubscription{document, nullptr, nullptr, false, nullptr});
   refreshSubscription(subscriptions_.back());
 }
 
 void ObjectArxBridge::databaseWillBeDestroyed(AcDbDatabase *database) {
   bool retiredSubscription = false;
 
-  for (DocumentSubscription &subscription : subscriptions_) {
+  for (DocSubscription &subscription : subscriptions_) {
     if (subscription.database != database) {
       continue;
     }
@@ -2433,7 +2433,7 @@ void ObjectArxBridge::databaseWillBeDestroyed(AcDbDatabase *database) {
 
 void ObjectArxBridge::actionTargetWillBeDestroyed(AcApDocument *document) {
   if (!documentContextDispatch_ ||
-      documentContextDispatch_->phase != DocumentContextDispatch::Phase::Queued) {
+      documentContextDispatch_->phase != DocContextDispatch::Phase::Queued) {
     return;
   }
 
@@ -2445,14 +2445,14 @@ void ObjectArxBridge::actionTargetWillBeDestroyed(AcApDocument *document) {
   }
 
   documentContextDispatch_->dispatchResult =
-      result(acadctl::NativeActionResultKind::DocumentGone);
+      result(acadctl::NativeActionResultKind::DocGone);
   scheduleDocumentContextFinalizer();
 }
 
 void ObjectArxBridge::unsubscribe(AcApDocument *document) {
   const auto subscription =
       std::find_if(subscriptions_.begin(), subscriptions_.end(),
-                   [document](const DocumentSubscription &candidate) {
+                   [document](const DocSubscription &candidate) {
                      return candidate.document == document;
                    });
 
@@ -2496,125 +2496,48 @@ extern "C" int acadctl_wake_native_actions() {
   return status;
 }
 
-extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
-                                           void *applicationId) {
-  switch (message) {
-  case AcRx::kInitAppMsg: {
-    acrxDynamicLinker->registerAppMDIAware(applicationId);
-    try {
-      objectArxBridge = std::make_unique<ObjectArxBridge>();
-    } catch (...) {
-      syslog(LOG_ERR, "acadctl plugin could not allocate its native bridge");
+void acadctl_disable_native_wakes() {
+  acceptNativeActionWakes.store(false, std::memory_order_seq_cst);
+}
 
-      return AcRx::kRetError;
-    }
+std::uint32_t acadctl_native_callbacks_outstanding() {
+  return nativeActionCallbacksOutstanding.load(std::memory_order_seq_cst);
+}
 
-    const auto failInitialization = []() {
-      acceptNativeActionWakes.store(false, std::memory_order_seq_cst);
-      acadctl::stop_rpc_server();
+void acadctl_create_bridge() {
+  objectArxBridge = std::make_unique<ObjectArxBridge>();
+}
 
-      if (nativeActionCallbacksOutstanding.load(std::memory_order_seq_cst) !=
-              0 ||
-          !objectArxBridge->stop()) {
-        syslog(LOG_ERR,
-               "acadctl plugin initialization failed after AutoCAD retained "
-               "a native callback; the inert module will remain loaded");
+Acad::ErrorStatus acadctl_start_bridge() {
+  return objectArxBridge->start();
+}
 
-        return AcRx::kRetOK;
-      }
+bool acadctl_stop_bridge() {
+  return !objectArxBridge || objectArxBridge->stop();
+}
 
-      objectArxBridge.reset();
+void acadctl_destroy_bridge() {
+  objectArxBridge.reset();
+}
 
-      return AcRx::kRetError;
-    };
+int acadctl_load_doc() {
+  const int status = defineLispFunctions();
 
-    try {
-      const Acad::ErrorStatus startStatus = objectArxBridge->start();
-
-      if (startStatus != Acad::eOk) {
-        syslog(LOG_ERR,
-               "acadctl plugin could not register its native command: %d",
-               static_cast<int>(startStatus));
-
-        return failInitialization();
-      }
-    } catch (...) {
-      syslog(LOG_ERR, "acadctl plugin initialization failed");
-
-      return failInitialization();
-    }
-
-    rust::String error = acadctl::start_rpc_server();
-
-    if (!error.empty()) {
-      syslog(LOG_ERR, "acadctl plugin failed to start: %s", error.c_str());
-
-      return failInitialization();
-    }
-
-    break;
+  if (objectArxBridge) {
+    objectArxBridge->setLispFunctionsDefined(acDocManager->curDocument(),
+                                             status == RTNORM);
   }
 
-  case AcRx::kLoadDwgMsg: {
-    const int status = defineLispFunctions();
+  return status;
+}
 
-    if (objectArxBridge) {
-      objectArxBridge->setLispFunctionsDefined(acDocManager->curDocument(),
-                                               status == RTNORM);
-    }
+int acadctl_unload_doc() {
+  AcApDocument *document = acDocManager->curDocument();
+  const int status = undefineLispFunctions();
 
-    if (status != RTNORM) {
-      syslog(LOG_ERR,
-             "acadctl plugin could not define its AutoLISP functions: %d",
-             status);
-    }
-
-    break;
+  if (objectArxBridge) {
+    objectArxBridge->setLispFunctionsDefined(document, false);
   }
 
-  case AcRx::kUnloadDwgMsg: {
-    AcApDocument *document = acDocManager->curDocument();
-    const int status = undefineLispFunctions();
-
-    if (objectArxBridge) {
-      objectArxBridge->setLispFunctionsDefined(document, false);
-    }
-
-    if (status != RTNORM) {
-      syslog(LOG_ERR,
-             "acadctl plugin could not undefine its AutoLISP functions: %d",
-             status);
-    }
-
-    break;
-  }
-
-  case AcRx::kUnloadAppMsg:
-    acceptNativeActionWakes.store(false, std::memory_order_seq_cst);
-    acadctl::stop_rpc_server();
-
-    if (nativeActionCallbacksOutstanding.load(std::memory_order_seq_cst) !=
-        0) {
-      syslog(LOG_ERR,
-             "acadctl plugin cannot unload while a native action callback is "
-             "outstanding");
-
-      return AcRx::kRetError;
-    }
-
-    if (objectArxBridge && !objectArxBridge->stop()) {
-      syslog(LOG_ERR,
-             "acadctl plugin cannot unload while AutoCAD may retain a "
-             "database reactor");
-
-      return AcRx::kRetError;
-    }
-
-    objectArxBridge.reset();
-    break;
-  default:
-    break;
-  }
-
-  return AcRx::kRetOK;
+  return status;
 }

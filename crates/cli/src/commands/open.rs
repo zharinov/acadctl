@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::{DrawingPath, OpenRequest, ProcessId};
 
-use crate::instances::Instance;
+use crate::instance::Instance;
 
 use super::{fail, query_error_message, request_error_message};
 
@@ -16,7 +16,7 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
     let process_id = match process_id {
         Some(process_id) => process_id,
         None => {
-            let instances = match crate::instances::list().await {
+            let instances = match crate::instance::list().await {
                 Ok(instances) => instances,
                 Err(_) => return fail("Could not inspect running AutoCAD instances.".into()),
             };
@@ -76,7 +76,7 @@ fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instances::{Instance, QueryError};
+    use crate::instance::{Instance, QueryError};
 
     #[test]
     fn selects_the_only_available_instance() {

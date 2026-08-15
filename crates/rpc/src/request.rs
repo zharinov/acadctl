@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::{
-    CloseRequest, DocumentId, DrawingPath, ExecutionMode, ExecutionRequest, HistoryRequest,
-    OpenRequest, SaveRequest,
+    CloseRequest, DocId, DrawingPath, ExecMode, ExecRequest, HistoryRequest, OpenRequest,
+    SaveRequest,
 };
 
 impl From<DrawingPath> for OpenRequest {
@@ -13,20 +13,20 @@ impl From<DrawingPath> for OpenRequest {
     }
 }
 
-impl From<DocumentId> for SaveRequest {
-    fn from(id: DocumentId) -> Self {
+impl From<DocId> for SaveRequest {
+    fn from(id: DocId) -> Self {
         Self { id: id.to_string() }
     }
 }
 
-impl From<DocumentId> for HistoryRequest {
-    fn from(id: DocumentId) -> Self {
+impl From<DocId> for HistoryRequest {
+    fn from(id: DocId) -> Self {
         Self { id: id.to_string() }
     }
 }
 
 impl CloseRequest {
-    pub fn new(id: DocumentId, discard: bool) -> Self {
+    pub fn new(id: DocId, discard: bool) -> Self {
         Self {
             id: id.to_string(),
             discard,
@@ -34,13 +34,8 @@ impl CloseRequest {
     }
 }
 
-impl ExecutionRequest {
-    pub fn new(
-        document_id: DocumentId,
-        mode: ExecutionMode,
-        source_name: String,
-        source: Bytes,
-    ) -> Self {
+impl ExecRequest {
+    pub fn new(document_id: DocId, mode: ExecMode, source_name: String, source: Bytes) -> Self {
         Self {
             document_id: document_id.to_string(),
             mode: mode as i32,

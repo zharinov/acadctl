@@ -1,11 +1,11 @@
 use std::fmt::Write;
 use std::sync::LazyLock;
 
-use crate::bridge_protocol;
+use crate::exec::protocol;
 
-use super::value_bridge::ValueEvent;
+use super::writer::ValueEvent;
 
-const TEMPLATE: &str = include_str!("../../lisp/eval-value-visitor.lsp");
+const TEMPLATE: &str = include_str!("../../../lisp/exec/visitor.lsp");
 static PROGRAM: LazyLock<Program> = LazyLock::new(Program::new);
 
 struct Program {
@@ -137,11 +137,11 @@ fn render() -> String {
 
 fn write_marker(output: &mut String, marker: &str) {
     let text = match marker {
-        "CALLBACK" => Some(bridge_protocol::VALUE_EVENT_FUNCTION),
-        "VALUE_SYMBOL" => Some(bridge_protocol::VALUE_SYMBOL),
-        "STATUS_SYMBOL" => Some(bridge_protocol::STATUS_SYMBOL),
-        "ERROR_SYMBOL" => Some(bridge_protocol::ERROR_SYMBOL),
-        "ERRNO_SYMBOL" => Some(bridge_protocol::ERRNO_SYMBOL),
+        "CALLBACK" => Some(protocol::VALUE_EVENT_FUNCTION),
+        "VALUE_SYMBOL" => Some(protocol::VALUE_SYMBOL),
+        "STATUS_SYMBOL" => Some(protocol::STATUS_SYMBOL),
+        "ERROR_SYMBOL" => Some(protocol::ERROR_SYMBOL),
+        "ERRNO_SYMBOL" => Some(protocol::ERRNO_SYMBOL),
         _ => None,
     };
 
@@ -152,8 +152,8 @@ fn write_marker(output: &mut String, marker: &str) {
     }
 
     let value = match marker {
-        "MAX_DEPTH" => bridge_protocol::VALUE_MAX_DEPTH,
-        "CHUNK_CHARS" => bridge_protocol::VALUE_CHUNK_CHARACTERS,
+        "MAX_DEPTH" => protocol::VALUE_MAX_DEPTH,
+        "CHUNK_CHARS" => protocol::VALUE_CHUNK_CHARACTERS,
         "BEGIN_LIST" => EventCode::BeginList as usize,
         "END_LIST" => EventCode::EndList as usize,
         "DOT" => EventCode::Dot as usize,

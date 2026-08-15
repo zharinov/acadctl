@@ -5,7 +5,7 @@ use acadctl_rpc::ProcessId;
 use tokio::time::{Instant, sleep};
 
 use super::fail;
-use crate::instances::{AutoCadProcess, autocad_processes};
+use crate::instance::{AutoCadProcess, autocad_processes};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);

@@ -1,4 +1,4 @@
-use super::{ExecutionStepResult, ExecutionStepResultKind, bounded_native_diagnostic};
+use super::{ExecStepResult, ExecStepResultKind, bounded_native_diagnostic};
 use crate::ffi::{
     NativeBridgeCleanupPlan as BridgeCleanupPlan, NativeBridgeStepResult as BridgeStepResult,
 };
@@ -41,8 +41,8 @@ pub(crate) fn interpret_lisp(
             )),
             LispStatus::True => success(),
             LispStatus::Other => native_error(observation.malformed_status),
-            LispStatus::Nil => ExecutionStepResult {
-                kind: ExecutionStepResultKind::LispError,
+            LispStatus::Nil => ExecStepResult {
+                kind: ExecStepResultKind::LispError,
                 native_status: 0,
                 lisp_errno: observation.errno.unwrap_or_default(),
                 detail: observation
@@ -58,10 +58,10 @@ pub(crate) fn interpret_lisp(
 }
 
 pub(crate) fn prepare_cleanup(
-    result: ExecutionStepResult,
+    result: ExecStepResult,
     retain_value_on_success: bool,
 ) -> BridgeCleanupPlan {
-    let retain_value = result.kind == ExecutionStepResultKind::Success && retain_value_on_success;
+    let retain_value = result.kind == ExecStepResultKind::Success && retain_value_on_success;
 
     BridgeCleanupPlan {
         result,
@@ -89,9 +89,9 @@ pub(crate) fn complete_cleanup(
     }
 }
 
-fn success() -> ExecutionStepResult {
-    ExecutionStepResult {
-        kind: ExecutionStepResultKind::Success,
+fn success() -> ExecStepResult {
+    ExecStepResult {
+        kind: ExecStepResultKind::Success,
         native_status: 0,
         lisp_errno: 0,
         detail: String::new(),
@@ -99,9 +99,9 @@ fn success() -> ExecutionStepResult {
     }
 }
 
-fn native_error(status: i32) -> ExecutionStepResult {
-    ExecutionStepResult {
-        kind: ExecutionStepResultKind::NativeError,
+fn native_error(status: i32) -> ExecStepResult {
+    ExecStepResult {
+        kind: ExecStepResultKind::NativeError,
         native_status: status,
         lisp_errno: 0,
         detail: String::new(),
@@ -131,11 +131,11 @@ mod tests {
     #[test]
     fn true_is_the_only_status_that_retains_a_requested_value() {
         let success = interpret_lisp(observation(LispStatus::True), true);
-        assert_eq!(success.result.kind, ExecutionStepResultKind::Success);
+        assert_eq!(success.result.kind, ExecStepResultKind::Success);
         assert!(success.retain_value);
 
         let malformed = interpret_lisp(observation(LispStatus::Other), true);
-        assert_eq!(malformed.result.kind, ExecutionStepResultKind::NativeError);
+        assert_eq!(malformed.result.kind, ExecStepResultKind::NativeError);
         assert_eq!(malformed.result.native_status, -5001);
         assert!(!malformed.retain_value);
     }
@@ -151,7 +151,7 @@ mod tests {
 
         let plan = interpret_lisp(value, false);
 
-        assert_eq!(plan.result.kind, ExecutionStepResultKind::LispError);
+        assert_eq!(plan.result.kind, ExecStepResultKind::LispError);
         assert_eq!(plan.result.lisp_errno, 7);
         assert!(plan.result.detail.ends_with("... [truncated]"));
         assert!(plan.result.detail.len() <= acadctl_rpc::MAX_DIAGNOSTIC_BYTES);

@@ -49,8 +49,8 @@ rm -rf "$build_bundle"
 mkdir -p "$build_plugin/Contents/MacOS"
 cp "$repo_root/crates/plugin/native/Info.plist" "$build_plugin/Contents/Info.plist"
 cp "$repo_root/crates/plugin/native/PackageContents.xml" "$build_bundle/PackageContents.xml"
-cp "$repo_root/crates/plugin/native/acadctl-loader.lsp" "$build_bundle/Contents/acadctl-loader.lsp"
-cp "$rust_target/acadctl-generated/$cargo_profile/execution-driver.lsp" "$build_bundle/Contents/execution-driver.lsp"
+cp "$repo_root/crates/plugin/native/loader.lsp" "$build_bundle/Contents/loader.lsp"
+cp "$rust_target/acadctl-generated/$cargo_profile/driver.lsp" "$build_bundle/Contents/driver.lsp"
 
 clang++ \
     -std=c++17 \
@@ -61,6 +61,7 @@ clang++ \
     -I"$rust_target/cxxbridge" \
     -L"$autocad_root/Contents/Frameworks" \
     -F"$autocad_root/Contents/Frameworks" \
+    "$repo_root/crates/plugin/native/entry.cpp" \
     "$repo_root/crates/plugin/native/host.cpp" \
     "$rust_target/$cargo_profile/libacadctl_plugin.a" \
     -lacfirst \

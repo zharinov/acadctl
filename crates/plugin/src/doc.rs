@@ -1,52 +1,52 @@
 use std::collections::HashSet;
 
-use acadctl_rpc::{DocumentId, DrawingPath};
+use acadctl_rpc::{DocId, DrawingPath};
 
-use crate::ffi::NativeDocumentSnapshot;
+use crate::ffi::NativeDocSnapshot;
 
 const DOCUMENT_ID_ALPHABET: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
 ];
-const DOCUMENT_ID_LENGTH: usize = DocumentId::HEX_WIDTH;
+const DOCUMENT_ID_LENGTH: usize = DocId::HEX_WIDTH;
 
-pub struct DocumentRegistry {
-    documents: Vec<TrackedDocument>,
+pub struct DocRegistry {
+    documents: Vec<TrackedDoc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Document {
-    pub id: DocumentId,
+pub struct Doc {
+    pub id: DocId,
     pub display_name: String,
     pub file_path: Option<String>,
     pub modified: bool,
     pub read_only: bool,
 }
 
-struct TrackedDocument {
-    native_key: NativeDocumentKey,
-    document: Document,
+struct TrackedDoc {
+    native_key: NativeDocKey,
+    document: Doc,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct NativeDocumentKey {
+pub struct NativeDocKey {
     pub document_token: usize,
     pub database_token: usize,
 }
 
 #[derive(Clone)]
-pub struct DocumentTarget {
-    pub native_key: NativeDocumentKey,
-    pub document: Document,
+pub struct DocTarget {
+    pub native_key: NativeDocKey,
+    pub document: Doc,
 }
 
-impl DocumentRegistry {
+impl DocRegistry {
     pub const fn new() -> Self {
         Self {
             documents: Vec::new(),
         }
     }
 
-    pub fn replace_snapshot(&mut self, native_documents: Vec<NativeDocumentSnapshot>) {
+    pub fn replace_snapshot(&mut self, native_documents: Vec<NativeDocSnapshot>) {
         let mut reserved_ids = self
             .documents
             .iter()
@@ -64,8 +64,8 @@ impl DocumentRegistry {
 
             let id = take_document_id(&mut previous, native.document_token)
                 .unwrap_or_else(|| new_document_id(&mut reserved_ids));
-            self.documents.push(TrackedDocument {
-                native_key: NativeDocumentKey {
+            self.documents.push(TrackedDoc {
+                native_key: NativeDocKey {
                     document_token: native.document_token,
                     database_token: native.database_token,
                 },
@@ -74,21 +74,21 @@ impl DocumentRegistry {
         }
     }
 
-    pub fn list(&self) -> Vec<Document> {
+    pub fn list(&self) -> Vec<Doc> {
         self.documents
             .iter()
             .map(|tracked| tracked.document.clone())
             .collect()
     }
 
-    pub fn find_by_id(&self, id: DocumentId) -> Option<DocumentTarget> {
+    pub fn find_by_id(&self, id: DocId) -> Option<DocTarget> {
         self.documents
             .iter()
             .find(|tracked| tracked.document.id == id)
             .map(document_target)
     }
 
-    pub fn find_by_path(&self, path: &DrawingPath) -> Option<DocumentTarget> {
+    pub fn find_by_path(&self, path: &DrawingPath) -> Option<DocTarget> {
         self.documents
             .iter()
             .find(|tracked| {
@@ -102,7 +102,7 @@ impl DocumentRegistry {
     }
 }
 
-fn public_document(id: DocumentId, native: NativeDocumentSnapshot) -> Document {
+fn public_document(id: DocId, native: NativeDocSnapshot) -> Doc {
     let name = document_name(native.name, native.named);
     let (display_name, file_path) = if native.named {
         let display_name = std::path::Path::new(&name)
@@ -115,7 +115,7 @@ fn public_document(id: DocumentId, native: NativeDocumentSnapshot) -> Document {
         (name, None)
     };
 
-    Document {
+    Doc {
         id,
         display_name,
         file_path,
@@ -124,24 +124,21 @@ fn public_document(id: DocumentId, native: NativeDocumentSnapshot) -> Document {
     }
 }
 
-fn document_target(tracked: &TrackedDocument) -> DocumentTarget {
-    DocumentTarget {
+fn document_target(tracked: &TrackedDoc) -> DocTarget {
+    DocTarget {
         native_key: tracked.native_key,
         document: tracked.document.clone(),
     }
 }
 
-fn take_document_id(
-    documents: &mut Vec<TrackedDocument>,
-    document_token: usize,
-) -> Option<DocumentId> {
+fn take_document_id(documents: &mut Vec<TrackedDoc>, document_token: usize) -> Option<DocId> {
     let position = documents
         .iter()
         .position(|document| document.native_key.document_token == document_token)?;
     Some(documents.swap_remove(position).document.id)
 }
 
-fn new_document_id(reserved_ids: &mut HashSet<DocumentId>) -> DocumentId {
+fn new_document_id(reserved_ids: &mut HashSet<DocId>) -> DocId {
     loop {
         let id = nanoid::nanoid!(DOCUMENT_ID_LENGTH, &DOCUMENT_ID_ALPHABET)
             .parse()
@@ -171,11 +168,11 @@ mod tests {
 
     #[test]
     fn preserves_identity_while_replacing_native_state() {
-        let mut documents = DocumentRegistry::new();
+        let mut documents = DocRegistry::new();
         documents.replace_snapshot(vec![named_document(1, "/tmp/house.dwg")]);
         let original_id = documents.list()[0].id;
 
-        documents.replace_snapshot(vec![NativeDocumentSnapshot {
+        documents.replace_snapshot(vec![NativeDocSnapshot {
             database_token: 99,
             modified: true,
             read_only: true,
@@ -201,7 +198,7 @@ mod tests {
 
     #[test]
     fn follows_native_order_and_removes_closed_documents() {
-        let mut documents = DocumentRegistry::new();
+        let mut documents = DocRegistry::new();
         documents.replace_snapshot(vec![
             named_document(1, "/tmp/house.dwg"),
             named_document(2, "/tmp/site.dwg"),
@@ -238,7 +235,7 @@ mod tests {
     fn finds_documents_by_id_and_named_path() {
         let house = drawing_path("house");
         let other = drawing_path("other");
-        let mut documents = DocumentRegistry::new();
+        let mut documents = DocRegistry::new();
         documents.replace_snapshot(vec![
             named_document(1, house.as_str()),
             unnamed_document(2, "Drawing1.dwg"),
@@ -248,7 +245,7 @@ mod tests {
         let by_id = documents.find_by_id(listed[0].id).unwrap();
         assert_eq!(
             by_id.native_key,
-            NativeDocumentKey {
+            NativeDocKey {
                 document_token: 1,
                 database_token: 101,
             }
@@ -269,8 +266,8 @@ mod tests {
         assert!(documents.find_by_path(&other).is_none());
     }
 
-    fn named_document(document_token: usize, name: &str) -> NativeDocumentSnapshot {
-        NativeDocumentSnapshot {
+    fn named_document(document_token: usize, name: &str) -> NativeDocSnapshot {
+        NativeDocSnapshot {
             document_token,
             database_token: document_token + 100,
             name: name.into(),
@@ -280,8 +277,8 @@ mod tests {
         }
     }
 
-    fn unnamed_document(document_token: usize, name: &str) -> NativeDocumentSnapshot {
-        NativeDocumentSnapshot {
+    fn unnamed_document(document_token: usize, name: &str) -> NativeDocSnapshot {
+        NativeDocSnapshot {
             named: false,
             ..named_document(document_token, name)
         }

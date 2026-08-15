@@ -1,6 +1,6 @@
 #[allow(dead_code, reason = "the Cargo build script renders this program")]
-const EXECUTION_DRIVER_TEMPLATE: &str = include_str!("lisp/execution-driver.lsp");
-const FORM_EVALUATOR_TEMPLATE: &str = include_str!("lisp/form-evaluator.lsp");
+const EXECUTION_DRIVER_TEMPLATE: &str = include_str!("../../lisp/exec/driver.lsp");
+const FORM_EVALUATOR_TEMPLATE: &str = include_str!("../../lisp/exec/evaluator.lsp");
 
 pub const VALUE_EVENT_FUNCTION: &str = "acadctl:_value-event";
 pub const ADVANCE_EXECUTION_FUNCTION: &str = "acadctl:_advance-execution";

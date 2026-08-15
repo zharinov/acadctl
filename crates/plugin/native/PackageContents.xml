@@ -14,7 +14,7 @@
     <ComponentEntry
         AppName="acadctl-loader"
         AppType="Lisp"
-        ModuleName="./Contents/acadctl-loader.lsp"
+        ModuleName="./Contents/loader.lsp"
         LoadOnAppearance="False"
         LoadOnAutoCADStartup="True" />
   </Components>

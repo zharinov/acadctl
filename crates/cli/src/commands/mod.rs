@@ -1,5 +1,5 @@
 pub mod close;
-pub mod execute;
+pub mod exec;
 pub mod history;
 pub mod kill;
 pub mod open;
@@ -12,9 +12,9 @@ use std::process::ExitCode;
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
-use crate::instances::QueryError;
+use crate::instance::QueryError;
 
-type DocumentClient = acadctl_rpc::DocumentServiceClient<Channel>;
+type DocClient = acadctl_rpc::DocServiceClient<Channel>;
 
 fn fail(message: String) -> ExitCode {
     eprintln!("acadctl: {message}");
@@ -42,8 +42,8 @@ fn query_error_message(error: &QueryError) -> String {
     }
 }
 
-async fn connect_documents(process_id: acadctl_rpc::ProcessId) -> Result<DocumentClient, String> {
-    crate::instances::connect_documents(process_id)
+async fn connect_documents(process_id: acadctl_rpc::ProcessId) -> Result<DocClient, String> {
+    crate::instance::connect_documents(process_id)
         .await
         .map_err(|error| query_error_message(&error))
 }

@@ -1,7 +1,7 @@
-mod document_id;
-mod drawing_path;
-mod process_id;
-mod requests;
+mod doc;
+mod path;
+mod pid;
+mod request;
 mod transport;
 
 use std::time::Duration;
@@ -10,21 +10,20 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
-pub use document_id::{DocumentId, ParseDocumentIdError};
-pub use drawing_path::{DrawingPath, DrawingPathError};
-pub use process_id::{ParseProcessIdError, ProcessId};
-pub use protocol::document_service_client::DocumentServiceClient;
-pub use protocol::document_service_server::{DocumentService, DocumentServiceServer};
-pub use protocol::execution_service_client::ExecutionServiceClient;
-pub use protocol::execution_service_server::{ExecutionService, ExecutionServiceServer};
+pub use doc::{DocId, ParseDocIdError};
+pub use path::{DrawingPath, DrawingPathError};
+pub use pid::{ParseProcessIdError, ProcessId};
+pub use protocol::doc_service_client::DocServiceClient;
+pub use protocol::doc_service_server::{DocService, DocServiceServer};
+pub use protocol::exec_service_client::ExecServiceClient;
+pub use protocol::exec_service_server::{ExecService, ExecServiceServer};
 pub use protocol::{
-    CloseRequest, CloseResponse, Document, DrawingOutcome, ExecutionAccepted,
-    ExecutionCancelAcknowledgement, ExecutionCancelDisposition, ExecutionCancelRequest,
-    ExecutionCancelled, ExecutionClientMessage, ExecutionFailure, ExecutionFinished, ExecutionMode,
-    ExecutionOutcome, ExecutionOutput, ExecutionRequest, ExecutionServerEvent, ExecutionSuccess,
+    CloseRequest, CloseResponse, Doc, DrawingOutcome, ExecAccepted, ExecCancelAcknowledgement,
+    ExecCancelDisposition, ExecCancelRequest, ExecCancelled, ExecClientMessage, ExecFailure,
+    ExecFinished, ExecMode, ExecOutcome, ExecOutput, ExecRequest, ExecServerEvent, ExecSuccess,
     HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-    SaveRequest, SaveResponse, SourceLocation, execution_client_message, execution_outcome,
-    execution_server_event,
+    SaveRequest, SaveResponse, SourceLocation, exec_client_message, exec_outcome,
+    exec_server_event,
 };
 pub use transport::{Incoming, discover, incoming};
 
@@ -47,22 +46,18 @@ pub const MAX_STREAMS_PER_CONNECTION: u32 = 1;
 
 pub async fn connect_documents(
     process_id: ProcessId,
-) -> Result<DocumentServiceClient<Channel>, tonic::transport::Error> {
-    Ok(
-        DocumentServiceClient::new(connect_channel(process_id).await?)
-            .max_encoding_message_size(MAX_DOCUMENT_REQUEST_BYTES)
-            .max_decoding_message_size(MAX_DOCUMENT_RESPONSE_BYTES),
-    )
+) -> Result<DocServiceClient<Channel>, tonic::transport::Error> {
+    Ok(DocServiceClient::new(connect_channel(process_id).await?)
+        .max_encoding_message_size(MAX_DOCUMENT_REQUEST_BYTES)
+        .max_decoding_message_size(MAX_DOCUMENT_RESPONSE_BYTES))
 }
 
 pub async fn connect_execution(
     process_id: ProcessId,
-) -> Result<ExecutionServiceClient<Channel>, tonic::transport::Error> {
-    Ok(
-        ExecutionServiceClient::new(connect_channel(process_id).await?)
-            .max_encoding_message_size(MAX_EXECUTION_REQUEST_BYTES)
-            .max_decoding_message_size(MAX_EXECUTION_RESPONSE_BYTES),
-    )
+) -> Result<ExecServiceClient<Channel>, tonic::transport::Error> {
+    Ok(ExecServiceClient::new(connect_channel(process_id).await?)
+        .max_encoding_message_size(MAX_EXECUTION_REQUEST_BYTES)
+        .max_decoding_message_size(MAX_EXECUTION_RESPONSE_BYTES))
 }
 
 async fn connect_channel(process_id: ProcessId) -> Result<Channel, tonic::transport::Error> {

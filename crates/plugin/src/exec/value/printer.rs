@@ -1,4 +1,4 @@
-use super::output::{EmitResult, OUTPUT_CHUNK_BYTES, OutputSink};
+use super::super::output::{EmitResult, OUTPUT_CHUNK_BYTES, OutputSink};
 
 pub const MAX_VALUE_DEPTH: usize = 64 * 1024;
 pub const MAX_VALUE_TEXT_BYTES: usize = OUTPUT_CHUNK_BYTES;
@@ -668,7 +668,7 @@ fn requires_readable_escape(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::output::{OutputStream, channel};
+    use crate::exec::output::{OutputStream, channel};
 
     #[tokio::test]
     async fn renders_readable_nested_strings_incrementally() {

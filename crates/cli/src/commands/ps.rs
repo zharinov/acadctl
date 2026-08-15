@@ -1,13 +1,13 @@
 use std::process::ExitCode;
 
-use acadctl_rpc::{Document, ProcessId};
+use acadctl_rpc::{Doc, ProcessId};
 
-use crate::instances::Instance;
+use crate::instance::Instance;
 
 use super::{fail, query_error_message};
 
 pub async fn run(long: bool) -> ExitCode {
-    let instances = match crate::instances::list().await {
+    let instances = match crate::instance::list().await {
         Ok(instances) => instances,
         Err(_) => return fail("Could not inspect registered AutoCAD endpoints.".into()),
     };
@@ -51,7 +51,7 @@ fn render(instances: &[Instance], long: bool) -> Result<Vec<String>, String> {
 fn document_line(
     process_id: ProcessId,
     process_id_width: usize,
-    document: &Document,
+    document: &Doc,
     long: bool,
 ) -> String {
     let modified = if document.modified { "*" } else { "." };
@@ -73,10 +73,10 @@ fn document_line(
 
 #[cfg(test)]
 mod tests {
-    use acadctl_rpc::Document;
+    use acadctl_rpc::Doc;
 
     use super::*;
-    use crate::instances::{Instance, QueryError};
+    use crate::instance::{Instance, QueryError};
 
     #[test]
     fn renders_only_actionable_document_state() {
@@ -171,7 +171,7 @@ mod tests {
         );
     }
 
-    fn available(process_id: u32, documents: Vec<Document>) -> Instance {
+    fn available(process_id: u32, documents: Vec<Doc>) -> Instance {
         Instance {
             process_id: acadctl_rpc::ProcessId::new(process_id).unwrap(),
             documents: Ok(documents),
@@ -185,7 +185,7 @@ mod tests {
         }
     }
 
-    fn document(id: &str, path: &str, modified: bool, read_only: bool) -> Document {
+    fn document(id: &str, path: &str, modified: bool, read_only: bool) -> Doc {
         let file_path = path.contains('/').then(|| path.to_owned());
         let display_name = file_path
             .as_deref()
@@ -193,7 +193,7 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or(path)
             .to_owned();
-        Document {
+        Doc {
             id: id.into(),
             display_name,
             file_path,
