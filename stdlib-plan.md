@@ -21,7 +21,7 @@ The repository state on 2026-08-14 provides the execution substrate, not the pro
 - The CLI exposes `ls`, `open`, `save`, `undo`, `redo`, `close`, `eval`, and `exec` in [main.rs](crates/cli/src/main.rs).
 - `eval` evaluates one top-level form and prints its value. `exec` runs zero or more forms without implicit value output. Each nonempty request is one ordinary AutoCAD undo group.
 - `save` is the durable checkpoint. `undo` and `redo` perform one ordinary drawing-history action without acadctl-owned provenance.
-- `acadctl:println` is the only public Lisp function. `acadctl:_value-event` is private execution plumbing in [host.cpp](crates/plugin/native/host.cpp).
+- There are no public `acadctl:*` Lisp functions. `acadctl:_value-event` is private `eval` result plumbing in [host.cpp](crates/plugin/native/host.cpp).
 - The existing value bridge carries lists, dotted pairs, symbols, strings, integers, reals, points, entity names, selection sets, VLA objects, files, functions, error objects, and unsupported native values. See [value_bridge.rs](crates/plugin/src/execution/value_bridge.rs).
 - The six-character public document ID follows the native document token. The internal target also includes a database token in [documents.rs](crates/plugin/src/documents.rs). A database replacement can preserve the document ID while invalidating every object handle.
 
@@ -45,7 +45,7 @@ human request
 The API follows these rules:
 
 - Document scope is implicit because `eval` and `exec` already target one document.
-- Structured Lisp values are the computational interface. `acadctl:table` is the sole table renderer, and `acadctl:println` remains the routed output function.
+- Structured Lisp values are the computational interface. `acadctl:table` is the sole table renderer and returns a string like every other computational helper.
 - Ordinary Lisp supplies iteration, filtering, branching, aggregation, and composition.
 - The schema registry exposes fixed public operations. There is no public generic query endpoint.
 - Agents use batch calls when they avoid round trips or repeated native object opens.
@@ -73,7 +73,7 @@ Discovery, inspection, paging, checker, and mutation helpers return a result ali
 
 `stamp` identifies the observed drawing generation and state. `diagnostics` contains structured warnings that do not invalidate the returned value.
 
-`acadctl:assert` returns `T` or raises. `acadctl:require` returns an accepted result's `value` or raises. `acadctl:table` returns a string or raises. The existing `acadctl:println` prints and returns `nil`.
+`acadctl:assert` returns `T` or raises. `acadctl:require` returns an accepted result's `value` or raises. `acadctl:table` returns a string or raises.
 
 | Status | Meaning |
 | --- | --- |
@@ -404,7 +404,6 @@ Styles normally use `lookup`, `ensure`, `set-facts`, and `import-definitions`. S
 (acadctl:purge refs [opts])
 (acadctl:diagnostics [opts])
 (acadctl:table columns rows [opts])
-(acadctl:println ...)
 ```
 
 `acadctl:assert` returns `T` or raises a structured error. `acadctl:require` returns the `value` of an accepted result and raises on every other status by default. An agent that also needs the stamp retains the original result before calling `require`.
@@ -417,7 +416,7 @@ Findings identify checker, severity, subject, evidence, coverage, and repairabil
 
 `acadctl:database-check` is read-only by default. Any repair runs as an explicit mutating request.
 
-`acadctl:table` returns one deterministic string from a rectangular scalar matrix. The renderer rejects inconsistent row widths and escapes newlines or control characters. It measures Unicode display width and formats numbers deterministically. It never adds terminal-dependent truncation or ellipses. `acadctl:println` remains the only request-routed printing function.
+`acadctl:table` returns one deterministic string from a rectangular scalar matrix. The renderer rejects inconsistent row widths and escapes newlines or control characters. It measures Unicode display width and formats numbers deterministically. It never adds terminal-dependent truncation or ellipses.
 
 ## Mutation behavior
 
@@ -608,7 +607,7 @@ No native object, iterator, document lock, or transaction may survive a helper r
 
 - Keep ordinary AutoLISP as the composition language and long-tail escape hatch.
 - Keep structured Lisp values as the computational result.
-- Keep one deterministic table renderer and `acadctl:println` for output.
+- Keep one deterministic table renderer that returns a string.
 - Keep ordinary AutoCAD save, undo, redo, and one undo group per nonempty execution.
 - Do not add screenshots or pixel inspection to this library.
 - Do not add JSON, JSONL, TSV, CSV, or output-format switches without a demonstrated consumer.

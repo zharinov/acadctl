@@ -48,11 +48,9 @@ struct BridgeProtocolText {
             nativeString(protocol.execution_driver_expression)),
         executionDriverInvocation(
             nativeString(protocol.execution_driver_invocation)),
-        beginPrintlnFunction(nativeString(protocol.begin_println_function)),
         valueEventFunction(nativeString(protocol.value_event_function)),
         advanceExecutionFunction(
             nativeString(protocol.advance_execution_function)),
-        finishPrintlnFunction(nativeString(protocol.finish_println_function)),
         sourceSymbol(nativeString(protocol.source_symbol)),
         stagedFormSymbol(nativeString(protocol.staged_form_symbol)),
         statusSymbol(nativeString(protocol.status_symbol)),
@@ -64,10 +62,8 @@ struct BridgeProtocolText {
 
   AcString executionDriverExpression;
   AcString executionDriverInvocation;
-  AcString beginPrintlnFunction;
   AcString valueEventFunction;
   AcString advanceExecutionFunction;
-  AcString finishPrintlnFunction;
   AcString sourceSymbol;
   AcString stagedFormSymbol;
   AcString statusSymbol;
@@ -172,8 +168,6 @@ acadctl::NativeActionResult bridgeFailure(
     acadctl::NativeActionResultKind kind, int status);
 
 int acadctlAdvanceExecution() noexcept;
-int acadctlBeginPrintln() noexcept;
-int acadctlFinishPrintln() noexcept;
 int undefineLispFunctions();
 
 enum class UndoGroupState { Inactive, Active, Unknown };
@@ -258,8 +252,6 @@ private:
   static void finalizeDocumentContextDispatch(void *data);
 
   friend int acadctlAdvanceExecution() noexcept;
-  friend int acadctlBeginPrintln() noexcept;
-  friend int acadctlFinishPrintln() noexcept;
 
   void publishDocumentSnapshot();
 
@@ -427,10 +419,8 @@ struct ResbufDeleter {
 
 using ResbufPtr = std::unique_ptr<resbuf, ResbufDeleter>;
 
-constexpr int kBeginPrintlnFunctionCode = 1;
-constexpr int kEvalValueEventFunctionCode = 2;
-constexpr int kAdvanceExecutionFunctionCode = 3;
-constexpr int kFinishPrintlnFunctionCode = 4;
+constexpr int kEvalValueEventFunctionCode = 1;
+constexpr int kAdvanceExecutionFunctionCode = 2;
 
 thread_local acadctl::NativeValueWriter *activeValueWriter = nullptr;
 
@@ -691,19 +681,9 @@ int defineLispFunction(const ACHAR *name, int code, int (*callback)()) {
 
 int defineLispFunctions() {
   const BridgeProtocolText &protocol = bridgeProtocol();
-  int status = defineLispFunction(protocol.beginPrintlnFunction.kACharPtr(),
-                                  kBeginPrintlnFunctionCode,
-                                  &acadctlBeginPrintln);
-
-  if (status != RTNORM) {
-    undefineLispFunctions();
-
-    return status;
-  }
-
-  status = defineLispFunction(protocol.valueEventFunction.kACharPtr(),
-                              kEvalValueEventFunctionCode,
-                              &acadctlEvalValueEvent);
+  int status = defineLispFunction(protocol.valueEventFunction.kACharPtr(),
+                                  kEvalValueEventFunctionCode,
+                                  &acadctlEvalValueEvent);
 
   if (status != RTNORM) {
     undefineLispFunctions();
@@ -721,40 +701,22 @@ int defineLispFunctions() {
     return status;
   }
 
-  status = defineLispFunction(protocol.finishPrintlnFunction.kACharPtr(),
-                              kFinishPrintlnFunctionCode,
-                              &acadctlFinishPrintln);
-
-  if (status != RTNORM) {
-    undefineLispFunctions();
-  }
-
   return status;
 }
 
 int undefineLispFunctions() {
   const BridgeProtocolText &protocol = bridgeProtocol();
-  const int finishStatus =
-      acedUndef(protocol.finishPrintlnFunction.kACharPtr(),
-                kFinishPrintlnFunctionCode);
   const int executionStatus =
       acedUndef(protocol.advanceExecutionFunction.kACharPtr(),
                 kAdvanceExecutionFunctionCode);
   const int privateStatus =
       acedUndef(protocol.valueEventFunction.kACharPtr(),
                 kEvalValueEventFunctionCode);
-  const int beginStatus = acedUndef(protocol.beginPrintlnFunction.kACharPtr(),
-                                   kBeginPrintlnFunctionCode);
-
-  if (finishStatus != RTNORM) {
-    return finishStatus;
-  }
-
   if (executionStatus != RTNORM) {
     return executionStatus;
   }
 
-  return privateStatus != RTNORM ? privateStatus : beginStatus;
+  return privateStatus;
 }
 
 int putStringSymbol(const ACHAR *name, const AcString &text) {
@@ -1793,143 +1755,6 @@ void ObjectArxBridge::finishAdvanceCallback(
   }
 
   failExecutionDriver();
-}
-
-int acadctlBeginPrintln() noexcept {
-  ObjectArxBridge *bridge = ObjectArxBridge::commandBridge_;
-  try {
-    if (!bridge || !bridge->documentContextDispatch_ ||
-        bridge->documentContextDispatch_->kind !=
-            ObjectArxBridge::DocumentContextDispatch::Kind::ExecutionDriver ||
-        bridge->documentContextDispatch_->phase !=
-            ObjectArxBridge::DocumentContextDispatch::Phase::Running ||
-        bridge->documentContextDispatch_->stagedFormKind !=
-            ObjectArxBridge::DocumentContextDispatch::StagedFormKind::Evaluator ||
-        bridge->documentContextDispatch_->valueWriter || activeValueWriter) {
-      clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-
-      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-    }
-
-    ObjectArxBridge::DocumentContextDispatch &dispatch =
-        *bridge->documentContextDispatch_;
-    AcApDocument *document = bridge->document(dispatch.documentToken);
-
-    if (!document ||
-        !matchesExecutionContext(document, dispatch.databaseToken, document)) {
-      dispatch.dispatchResult = abandonLostExecutionContext(
-          dispatch.jobId, document, dispatch.databaseToken, document,
-          dispatch.bridgeSymbolsMayBeRetained);
-
-      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-    }
-
-    AcDbDatabase *database = document->database();
-    rust::Box<acadctl::NativeValueWriter> writer = acadctl::begin_println(
-        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
-        static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(database)));
-
-    if (!acadctl::value_writer_active(*writer)) {
-      acadctl::finish_value_writer(std::move(writer));
-      clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-
-      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-    }
-
-    const rust::Str visitor = acadctl::eval_value_visitor_source();
-    const AcString visitorText(
-        visitor.data(), AcString::Utf8,
-        static_cast<Adesk::UInt32>(visitor.size()));
-    int preparationStatus = putStringSymbol(
-        bridgeProtocol().stagedFormSymbol.kACharPtr(), visitorText);
-
-    if (preparationStatus == RTNORM) {
-      preparationStatus = putStringSymbol(
-          bridgeProtocol().statusSymbol.kACharPtr(),
-          bridgeProtocol().pendingStatus);
-    }
-
-    if (preparationStatus != RTNORM) {
-      acadctl::invalidate_value_writer(*writer);
-      acadctl::finish_value_writer(std::move(writer));
-      clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-
-      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-    }
-
-    dispatch.valueWriter.emplace(std::move(writer));
-    activeValueWriter = &**dispatch.valueWriter;
-    const int returnStatus = acedRetT();
-
-    if (returnStatus != RTNORM) {
-      finishValueWriter(dispatch.valueWriter, true);
-      clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-    }
-
-    return returnStatus == RTNORM ? RSRSLT : RSERR;
-  } catch (...) {
-    activeValueWriter = nullptr;
-    clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-
-    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-  }
-}
-
-int acadctlFinishPrintln() noexcept {
-  ObjectArxBridge *bridge = ObjectArxBridge::commandBridge_;
-  try {
-    if (!bridge || !bridge->documentContextDispatch_ ||
-        bridge->documentContextDispatch_->kind !=
-            ObjectArxBridge::DocumentContextDispatch::Kind::ExecutionDriver ||
-        bridge->documentContextDispatch_->phase !=
-            ObjectArxBridge::DocumentContextDispatch::Phase::Running ||
-        bridge->documentContextDispatch_->stagedFormKind !=
-            ObjectArxBridge::DocumentContextDispatch::StagedFormKind::Evaluator ||
-        !bridge->documentContextDispatch_->valueWriter) {
-      activeValueWriter = nullptr;
-      clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-
-      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-    }
-
-    ObjectArxBridge::DocumentContextDispatch &dispatch =
-        *bridge->documentContextDispatch_;
-    AcApDocument *document = bridge->document(dispatch.documentToken);
-
-    if (!document ||
-        !matchesExecutionContext(document, dispatch.databaseToken, document)) {
-      finishValueWriter(dispatch.valueWriter, true);
-      dispatch.dispatchResult = abandonLostExecutionContext(
-          dispatch.jobId, document, dispatch.databaseToken, document,
-          dispatch.bridgeSymbolsMayBeRetained);
-
-      return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-    }
-
-    if (valueVisitorOutcome(RTNORM).result.kind !=
-        acadctl::NativeExecutionStepResultKind::Success) {
-      acadctl::invalidate_value_writer(**dispatch.valueWriter);
-    }
-
-    if (clearSymbol(bridgeProtocol().valueSymbol.kACharPtr()) != RTNORM) {
-      acadctl::invalidate_value_writer(**dispatch.valueWriter);
-    }
-
-    const int returnStatus = acedRetNil();
-
-    if (returnStatus != RTNORM) {
-      acadctl::invalidate_value_writer(**dispatch.valueWriter);
-    }
-
-    finishValueWriter(dispatch.valueWriter, false);
-
-    return returnStatus == RTNORM ? RSRSLT : RSERR;
-  } catch (...) {
-    activeValueWriter = nullptr;
-    clearSymbol(bridgeProtocol().valueSymbol.kACharPtr());
-
-    return acedRetNil() == RTNORM ? RSRSLT : RSERR;
-  }
 }
 
 int acadctlAdvanceExecution() noexcept {

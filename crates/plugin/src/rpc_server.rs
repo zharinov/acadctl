@@ -1050,15 +1050,6 @@ mod tests {
                 crate::scheduler::take_execution_step(action.job_id).kind(),
                 crate::execution::ExecutionStepKind::EvaluateForm
             );
-            let mut writer = crate::scheduler::begin_println(1, 101);
-            assert_eq!(
-                writer.write(crate::execution::value_bridge::ValueEvent::Integer(1)),
-                crate::execution::value_bridge::WriteResult::Disconnected
-            );
-            assert_eq!(
-                writer.finish(),
-                crate::execution::value_bridge::WriteResult::Disconnected
-            );
             assert_eq!(
                 crate::scheduler::cancel_execution(action.job_id),
                 CancelResult::Accepted

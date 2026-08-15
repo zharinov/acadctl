@@ -133,10 +133,8 @@ mod ffi {
     struct NativeBridgeProtocol {
         execution_driver_expression: String,
         execution_driver_invocation: String,
-        begin_println_function: String,
         value_event_function: String,
         advance_execution_function: String,
-        finish_println_function: String,
         source_symbol: String,
         staged_form_symbol: String,
         status_symbol: String,
@@ -237,8 +235,6 @@ mod ffi {
             cleanup_status: i32,
             fallback_cleanup_status: i32,
         ) -> NativeBridgeStepResult;
-
-        fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter>;
 
         fn begin_eval_value(
             job_id: u64,
@@ -341,10 +337,8 @@ fn native_bridge_protocol() -> ffi::NativeBridgeProtocol {
     ffi::NativeBridgeProtocol {
         execution_driver_expression: bridge_protocol::execution_driver_expression(),
         execution_driver_invocation: bridge_protocol::execution_driver_invocation(),
-        begin_println_function: bridge_protocol::BEGIN_PRINTLN_FUNCTION.into(),
         value_event_function: bridge_protocol::VALUE_EVENT_FUNCTION.into(),
         advance_execution_function: bridge_protocol::ADVANCE_EXECUTION_FUNCTION.into(),
-        finish_println_function: bridge_protocol::FINISH_PRINTLN_FUNCTION.into(),
         source_symbol: bridge_protocol::SOURCE_SYMBOL.into(),
         staged_form_symbol: bridge_protocol::STAGED_FORM_SYMBOL.into(),
         status_symbol: bridge_protocol::STATUS_SYMBOL.into(),
@@ -406,10 +400,6 @@ fn complete_execution_step(job_id: u64, result: ffi::NativeExecutionStepResult) 
 
 fn abandon_execution(job_id: u64, result: ffi::NativeExecutionStepResult) -> bool {
     scheduler::abandon_execution(job_id, result)
-}
-
-fn begin_println(document_token: usize, database_token: usize) -> Box<NativeValueWriter> {
-    Box::new(scheduler::begin_println(document_token, database_token))
 }
 
 fn begin_eval_value(

@@ -2,10 +2,8 @@
 const EXECUTION_DRIVER_TEMPLATE: &str = include_str!("lisp/execution-driver.lsp");
 const FORM_EVALUATOR_TEMPLATE: &str = include_str!("lisp/form-evaluator.lsp");
 
-pub const BEGIN_PRINTLN_FUNCTION: &str = "acadctl:_begin-println";
 pub const VALUE_EVENT_FUNCTION: &str = "acadctl:_value-event";
 pub const ADVANCE_EXECUTION_FUNCTION: &str = "acadctl:_advance-execution";
-pub const FINISH_PRINTLN_FUNCTION: &str = "acadctl:_finish-println";
 pub const DRIVE_EXECUTION_FUNCTION: &str = "acadctl:_drive-execution";
 pub const INVALID_FORM_SPAN_FUNCTION: &str = "acadctl:_invalid-form-span";
 
@@ -34,12 +32,9 @@ pub fn execution_driver_source() -> String {
     render(
         EXECUTION_DRIVER_TEMPLATE,
         &[
-            ("BEGIN_PRINTLN_FUNCTION", BEGIN_PRINTLN_FUNCTION),
             ("ADVANCE_EXECUTION_FUNCTION", ADVANCE_EXECUTION_FUNCTION),
-            ("FINISH_PRINTLN_FUNCTION", FINISH_PRINTLN_FUNCTION),
             ("DRIVE_EXECUTION_FUNCTION", DRIVE_EXECUTION_FUNCTION),
             ("STAGED_FORM_SYMBOL", STAGED_FORM_SYMBOL),
-            ("VALUE_SYMBOL", VALUE_SYMBOL),
         ],
     )
 }
@@ -85,12 +80,9 @@ mod tests {
     fn rendered_programs_use_the_shared_private_protocol() {
         let driver = execution_driver_source();
         for value in [
-            BEGIN_PRINTLN_FUNCTION,
             ADVANCE_EXECUTION_FUNCTION,
-            FINISH_PRINTLN_FUNCTION,
             DRIVE_EXECUTION_FUNCTION,
             STAGED_FORM_SYMBOL,
-            VALUE_SYMBOL,
         ] {
             assert!(driver.contains(value));
         }

@@ -7,12 +7,6 @@ const MAX_ENTITY_HANDLE_BYTES: usize = 32;
 const MAX_OBJECT_LABEL_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrintMode {
-    Display,
-    Readable,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrintError {
     InvalidSequence,
     LimitExceeded,
@@ -21,7 +15,6 @@ pub enum PrintError {
 
 pub struct ValuePrinter {
     sink: OutputSink,
-    mode: PrintMode,
     lists: Vec<ListState>,
     atom: AtomState,
     skipped_lists: usize,
@@ -84,10 +77,9 @@ enum OpaqueKind {
 }
 
 impl ValuePrinter {
-    pub fn new(sink: OutputSink, mode: PrintMode) -> Self {
+    pub fn new(sink: OutputSink) -> Self {
         Self {
             sink,
-            mode,
             lists: Vec::new(),
             atom: AtomState::None,
             skipped_lists: 0,
@@ -246,9 +238,7 @@ impl ValuePrinter {
         self.poll_output()?;
         self.before_value()?;
 
-        if self.mode == PrintMode::Readable {
-            self.write("\"")?;
-        }
+        self.write("\"")?;
 
         self.atom = AtomState::String;
         Ok(())
@@ -267,7 +257,7 @@ impl ValuePrinter {
             return Err(PrintError::InvalidSequence);
         }
 
-        if self.mode == PrintMode::Display || !text.chars().any(requires_readable_escape) {
+        if !text.chars().any(requires_readable_escape) {
             return self.write(text);
         }
 
@@ -316,9 +306,7 @@ impl ValuePrinter {
         self.poll_output()?;
         self.atom = AtomState::None;
 
-        if self.mode == PrintMode::Readable {
-            self.write("\"")?;
-        }
+        self.write("\"")?;
 
         Ok(())
     }
@@ -484,7 +472,7 @@ impl ValuePrinter {
     }
 
     fn write_symbol_chunk(&self, text: &str) -> Result<(), PrintError> {
-        if self.mode == PrintMode::Display || !text.contains('\\') {
+        if !text.contains('\\') {
             return self.write(text);
         }
 
@@ -686,7 +674,7 @@ mod tests {
     async fn renders_readable_nested_strings_incrementally() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
         printer.begin_list().unwrap();
         printer.integer(1).unwrap();
         printer.begin_string().unwrap();
@@ -707,7 +695,7 @@ mod tests {
     async fn renders_proper_and_dotted_structure() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
         printer.begin_list().unwrap();
         symbol(&mut printer, "A");
         printer.begin_list().unwrap();
@@ -724,22 +712,14 @@ mod tests {
 
     #[tokio::test]
     async fn applies_autolisp_backslash_semantics_to_symbols() {
-        let (readable_sink, readable_stream) = channel();
-        let readable_terminal = readable_sink.clone();
-        let mut readable = ValuePrinter::new(readable_sink, PrintMode::Readable);
-        symbol(&mut readable, "A\\B");
-        readable.finish().unwrap();
-        readable_terminal.finish();
+        let (sink, stream) = channel();
+        let terminal = sink.clone();
+        let mut printer = ValuePrinter::new(sink);
+        symbol(&mut printer, "A\\B");
+        printer.finish().unwrap();
+        terminal.finish();
 
-        let (display_sink, display_stream) = channel();
-        let display_terminal = display_sink.clone();
-        let mut display = ValuePrinter::new(display_sink, PrintMode::Display);
-        symbol(&mut display, "A\\B");
-        display.finish().unwrap();
-        display_terminal.finish();
-
-        assert_eq!(collect(readable_stream).await, "A\\\\B\n");
-        assert_eq!(collect(display_stream).await, "A\\B\n");
+        assert_eq!(collect(stream).await, "A\\\\B\n");
     }
 
     #[test]
@@ -753,7 +733,7 @@ mod tests {
             &["n", "I", "l"][..],
         ] {
             let (sink, _stream) = channel();
-            let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+            let mut printer = ValuePrinter::new(sink);
             printer.begin_symbol().unwrap();
 
             for chunk in chunks {
@@ -771,7 +751,7 @@ mod tests {
             &["1E", "+"][..],
         ] {
             let (sink, _stream) = channel();
-            let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+            let mut printer = ValuePrinter::new(sink);
             printer.begin_symbol().unwrap();
 
             for chunk in chunks {
@@ -786,7 +766,7 @@ mod tests {
     async fn uses_resolvable_entities_and_kind_specific_opaque_displays() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Display);
+        let mut printer = ValuePrinter::new(sink);
         printer.begin_list().unwrap();
         printer.entity(Some("5a2")).unwrap();
         printer.entity(Some("not-a-handle")).unwrap();
@@ -811,7 +791,7 @@ mod tests {
     async fn formats_autolisp_reals_from_native_binary_values() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
         printer.begin_list().unwrap();
 
         for number in [1.0, -0.0, 1.234567890123, 1.0e-12, 1.0e20] {
@@ -872,7 +852,7 @@ mod tests {
     #[test]
     fn rejects_malformed_or_oversized_events() {
         let (sink, _stream) = channel();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
         assert_eq!(printer.dot(), Err(PrintError::InvalidSequence));
         assert_eq!(
             printer.string_chunk("not begun"),
@@ -894,7 +874,7 @@ mod tests {
     fn observes_cancellation_while_skipping_excessive_depth() {
         let (sink, _stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
 
         for _ in 0..=MAX_VALUE_DEPTH {
             printer.begin_list().unwrap();
@@ -912,7 +892,7 @@ mod tests {
     fn zero_output_atom_boundaries_observe_cancellation() {
         let (symbol_sink, _stream) = channel();
         let symbol_terminal = symbol_sink.clone();
-        let mut symbol_printer = ValuePrinter::new(symbol_sink, PrintMode::Readable);
+        let mut symbol_printer = ValuePrinter::new(symbol_sink);
         symbol_printer.begin_symbol().unwrap();
         symbol_printer.symbol_chunk("A").unwrap();
         symbol_terminal.request_cancel();
@@ -923,7 +903,7 @@ mod tests {
 
         let (string_sink, _stream) = channel();
         let string_terminal = string_sink.clone();
-        let mut string_printer = ValuePrinter::new(string_sink, PrintMode::Display);
+        let mut string_printer = ValuePrinter::new(string_sink);
         string_printer.begin_string().unwrap();
         string_terminal.request_cancel();
         assert_eq!(
@@ -936,7 +916,7 @@ mod tests {
     async fn escapes_dense_control_text_without_changing_bytes() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
         printer.begin_string().unwrap();
         printer
             .string_chunk(&"\u{2}".repeat(MAX_VALUE_TEXT_BYTES))
@@ -953,7 +933,7 @@ mod tests {
     async fn replaces_excessive_depth_with_too_deep() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
 
         for _ in 0..=MAX_VALUE_DEPTH {
             printer.begin_list().unwrap();
@@ -978,7 +958,7 @@ mod tests {
     async fn renders_large_escaped_strings_without_a_composite_buffer() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink, PrintMode::Readable);
+        let mut printer = ValuePrinter::new(sink);
         printer.begin_string().unwrap();
 
         for _ in 0..10_000 {

@@ -1,4 +1,4 @@
-use super::value::{PrintError, PrintMode, ValuePrinter};
+use super::value::{PrintError, ValuePrinter};
 use super::{ValueBridgeFailure, ValueOutputLease};
 
 pub use crate::ffi::NativeValueWriteResult as WriteResult;
@@ -29,17 +29,9 @@ pub enum ValueEvent<'a> {
     TooDeep,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WriterPolicy {
-    Inactive,
-    Println,
-    EvalValue,
-}
-
 pub struct NativeValueWriter {
     printer: Option<ValuePrinter>,
     lease: Option<ValueOutputLease>,
-    policy: WriterPolicy,
     result: WriteResult,
 }
 
@@ -48,26 +40,20 @@ impl NativeValueWriter {
         Self {
             printer: None,
             lease: None,
-            policy: WriterPolicy::Inactive,
             result: WriteResult::Inactive,
         }
     }
 
-    pub(crate) fn println(lease: ValueOutputLease) -> Self {
-        Self::new(lease, PrintMode::Display, WriterPolicy::Println)
-    }
-
     pub(crate) fn eval_value(lease: ValueOutputLease) -> Self {
-        Self::new(lease, PrintMode::Readable, WriterPolicy::EvalValue)
+        Self::new(lease)
     }
 
-    fn new(lease: ValueOutputLease, mode: PrintMode, policy: WriterPolicy) -> Self {
+    fn new(lease: ValueOutputLease) -> Self {
         let sink = lease.output_sink();
         let result = sink.emit("");
         let mut writer = Self {
-            printer: (result == WriteResult::Continue).then(|| ValuePrinter::new(sink, mode)),
+            printer: (result == WriteResult::Continue).then(|| ValuePrinter::new(sink)),
             lease: Some(lease),
-            policy,
             result,
         };
 
@@ -142,7 +128,7 @@ impl NativeValueWriter {
             return self.fail(WriteResult::InvalidSequence);
         };
 
-        if self.policy != WriterPolicy::Inactive && printer.root_values() != 1 {
+        if printer.root_values() != 1 {
             return self.fail(WriteResult::InvalidSequence);
         }
 
@@ -176,21 +162,19 @@ impl NativeValueWriter {
         self.printer = None;
 
         if let Some(lease) = self.lease.take() {
-            lease.release(write_failure(self.policy, result));
+            lease.release(write_failure(result));
         }
 
         self.result = result;
     }
 }
 
-const fn write_failure(policy: WriterPolicy, result: WriteResult) -> Option<ValueBridgeFailure> {
-    match (policy, result) {
-        (_, WriteResult::InvalidSequence) => Some(ValueBridgeFailure::InvalidSequence),
-        (_, WriteResult::LimitExceeded) => Some(ValueBridgeFailure::LimitExceeded),
-        (_, WriteResult::Finished) => Some(ValueBridgeFailure::OutputFinished),
-        (WriterPolicy::EvalValue, WriteResult::Cancelled) => {
-            Some(ValueBridgeFailure::PostCommitCancelled)
-        }
+const fn write_failure(result: WriteResult) -> Option<ValueBridgeFailure> {
+    match result {
+        WriteResult::InvalidSequence => Some(ValueBridgeFailure::InvalidSequence),
+        WriteResult::LimitExceeded => Some(ValueBridgeFailure::LimitExceeded),
+        WriteResult::Finished => Some(ValueBridgeFailure::OutputFinished),
+        WriteResult::Cancelled => Some(ValueBridgeFailure::PostCommitCancelled),
         _ => None,
     }
 }
@@ -203,55 +187,6 @@ mod tests {
     use super::super::{ExecutionIo, ValueBridgeState};
     use super::*;
 
-    #[tokio::test]
-    async fn prints_exactly_one_display_value() {
-        let (io, mut stream) = execution_io();
-        let terminal = io.output_sink();
-        let mut writer = NativeValueWriter::println(println_lease(&io));
-
-        assert_eq!(writer.write(ValueEvent::BeginString), WriteResult::Continue);
-        assert_eq!(
-            writer.write(ValueEvent::StringChunk("created: ")),
-            WriteResult::Continue
-        );
-        assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
-        assert_eq!(writer.finish(), WriteResult::Continue);
-        assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::Println),
-            None
-        );
-        terminal.finish();
-
-        assert_eq!(collect(&mut stream).await, "created: \n");
-    }
-
-    #[test]
-    fn println_requires_exactly_one_root() {
-        let (empty_io, _stream) = execution_io();
-        let empty = NativeValueWriter::println(println_lease(&empty_io));
-        assert_eq!(empty.finish(), WriteResult::InvalidSequence);
-        assert_eq!(
-            empty_io.close_value_output(super::super::ValueOutputKind::Println),
-            Some(ValueBridgeFailure::InvalidSequence)
-        );
-
-        let (multiple_io, _stream) = execution_io();
-        let mut multiple = NativeValueWriter::println(println_lease(&multiple_io));
-        assert_eq!(
-            multiple.write(ValueEvent::Integer(1)),
-            WriteResult::Continue
-        );
-        assert_eq!(
-            multiple.write(ValueEvent::Integer(2)),
-            WriteResult::Continue
-        );
-        assert_eq!(multiple.finish(), WriteResult::InvalidSequence);
-        assert_eq!(
-            multiple_io.close_value_output(super::super::ValueOutputKind::Println),
-            Some(ValueBridgeFailure::InvalidSequence)
-        );
-    }
-
     #[test]
     fn eval_value_requires_exactly_one_root() {
         let (io, _stream) = execution_io();
@@ -259,7 +194,7 @@ mod tests {
 
         assert_eq!(writer.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            io.close_value_output(),
             Some(ValueBridgeFailure::InvalidSequence)
         );
     }
@@ -272,10 +207,7 @@ mod tests {
         assert_eq!(one.write(ValueEvent::Integer(1)), WriteResult::Continue);
         assert_eq!(one.write(ValueEvent::EndList), WriteResult::Continue);
         assert_eq!(one.finish(), WriteResult::Continue);
-        assert_eq!(
-            one_io.close_value_output(super::super::ValueOutputKind::EvalValue),
-            None
-        );
+        assert_eq!(one_io.close_value_output(), None);
 
         let (two_io, _two_stream) = execution_io();
         let mut two = NativeValueWriter::eval_value(eval_value_lease(&two_io));
@@ -283,7 +215,7 @@ mod tests {
         assert_eq!(two.write(ValueEvent::Integer(2)), WriteResult::Continue);
         assert_eq!(two.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            two_io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            two_io.close_value_output(),
             Some(ValueBridgeFailure::InvalidSequence)
         );
     }
@@ -291,31 +223,20 @@ mod tests {
     #[test]
     fn eval_value_epoch_requires_exactly_one_writer_claim() {
         let (io, _stream) = execution_io();
-        io.begin_value_output(super::super::ValueOutputKind::EvalValue);
+        io.begin_value_output();
         assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            io.close_value_output(),
             Some(ValueBridgeFailure::MissingValue)
         );
 
-        io.begin_value_output(super::super::ValueOutputKind::EvalValue);
-        let mut writer = NativeValueWriter::eval_value(
-            io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
-                .expect("first claim succeeds"),
-        );
-        assert!(
-            io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
-                .is_none()
-        );
+        io.begin_value_output();
+        let mut writer =
+            NativeValueWriter::eval_value(io.acquire_value_output().expect("first claim succeeds"));
+        assert!(io.acquire_value_output().is_none());
         assert_eq!(writer.write(ValueEvent::Nil), WriteResult::Continue);
         assert_eq!(writer.finish(), WriteResult::Continue);
-        assert!(
-            io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
-                .is_none()
-        );
-        assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::EvalValue),
-            None
-        );
+        assert!(io.acquire_value_output().is_none());
+        assert_eq!(io.close_value_output(), None);
     }
 
     #[test]
@@ -326,10 +247,7 @@ mod tests {
 
         let writer = NativeValueWriter::eval_value(lease);
         assert_eq!(writer.result, WriteResult::Disconnected);
-        assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::EvalValue),
-            None
-        );
+        assert_eq!(io.close_value_output(), None);
     }
 
     #[test]
@@ -341,7 +259,7 @@ mod tests {
         let writer = NativeValueWriter::eval_value(lease);
         assert_eq!(writer.result, WriteResult::Cancelled);
         assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::EvalValue),
+            io.close_value_output(),
             Some(ValueBridgeFailure::PostCommitCancelled)
         );
     }
@@ -349,28 +267,22 @@ mod tests {
     #[test]
     fn dropping_an_active_writer_records_an_abandoned_bridge() {
         let (io, _stream) = execution_io();
-        drop(NativeValueWriter::println(println_lease(&io)));
+        drop(NativeValueWriter::eval_value(eval_value_lease(&io)));
 
-        assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::Println),
-            Some(ValueBridgeFailure::Abandoned)
-        );
+        assert_eq!(io.close_value_output(), Some(ValueBridgeFailure::Abandoned));
     }
 
     #[test]
     fn terminal_writer_releases_its_formatter_and_execution_io() {
         let (io, stream) = execution_io();
-        let lease = println_lease(&io);
+        let lease = eval_value_lease(&io);
         drop(stream);
 
-        let writer = NativeValueWriter::println(lease);
+        let writer = NativeValueWriter::eval_value(lease);
         assert_eq!(writer.result, WriteResult::Disconnected);
         assert!(writer.printer.is_none());
         assert!(writer.lease.is_none());
-        assert_eq!(
-            io.close_value_output(super::super::ValueOutputKind::Println),
-            None
-        );
+        assert_eq!(io.close_value_output(), None);
     }
 
     fn execution_io() -> (Arc<ExecutionIo>, OutputStream) {
@@ -384,25 +296,9 @@ mod tests {
         )
     }
 
-    fn println_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
-        io.begin_value_output(super::super::ValueOutputKind::Println);
-        io.acquire_value_output(super::super::ValueOutputKind::Println)
-            .expect("println output is open")
-    }
-
     fn eval_value_lease(io: &Arc<ExecutionIo>) -> ValueOutputLease {
-        io.begin_value_output(super::super::ValueOutputKind::EvalValue);
-        io.acquire_value_output(super::super::ValueOutputKind::EvalValue)
+        io.begin_value_output();
+        io.acquire_value_output()
             .expect("eval value output is open")
-    }
-
-    async fn collect(stream: &mut OutputStream) -> String {
-        let mut output = String::new();
-
-        while let Some(chunk) = stream.next_chunk().await {
-            output.push_str(&chunk);
-        }
-
-        output
     }
 }

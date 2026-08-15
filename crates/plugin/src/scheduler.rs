@@ -1068,37 +1068,6 @@ pub fn take_execution_step(job_id: MutationJobId) -> NativeExecutionStep {
     }
 }
 
-pub fn begin_println(document_token: usize, database_token: usize) -> NativeValueWriter {
-    let lease = {
-        let Ok(scheduler) = SCHEDULER.lock() else {
-            return NativeValueWriter::inactive();
-        };
-
-        let Some(job) = scheduler.active.as_ref() else {
-            return NativeValueWriter::inactive();
-        };
-
-        if job.native_target
-            != Some(NativeDocumentKey {
-                document_token,
-                database_token,
-            })
-        {
-            return NativeValueWriter::inactive();
-        }
-
-        match &job.operation {
-            Operation::Execute { execution, .. } => execution.acquire_println_output(),
-            Operation::Open { .. }
-            | Operation::Save { .. }
-            | Operation::Close { .. }
-            | Operation::History { .. } => None,
-        }
-    };
-
-    lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::println)
-}
-
 pub fn begin_eval_value(
     job_id: MutationJobId,
     document_token: usize,
@@ -1880,64 +1849,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_println_only_to_the_exact_active_form() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id;
-        let (execution, output) =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let (mut output, pending) = spawn_test_execution(id, execution, output);
-        tokio::task::yield_now().await;
-
-        let action = take_native_action();
-        assert!(!begin_println(1, 101).active());
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::BeginUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::EvaluateForm
-        );
-        assert!(!begin_println(2, 101).active());
-        assert!(!begin_println(1, 202).active());
-
-        let mut writer = begin_println(1, 101);
-        assert!(writer.active());
-        assert_eq!(writer.write(ValueEvent::BeginString), WriteResult::Continue);
-        assert_eq!(
-            writer.write(ValueEvent::StringChunk("created: 3")),
-            WriteResult::Continue
-        );
-        assert_eq!(writer.write(ValueEvent::EndString), WriteResult::Continue);
-        assert_eq!(writer.finish(), WriteResult::Continue);
-
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert!(!begin_println(1, 101).active());
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::CommitUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::Done
-        );
-        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
-
-        assert_eq!(pending.await.unwrap().unwrap(), ExecutionOutcome::Success);
-        let mut rendered = String::new();
-
-        while let Some(chunk) = output.next_chunk().await {
-            rendered.push_str(&chunk);
-        }
-
-        assert_eq!(rendered, "created: 3\n");
-        stop();
-    }
-
-    #[tokio::test]
     async fn routes_the_eval_value_only_after_commit_and_only_once() {
         let _test = TEST_LOCK.lock().await;
         reset(vec![document(1, 101, false)]);
@@ -1970,7 +1881,6 @@ mod tests {
             crate::execution::ExecutionStepKind::EmitEvalValue
         );
 
-        assert!(!begin_println(1, 101).active());
         assert!(!begin_eval_value(action.job_id + 1, 1, 101).active());
         assert!(!begin_eval_value(action.job_id, 2, 101).active());
         assert!(!begin_eval_value(action.job_id, 1, 202).active());
@@ -1996,114 +1906,6 @@ mod tests {
         }
 
         assert_eq!(rendered, "12\n");
-        stop();
-    }
-
-    #[tokio::test]
-    async fn rolls_back_a_malformed_active_value_stream() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id;
-        let (execution, output) =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let (_output, pending) = spawn_test_execution(id, execution, output);
-        tokio::task::yield_now().await;
-
-        let action = take_native_action();
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::BeginUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::EvaluateForm
-        );
-
-        let mut writer = begin_println(1, 101);
-        assert_eq!(
-            writer.write(ValueEvent::EndList),
-            WriteResult::InvalidSequence
-        );
-        assert_eq!(writer.finish(), WriteResult::InvalidSequence);
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::RollbackUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::Done
-        );
-        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
-
-        assert_eq!(
-            pending.await.unwrap().unwrap(),
-            ExecutionOutcome::Failure(crate::execution::ExecutionFailure {
-                message: "the AutoLISP output bridge emitted an invalid value sequence".into(),
-                form_index: Some(1),
-                location: Some(crate::execution::SourceLocation {
-                    source_name: "batch.lsp".into(),
-                    line: 1,
-                    column: 1,
-                }),
-                drawing_outcome: crate::execution::DrawingOutcome::RolledBack,
-            })
-        );
-        stop();
-    }
-
-    #[tokio::test]
-    async fn unfinished_writer_fails_its_own_form_checkpoint() {
-        let _test = TEST_LOCK.lock().await;
-        reset(vec![document(1, 101, false)]);
-        let id = list().unwrap()[0].id;
-        let (execution, output) =
-            Execution::new(ExecutionMode::Exec, "batch.lsp".into(), "form".into()).unwrap();
-        let (_output, pending) = spawn_test_execution(id, execution, output);
-        tokio::task::yield_now().await;
-
-        let action = take_native_action();
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::BeginUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::EvaluateForm
-        );
-
-        let mut writer = begin_println(1, 101);
-        assert!(writer.active());
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert!(!writer.active());
-        assert_eq!(writer.write(ValueEvent::Integer(9)), WriteResult::Inactive);
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::RollbackUndoGroup
-        );
-        assert!(complete_execution_step(action.job_id, step_success()));
-        assert_eq!(
-            take_execution_step(action.job_id).kind(),
-            crate::execution::ExecutionStepKind::Done
-        );
-        complete_native_action(action.job_id, result(NativeActionResultKind::Success));
-
-        let Some(ExecutionOutcome::Failure(failure)) = pending.await.unwrap().ok() else {
-            panic!("expected the unfinished writer to fail execution");
-        };
-
-        assert_eq!(
-            failure.message,
-            "the AutoLISP output bridge abandoned an unfinished value"
-        );
-        assert_eq!(failure.form_index, Some(1));
-        assert_eq!(
-            failure.drawing_outcome,
-            crate::execution::DrawingOutcome::RolledBack
-        );
         stop();
     }
 

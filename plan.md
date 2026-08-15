@@ -1,11 +1,11 @@
 # `acadctl eval`, `exec`, and drawing history
 
-Status: the installed private build runs document-scoped `eval`, `exec`, one-value `acadctl:println`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The implementation and its post-commit first-principles naming pass are committed locally; cleanup and independent spec audits remain. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
+Status: the installed private build runs document-scoped `eval`, `exec`, rollback, drawing-wide undo and redo, and exact process termination on macOS and AutoCAD 2027. The implementation and its post-commit first-principles naming pass are committed locally; cleanup and independent spec audits remain. Windows-specific runtime validation remains a platform porting gate; its CLI path cross-compiles but was not executed on this Mac.
 
 ## Current implementation checklist
 
 - [x] Bounded scanner, Rust execution state machine, output/value rendering, RPC, and CLI.
-- [x] Live document-scoped `exec`, `eval`, `acadctl:println`, readable values, Lisp diagnostics, and drawing rollback.
+- [x] Live document-scoped `exec`, `eval`, readable values, Lisp diagnostics, and drawing rollback.
 - [x] Live drawing-wide `undo` and `redo`, including exact inactive-document routing and restoration of the prior active document.
 - [x] Live cancellation, disconnect, blocked-output, busy-admission, maximum-source, and process-lifecycle gates on macOS and AutoCAD 2027.
 - [x] Commit the one-value output and process-identity corrections, then complete the first-principles naming reconciliation.
@@ -17,7 +17,7 @@ Status: the installed private build runs document-scoped `eval`, `exec`, one-val
 
 The design has five priorities:
 
-1. Familiar AutoLISP behavior for source, values, definitions, and printing.
+1. Familiar AutoLISP behavior for source, values, definitions, and value rendering.
 2. Exact routing to one open document without disturbing work already happening in AutoCAD.
 3. One drawing undo group per non-empty request, with drawing rollback on failure or cancellation.
 4. Predictable Unix behavior for stdin, files, stdout, stderr, exit status, Ctrl+C, and broken connections.
@@ -29,8 +29,8 @@ AutoLISP remains fully capable code. `acadctl` is not a sandbox. Agent instructi
 
 | Command | Meaning | Successful stdout |
 | --- | --- | --- |
-| `acadctl eval <id> [file]` | Evaluate exactly one top-level AutoLISP form. | The form's readable value, followed by a newline; explicit `acadctl:println` output comes first. |
-| `acadctl exec <id> [file]` | Execute zero or more top-level AutoLISP forms as one batch. | Only explicit `acadctl:println` output. |
+| `acadctl eval <id> [file]` | Evaluate exactly one top-level AutoLISP form. | The form's readable value, followed by a newline. |
+| `acadctl exec <id> [file]` | Execute zero or more top-level AutoLISP forms as one batch. | Nothing. |
 | `acadctl undo <id>` | Undo the drawing's last AutoCAD history step. | Nothing. |
 | `acadctl redo <id>` | Redo the drawing's next AutoCAD history step. | Nothing. |
 | `acadctl kill [pid] [--force]` | Terminate an AutoCAD instance, not an execution request. | Nothing. |
@@ -91,7 +91,6 @@ Examples of implicit results:
 | `(setq count 12)` | `12` | Empty |
 | `(defun twice (x) (* x 2))` | `TWICE` | Empty |
 | `nil` | `nil` | Empty |
-| `(acadctl:println (strcat "created: " (itoa count)))` | `created: 12`, then `nil` | `created: 12` |
 
 `eval` is intended for inspection and composition, but it is not read-only. `exec` is intended for definitions, commands, and batches where implicit Lisp return values would be noise.
 
@@ -139,38 +138,13 @@ Exact form spans are necessary for three reasons: sequential execution, cancella
 
 ## Output
 
-### `acadctl:println`
+There is no public request-routed AutoLISP output primitive. `exec` is silent on success. A future data-output primitive requires a separate design.
 
-The `acadctl:` symbol prefix is reserved for this tool. The only documented source-output function is:
+### Value printer
 
-```lisp
-(acadctl:println (strcat "created: " (itoa count)))
-```
+The implicit `eval` result uses readable Lisp-native formatting for ordinary values, analogous to `prin1`.
 
-Its contract is:
-
-- Exactly one argument.
-- Ordinary values use familiar `princ`-style display semantics; strings are not quoted.
-- Opaque values use the stable acadctl display forms described below.
-- Exactly one newline is added after the value.
-- The CLI forwards each received line immediately and flushes stdout; buffering does not wait for request completion.
-- Output is routed only to the client owning the active `eval` or `exec` request.
-- The function returns `nil`.
-- Outside an active request, it has no effect and still returns `nil`.
-- After a client disconnects, it has no visible effect and returns `nil` while the accepted job continues.
-
-Standard AutoLISP `princ`, `prin1`, `print`, `prompt`, and related functions are not replaced or captured. They retain their normal AutoCAD command-line behavior. This preserves existing Lisp expectations and keeps the user's AutoCAD console separate from the request's stdout.
-
-No automatic label, prefix, or request ID is added to output. Callers can construct one string when they want a label beside another value.
-
-### Value printers
-
-There are two related printer modes:
-
-- The implicit `eval` result uses readable Lisp-native formatting for ordinary values, analogous to `prin1`.
-- `acadctl:println` uses display formatting for ordinary values, analogous to `princ`.
-
-Both modes render a valid entity handle as AutoLISP's native resolver form and use stable forms for the remaining opaque values, including when they are nested inside ordinary data:
+The printer renders a valid entity handle as AutoLISP's native resolver form and uses stable forms for the remaining opaque values, including when they are nested inside ordinary data:
 
 ```text
 (handent "5A2")
@@ -186,11 +160,11 @@ An entity whose handle cannot be represented safely remains `#<Entity>`. Opaque 
 
 Only an entity handle is intentionally reusable identity. `(handent "5A2")` resolves it in the current drawing, subject to the entity still being available there. Selection-set, VLA-object, file, and function displays are descriptive type tags rather than general object handles. `Cycle` and `TooDeep` describe incomplete traversal rather than AutoLISP value types.
 
-The implicit `eval` value is emitted only after successful completion of the drawing undo group. If execution or finalization fails, there is no implicit value. Previously streamed `acadctl:println` output remains visible.
+The implicit `eval` value is emitted only after successful completion of the drawing undo group. If execution or finalization fails, there is no implicit value.
 
 ### Backpressure
 
-Output is never silently dropped while a client remains connected, and queued output is not allowed to grow without bound. A slow stdout consumer applies backpressure at `acadctl:println`. Ctrl+C wakes a blocked output operation and requests cancellation. A disconnected sink switches to discard mode so the accepted AutoLISP job can finish without blocking or accumulating output.
+Output is never silently dropped while a client remains connected, and queued output is not allowed to grow without bound. A slow stdout consumer applies backpressure while an `eval` result is emitted. Ctrl+C wakes a blocked output operation. A disconnected sink switches to discard mode so the accepted job can finish without blocking or accumulating output.
 
 ## Errors and exit status
 
@@ -219,7 +193,7 @@ unterminated string
 
 Runtime diagnostics identify the start of the failing top-level form because the native AutoLISP evaluator does not provide a reliable inner-expression source location. The design does not invent a precise column, build a full parser solely for diagnostics, manufacture a stack trace, or create a temporary exception report.
 
-Normal values and explicit output go to stdout. Diagnostics, cancellation notices, rollback failures, and operational failures go to stderr. An error does not retract stdout that was already streamed.
+Successful `eval` values go to stdout. Diagnostics, cancellation notices, rollback failures, and operational failures go to stderr. An error does not retract stdout that was already streamed.
 
 ## AutoCAD scheduling and document routing
 
@@ -292,7 +266,6 @@ Cancellation is cooperative:
 
 - A queued job is removed before it starts.
 - A running `exec` observes cancellation between top-level forms.
-- A blocked `acadctl:println` is awakened by cancellation.
 - A single running form cannot generally be preempted. If it never returns or reaches a proven native bridge checkpoint, cancellation remains pending.
 
 No execution runtime timeout is layered on top of this model.
@@ -440,7 +413,7 @@ No queueing policy, scanner, printer policy, error policy, history model, or doc
 
 ### AutoLISP shim
 
-A small internal AutoLISP shim may use the reserved `acadctl:` namespace for reader, evaluator, error-capture, and value-formatting support. Only `acadctl:println` is public API. Internal symbol names are implementation details; the tool does not introduce a second `acadctl--` pseudo-namespace.
+A small internal AutoLISP shim uses the reserved `acadctl:` namespace for reader, evaluator, error-capture, and value-formatting support. There is no public Lisp API. Internal symbol names are implementation details; the tool does not introduce a second `acadctl--` pseudo-namespace.
 
 The evaluator must distinguish an uncaught evaluation error from a successfully returned AutoLISP error object. Returned values remain values; only an error escaping the evaluated form fails the request.
 
@@ -454,12 +427,10 @@ Source remains in memory. A temporary `.lsp` file, `load`, command-line paste, o
 | Provide only `exec` | Inspection needs a reliable implicit value, while command batches need silence. One command cannot satisfy both without flags or surprising output. |
 | Add a separate REPL | Repeated document-scoped invocations already preserve Lisp state, and batch stdin provides multi-form execution without a long-lived interactive protocol. |
 | Print every `exec` form value | Assignments and definitions would produce noise, and batch output would be hard to distinguish from intentional output. |
-| Print only the last `exec` value | A trailing `setq`, `defun`, or `println` would make the result accidental. That behavior belongs to explicit `eval`. |
+| Print only the last `exec` value | A trailing `setq` or `defun` would make the result accidental. That behavior belongs to explicit `eval`. |
 | Capture or mirror the AutoCAD command line | It mixes user UI, command echo, prompts, and unrelated output, and does not route cleanly to one client. |
-| Replace or wrap standard `princ`, `print`, or `prompt` | Existing AutoLISP must keep its familiar AutoCAD behavior. Agents opt into request output with one explicit function. |
+| Replace or wrap standard `princ`, `print`, or `prompt` | Existing AutoLISP must keep its familiar AutoCAD behavior. Request output needs a separately designed data contract. |
 | Name the function `acadctl:tap` | Clojure's `tap>` distributes live values to handlers and interactive tooling; this API emits text. |
-| Name the function `acadctl:print` | The chosen behavior always appends a newline and is therefore `println` semantics. |
-| Give `println` a label argument or automatic prefix | Callers can construct the one value they want to display, normally with `strcat`, without forcing a formatting protocol. |
 | Use Clojure-like `#Type[...]` or AutoCAD's all-caps tags | AutoLISP/Common Lisp-style `#<Type payload>` is more native, and PascalCase is easier to read. |
 | Treat every displayed object identity as reusable | AutoCAD does not expose a uniform persistent lookup for selection sets, COM wrappers, files, or functions. Entity handles are the deliberate reusable exception. |
 | Use a supported ObjectARX reader/AST API | No such general API is exposed. |
@@ -499,7 +470,6 @@ The design depends on behavior that documentation alone does not establish stron
 | Rollback | A later form failure and cooperative cancellation restore the target drawing while leaving already documented non-drawing effects outside the guarantee. Immediate `REDO` may reapply the rolled-back group. | Mutating execution does not ship. |
 | Busy admission | Active commands, command prompts, scripts, Lisp, dialogs, and unavailable locks are not cancelled or interrupted; expiry happens off the main loop. | Admission behavior is corrected before execution ships. |
 | Cancellation checkpoints | A queued request cancels immediately; cancellation is observed between forms; blocked output wakes; one unreturned form remains honestly uninterruptible. | The contract is narrowed to only the checkpoints proven. |
-| Output routing | `acadctl:println` reaches only its owning client, preserves order, applies bounded backpressure, becomes a no-op without a sink, and does not alter standard AutoLISP printers. | Public output does not ship until routing is deterministic. |
 | Disconnect survival | An accepted job outlives its RPC sink, stops buffering after disconnect, and reaches a terminal internal state without leaking queue entries. | Disconnect semantics are corrected before streaming execution ships. |
 | Drawing history | One fixed `U` or `REDO` executes in the exact requested document, affects the same history visible to the user, reports native absence/failure honestly, and restores the prior current/active context. | `undo` and `redo` do not ship until routing and context restoration are exact. |
 | Source limit | A 4 MiB source is accepted with protocol overhead, a source one byte larger is rejected by both sides, and no transport default creates a smaller accidental limit. | Transport limits are aligned with the application contract. |
@@ -541,7 +511,7 @@ Preserving provenance across a database replacement was rejected. Replacement or
 
 ### 2026-08-13 — I-004: native calls never retain a Rust state lock
 
-Every Rust-to-C++ execution step is owned data obtained after releasing scheduler state. Lisp evaluation, document changes, and `acadctl:println` can call synchronously back into Rust through reactors or the registered Lisp function.
+Every Rust-to-C++ execution step is owned data obtained after releasing scheduler state. Lisp evaluation and document changes can call synchronously back into Rust through reactors or registered private Lisp functions.
 
 Holding the queue, execution, output, or provenance mutex across an ObjectARX call was rejected because a reentrant callback could deadlock the AutoCAD main thread. History invalidation events are nevertheless delivered synchronously to Rust so a safe undo decision cannot overtake an earlier user event.
 
@@ -553,9 +523,9 @@ Putting `kill` behind the plugin was rejected because the command is specificall
 
 ### 2026-08-13 — I-006: output capacity is measured in bytes
 
-The execution output path has a total queued-byte budget in addition to bounded message counts. A single `acadctl:println` argument can otherwise make a nominally bounded channel retain an unbounded string.
+The execution output path has a total queued-byte budget in addition to bounded message counts. A single large `eval` value can otherwise make a nominally bounded channel retain an unbounded string.
 
-A bounded channel of unrestricted strings was rejected as insufficient backpressure. Native output is divided into bounded transport chunks while preserving exact concatenated stdout and the one-newline `acadctl:println` contract.
+A bounded channel of unrestricted strings was rejected as insufficient backpressure. Native output is divided into bounded transport chunks while preserving exact concatenated stdout.
 
 ### 2026-08-13 — I-007: form spans are produced incrementally
 
@@ -574,12 +544,6 @@ Treating every period as part of an atom was rejected because a per-form evaluat
 `logos` and `winnow` were evaluated after the first scanner implementation. `logos` provides generated token recognition, spans, callbacks, and lexer extras, but the implementation would still need custom state for balanced lists, quote-plus-trivia attachment, unterminated construct origins, Unicode line and column accounting, AutoLISP's decimal-aware period rule, and an independent resume position. `winnow` provides located and stateful streams with checkpoints, but introduces parser-combinator and checkpoint machinery for a component that intentionally does not parse an AST.
 
 Both dependencies were rejected because neither reduced the net implementation or proof surface for this grammar. The decision can be revisited if the component later becomes a real parser rather than a form-boundary scanner. References: <https://docs.rs/logos/latest/logos/> and <https://docs.rs/winnow/latest/winnow/stream/>.
-
-### 2026-08-13 — I-010: variadic `acadctl:println` is a native registration
-
-Live AutoCAD 2027 testing and Autodesk's `defun` contract established that user-defined AutoLISP functions have fixed arity. `&rest` is not supported and produces a syntax error. The public arbitrary-arity `acadctl:println` is therefore registered through the ObjectARX external-function interface.
-
-C++ performs only mechanical conversion of the `resbuf` argument chain into bounded typed chunks and forwards them synchronously. Rust owns display formatting, opaque-value policy, output routing, byte-budget backpressure, and cancellation wakeups. A Lisp-defined variadic shim was rejected as infeasible; formatting whole values into one Lisp string was rejected because it bypasses the bounded-output contract.
 
 ### 2026-08-13 — I-011: mutating native work outlives its RPC handler future
 
@@ -669,11 +633,11 @@ Each accepted execution owns a separate output state shared by one synchronous p
 
 The initial infrastructure budget is 256 KiB of queued UTF-8 divided into chunks no larger than 16 KiB. Adjacent fragments are coalesced into the current chunk, including across renderer calls, so many one-byte values cannot turn the byte budget into unbounded per-fragment allocation metadata. Chunks split only at UTF-8 boundaries and concatenating them reproduces stdout byte for byte. Disconnect clears queued data and makes later emission a no-op without clearing an already latched cancellation; cancellation stops later emission but retains bytes already queued for the still-connected client.
 
-A Tokio channel bounded only by message count was rejected because each message could contain an unrestricted string. Holding the scheduler lock while waiting for space was rejected because `acadctl:println` re-enters Rust synchronously on AutoCAD's main thread. Making async read ownership part of the queue entry was rejected because cancelling that future could lose an output chunk.
+A Tokio channel bounded only by message count was rejected because each message could contain an unrestricted string. Holding the scheduler lock while waiting for space was rejected because the value visitor re-enters Rust synchronously on AutoCAD's main thread. Making async read ownership part of the queue entry was rejected because cancelling that future could lose an output chunk.
 
 ### 2026-08-14 — I-024: output fragments become readable at bounded flush points
 
-Renderer fragments remain private to the producer until their chunk reaches 16 KiB or the completed `acadctl:println` or implicit eval value explicitly flushes it. Completed small lines are merged into the last unread transport chunk when capacity permits. A connected client therefore receives a completed line promptly, while a fast consumer cannot turn every string escape, list delimiter, or one-byte argument into a separate allocation and RPC event. Large values still expose full chunks incrementally and apply the same byte-budget backpressure before the value finishes.
+Renderer fragments remain private to the producer until their chunk reaches 16 KiB or the completed implicit eval value explicitly flushes it. Completed small chunks are merged into the last unread transport chunk when capacity permits, while a fast consumer cannot turn every string escape, list delimiter, or one-byte argument into a separate allocation and RPC event. Large values still expose full chunks incrementally and apply the same byte-budget backpressure before the value finishes.
 
 Notifying the consumer after every fragment was rejected after a clean-context performance audit demonstrated a schedule in which the consumer removed each one-byte partial tail before the next fragment arrived. Coalescing only while the consumer happened to lag did not establish the bounded-message property recorded in I-006 and I-023.
 
@@ -691,11 +655,11 @@ Describing the payload limit as an allocator-exact heap limit was rejected after
 
 ### 2026-08-14 — I-027: Rust renders typed value events
 
-Rust's value printer consumes an iterative stream of structural and typed events: list begin and end, dotted-tail markers, strings in bounded chunks, symbols, numbers, points, and normalized opaque kinds. It owns list spacing, display versus readable string behavior, stable PascalCase opaque tags, payload sanitization, the final newline, and the explicit output flush. C++ only classifies documented `resbuf` fields and forwards bounded text; a private fixed-arity Lisp visitor may normalize symbols and unsupported opaque values before crossing the same event boundary.
+Rust's value printer consumes an iterative stream of structural and typed events: list begin and end, dotted-tail markers, strings in bounded chunks, symbols, numbers, points, and normalized opaque kinds. It owns list spacing, readable string behavior, stable PascalCase opaque tags, payload sanitization, the final newline, and the final flush. C++ forwards bounded text; a private fixed-arity Lisp visitor normalizes symbols and unsupported opaque values before crossing the event boundary.
 
 Live AutoCAD 2027 checks established that `prin1` and `princ` differ recursively for strings, while lists use conventional proper and dotted syntax. Readable strings escape quote, backslash, line feed, carriage return, and tab; literal Unicode remains literal. Stable acadctl opaque displays deliberately replace AutoCAD's pointer-bearing entity and function printers and path-bearing file printer. Whole-composite `vl-prin1-to-string`, native command-line capture, and C++ formatting policy remain rejected because they either allocate without the output budget, mix console output, or move load-bearing behavior into the bridge.
 
-Documented `resbuf` types do not cover every promised AutoLISP opaque family. Public arbitrary-value `acadctl:println`, nested opaque normalization, and the unavoidable AutoCAD-side allocation for a huge variadic argument graph therefore remain native live proof gates. The formatter being total for its typed event vocabulary is not treated as proof that AutoCAD can marshal every source value into that vocabulary.
+Documented `resbuf` types do not cover every AutoLISP opaque family. The formatter being total for its typed event vocabulary is not treated as proof that AutoCAD can marshal every source value into that vocabulary.
 
 ### 2026-08-14 — I-028: native numeric text and structural limits preserve Lisp semantics safely
 
@@ -749,24 +713,6 @@ Cancellation before `_UNDO _Begin` completes without opening a group. If cancell
 
 An evaluator failure observed after cancellation still becomes the terminal failure and keeps its source location. A failed cancellation rollback, failed empty-group close, lost native context, or failed lease cleanup overrides `Cancelled` with failure and an unknown drawing outcome. Plugin shutdown requests cancellation only while the active execution remains before finalization, wakes its output with `Stopped`, and leaves the already claimed native lease in place until its synchronous callback reaches rollback or terminal completion.
 
-### 2026-08-14 — I-035: native value output uses a request-owned typed writer
-
-The scheduler records the exact document and database key when AutoCAD claims an execution action. A `println` writer is enabled only while that one claimed job is evaluating a form and only when the native callback's current document and database tokens match the recorded key. The writer receives no execution identifier, sink handle, or routing label from AutoLISP. Outside that state it is inert and the eventual Lisp function still returns `nil`.
-
-The scheduler lock protects only the short routing check and cloning of request-owned I/O state. The resulting Rust writer owns the bounded formatter and output sink independently, so every typed event and any byte-budget wait occurs after the scheduler lock has been released. One tagged CXX entry point carries scalar fields and borrowed bounded text fragments. Storing owned strings in a generic event object was rejected because it would add an allocation and copy at every native fragment; exposing one FFI function per printable type was rejected as unnecessary bridge surface.
-
-`acadctl:println` accepts zero or more top-level values, concatenates their display representations, and adds exactly one newline. The later implicit `eval` writer uses the same event vocabulary in readable mode but requires exactly one top-level value. Malformed structure, a renderer limit, premature output completion, or dropping an unfinished active writer latches the first bridge failure on the execution. At the form checkpoint, an actual evaluator failure takes precedence over that bridge failure, the bridge failure takes precedence over concurrent cancellation, and the selected failure follows the ordinary rollback path with the form's source location. Disconnect, accepted cancellation, and plugin stop terminate traversal without being reclassified as bridge corruption.
-
-A process-global current sink, a C++-owned request pointer, caller-supplied correlation, native formatting policy, and whole-value rendered strings were rejected. This slice exposes only the private trusted writer boundary; per-document `acadctl:println` registration and mechanical native value traversal remain separate proof slices.
-
-### 2026-08-14 — I-036: every value writer is leased to one form generation
-
-Each yielded form opens a new generation in its execution-owned output state. The exact-document routing check may claim one writer lease only while that generation is open, has no prior bridge failure, and has no other live writer. Finishing or terminalizing the writer releases the lease. The form checkpoint closes the generation before it selects evaluator failure, bridge failure, cancellation, or continuation; any lease still outstanding at that point becomes an `Abandoned` bridge failure attributed to that same form. Older writers then become inert and cannot write output or record a fault against a later form.
-
-Relying only on the future C++ callback to destroy its writer before `complete_execution_step` was rejected. The CXX boundary transfers an owning box but its type alone does not prove callback ordering, so a retained writer could otherwise fail after the final checkpoint and allow success, or contaminate the next form's failure slot. The generation and outstanding-writer count make that lifetime rule authoritative in Rust while retaining a short bridge-state mutex; no output emission or backpressure wait holds it.
-
-A writer releases its formatter, execution I/O reference, and producer sink as soon as it reaches disconnect, cancellation, stop, completion, malformed structure, or a renderer limit. Keeping a terminal writer's list stack and request-owned I/O alive until an arbitrary later CXX box destruction was rejected because the native boundary does not need that state after its first terminal result.
-
 ### 2026-08-14 — I-037: Rust normalizes native binary reals
 
 I-028's numeric boundary is amended: ObjectARX exposes real and point values to the registered function as binary `double` fields, so those fields cross the mechanical bridge unchanged and Rust owns their textual normalization. Requiring C++ to manufacture an already normalized token would move printer policy into the bridge and would depend on a native formatter whose contract is not AutoLISP `prin1` or `princ` semantics.
@@ -775,19 +721,11 @@ Live AutoCAD 2027 checks established the complete notation boundary used here. R
 
 Non-finite bridge values are rejected as malformed events. AutoLISP's reader collapsed tested overflow and subnormal literals to zero, but that did not prove how its printer would spell a raw subnormal injected through native code; finite subnormal spelling therefore remains a live native-domain gate rather than being silently clamped. Rust shortest-decimal output, `acdbRToS`, locale-sensitive native formatting, and treating reader overflow as evidence that infinity means zero were rejected because none match the observed printer contract reliably.
 
-### 2026-08-14 — I-038: `acadctl:println` is registered per drawing and walks documented native values mechanically
-
-The public external function is defined during each `kLoadDwgMsg` edit session and undefined during the corresponding `kUnloadDwgMsg`, matching ObjectARX's per-document AutoLISP symbol lifecycle. A fixed application-local function code identifies the callback. Native capability is tracked against the exact document and current database generation and is cleared conservatively when that database changes. Failure to define or bind it marks execution unavailable for that drawing but does not abort the drawing's load or disable unrelated status and lifecycle operations. A later user definition can still shadow the external function, so the `acadctl:` namespace remains a contract rather than a native enforcement mechanism.
-
-The callback derives the current document and database tokens from AutoCAD and asks Rust for a writer. It accepts no caller-supplied request identity. An inactive writer makes the function a no-op. AutoLISP `nil` is published before the form writer lease is released; success returns the external-function result code `RSRSLT`, while failed result publication records a bridge failure on that form and returns `RSERR`. Command-processor status `RTNORM` is not itself a registered-function return code. The argument chain returned by `acedGetArgs` is consumed synchronously and never retained or freed by the plugin. Strings are discovered and transcoded in bounded chunks without first scanning their full length and without splitting UTF-16 surrogate pairs on platforms that use them, so cancellation and terminal output state are checked between chunks. Entity names are converted only to stable database handles; selection-set payloads are omitted until their native identity representation is proved. Unknown and pointer-sized native tags are reported through the stable unsupported-value event without reading or exposing their union payload.
-
-The native walker is iterative and uses constant-memory cycle detection over the `resbuf` chain. A detected cycle becomes a bridge failure and follows the form's rollback path; acyclic values have no arbitrary node-count cutoff and remain governed by bounded output backpressure and cancellation polling on every event. Pre-rendering the entire argument graph, recursive C++ formatting, freeing the `acedGetArgs` chain, exposing native addresses or file paths, and treating `RTRESBUF` as an undocumented pointer were rejected because they would add unbounded copies, move policy into C++, or rely on unsupported ownership and union layouts.
-
 ### 2026-08-14 — I-039: the implicit `eval` value is a post-commit phase
 
 The successful `eval` form leaves its raw value rooted only until AutoCAD has positively closed the request's undo group. Rust then yields a distinct `EmitValue` step and opens a new readable, exactly-one-value output epoch. `exec` continues clearing every implicit form value immediately. Handing the `Commit` step to the native loop remains the cancellation point of no return; a cancellation request that loses that race is too late and does not suppress the implicit value.
 
-A failure while reading, visiting, formatting, or clearing the result after `_UNDO End` is an execution failure with `DrawingOutcome::Committed`. It never issues `U`: the drawing group is known closed, and undoing valid mutations because their return value could not be delivered would cross the finalization boundary. Reporting `Unknown` was rejected because it would hide the positive commit evidence and could make an automatic retry repeat mutations. Reporting success was rejected because `eval` did not satisfy its value contract. Already streamed `println` output and a partial implicit-value prefix remain visible; buffering a complete value solely to retract output was rejected because it would violate the bounded-output design. A later document-context restore or unlock failure can still amend any outcome, including `Committed`, to `Unknown`.
+A failure while reading, visiting, formatting, or clearing the result after `_UNDO End` is an execution failure with `DrawingOutcome::Committed`. It never issues `U`: the drawing group is known closed, and undoing valid mutations because their return value could not be delivered would cross the finalization boundary. Reporting `Unknown` was rejected because it would hide the positive commit evidence and could make an automatic retry repeat mutations. Reporting success was rejected because `eval` did not satisfy its value contract. A partial implicit-value prefix remains visible; buffering a complete value solely to retract output was rejected because it would violate the bounded-output design. A later document-context restore or unlock failure can still amend any outcome, including `Committed`, to `Unknown`.
 
 ### 2026-08-14 — I-040: retained eval state is cleared separately from drawing rollback
 
@@ -795,13 +733,13 @@ Rust marks the one `eval` form step with an explicit retain-value property; C++ 
 
 If eval must fail or cancel before commit completes, Rust yields `ClearValue` before `Rollback`. Cleanup and drawing recovery therefore produce separate evidence: a cleanup failure is preserved in the diagnostic, but a subsequently proved drawing rollback still reports `RolledBack`; only rollback or context-proof failure reports `Unknown`. Folding value cleanup into the native rollback command was rejected because it would make those outcomes indistinguishable.
 
-Form output and post-commit value output use separate generation-tagged epochs. Form epochs permit sequential one-at-a-time `acadctl:println` writers. The eval epoch requires exactly one writer claim and cannot be reopened after release, including after disconnect or plugin stop. Closing an epoch invalidates stale writers before evaluating its result, so a retained native writer cannot emit into or fault a later phase. No scheduler or epoch mutex remains held during formatting or byte-budget backpressure.
+The eval output epoch requires exactly one writer claim and cannot be reopened after release, including after disconnect or plugin stop. Closing the epoch invalidates stale writers before evaluating its result, so a retained native writer cannot emit into or fault a later phase. No scheduler or epoch mutex remains held during formatting or byte-budget backpressure.
 
 ### 2026-08-14 — I-041: a private Lisp visitor normalizes the committed eval value
 
 The post-commit value path uses a compile-time embedded AutoLISP visitor rather than `acedGetSym`. The visitor captures `acadctl:*value*` in a lambda local, clears the global root before visible output begins, and iteratively emits typed events through the private fixed-arity `acadctl:_value-event` function. Strings and raw symbol names are sliced into at most 4,096 AutoLISP characters per callback, list traversal uses an explicit stack capped at 4,096 nested values, and Floyd cycle detection replaces a cyclic tail with a stable `#<Object Cycle>` display. Reaching the visitor depth boundary produces `#<Object DepthLimit>` rather than recursing on the native or Rust stack.
 
-The private callback is registered and undefined with `acadctl:println` in every drawing. It accepts no request identity. Rust first validates and claims the exact execution, document, database, post-commit phase, and exactly-one writer epoch. C++ then exposes the owned Rust writer through a thread-local borrowed pointer only for the dynamic extent of the synchronous fixed visitor command; an RAII guard clears it before the step can complete. This narrow reentrant handle amends I-035's rejection of a C++ request pointer: it is neither routing authority nor persistent request state, and source Lisp cannot select or retain it. Keeping the writer in a Rust global, passing an execution ID through Lisp, and storing a whole rendered value were rejected because they would complicate ownership, expose correlation, or violate bounded output.
+The private callback is registered and undefined in every drawing. It accepts no request identity. Rust first validates and claims the exact execution, document, database, post-commit phase, and exactly-one writer epoch. C++ then exposes the owned Rust writer through a thread-local borrowed pointer only for the dynamic extent of the synchronous fixed visitor command; an RAII guard clears it before the step can complete. This narrow reentrant handle is neither routing authority nor persistent request state, and source Lisp cannot select or retain it. Keeping the writer in a Rust global, passing an execution ID through Lisp, and storing a whole rendered value were rejected because they would complicate ownership, expose correlation, or violate bounded output.
 
 `acedGetSym` was rejected as the primary value path. Documented result buffers have no symbol tag or generic Lisp-object field, so they cannot preserve arbitrary symbols and opaque leaves reliably; the call also returns a caller-owned materialized result graph proportional to the complete value before streaming can begin. The visitor still necessarily retains the original AutoLISP value while it walks and may allocate a raw symbol-name or bounded substring in AutoCAD. The 256 KiB queue and 16 KiB fragment limits bound Rust/C++ rendering infrastructure, not the source Lisp value or AutoCAD's own representation of one atom.
 
@@ -829,7 +767,7 @@ I-041 is amended so Rust is the sole authority for the committed-value visitor's
 
 The Lisp visitor retains only operations that require access to an actual Lisp object: `type`, cons traversal, Floyd cycle detection, `vl-symbol-name`, and bounded `substr`. It does not format a composite value, contain numeric copies of the Rust event enum, decide display labels, or scan a complete string with `strlen` before the first cancellable chunk. C++ validates the fixed two-argument callback shape, reads only documented `resbuf` union members, converts a bounded string fragment or entity name to raw text, and forwards `{code, payload kind, scalar fields}` to Rust. Reusing the public native-value enum for the private Lisp codes was rejected because it created two incompatible numeric schemas and moved protocol validation into the bridge.
 
-The private callback keeps one fixed `acadctl:_value-event` binding per drawing, registered with `acadctl:println` during the documented drawing-load lifecycle. This name is protected by the existing contract that the complete `acadctl:` namespace is reserved; it is not a hostile-code isolation boundary. Per-execution randomized function names were rejected because runtime registration is not the documented lifecycle, every name can remain interned in a long-lived Lisp environment, and the extra native binding state would not improve supported-source behavior.
+The private callback keeps one fixed `acadctl:_value-event` binding per drawing during the documented drawing-load lifecycle. This name is protected by the existing contract that the complete `acadctl:` namespace is reserved; it is not a hostile-code isolation boundary. Per-execution randomized function names were rejected because runtime registration is not the documented lifecycle, every name can remain interned in a long-lived Lisp environment, and the extra native binding state would not improve supported-source behavior.
 
 Native step observations carry reserved-symbol cleanup status separately from the evaluator or visitor result. Rust preserves a real Lisp or native failure first, then an output-bridge failure when no primary evaluation failure exists, and finally appends cleanup evidence. C++ replacing the original detail and `ERRNO` with a generic cleanup error was rejected. Impossible disagreement between the Rust step state and the native loop remains conservatively unknown instead of adding a second commit/rollback outcome state machine to C++.
 
@@ -907,7 +845,7 @@ The eager `SourceBatch` and `SourceShape` examples in the original design are su
 
 ### 2026-08-14 — I-055: implementation checkpoint after the naming sweep
 
-The committed implementation now covers the lexical scanner, document-generation identity, scheduler-owned mutation jobs, private execution lease, bounded output, typed value rendering, request-routed `acadctl:println`, post-commit eval value emission, cancellation state, and bounded bidirectional Execute RPC. The architecture naming sweep is the final refactor before a public execution client consumes those APIs.
+The committed implementation now covers the lexical scanner, document-generation identity, scheduler-owned mutation jobs, private execution lease, bounded output, typed value rendering, post-commit eval value emission, cancellation state, and bounded bidirectional Execute RPC. The architecture naming sweep is the final refactor before a public execution client consumes those APIs.
 
 I-056 through I-060 completed the CLI execution surface, and I-068 replaced provenance-safe history with ordinary drawing-wide undo and redo. This checkpoint remains only as implementation history.
 
@@ -943,7 +881,7 @@ Stdout start and write failures use the same interruptible stderr completion rec
 
 ### 2026-08-14 — I-060: observer failure disconnects output before reporting
 
-A stdout writer start or write failure first drops the live Execute response and only then waits for the stderr diagnostic receipt. Retaining the response while stderr was blocked would retain the plugin's `OutputStream`; its 256 KiB queue could fill and leave AutoCAD's main thread blocked in `acadctl:println` even though the client had already lost its output observer. Closing the response makes server-side output switch to disconnect/discard and is independent of whether the diagnostic pipe drains. The execution itself remains detached rather than implicitly cancelled, and the message keeps the unknown-outcome and no-blind-retry warning.
+A stdout writer start or write failure first drops the live Execute response and only then waits for the stderr diagnostic receipt. Retaining the response while stderr was blocked would retain the plugin's `OutputStream`; its 256 KiB queue could fill and leave AutoCAD's main thread blocked while emitting an `eval` value even though the client had already lost its output observer. Closing the response makes server-side output switch to disconnect/discard and is independent of whether the diagnostic pipe drains. The execution itself remains detached rather than implicitly cancelled, and the message keeps the unknown-outcome and no-blind-retry warning.
 
 ### 2026-08-14 — I-061: native-state quarantine survives transport restart
 
@@ -1003,7 +941,7 @@ The persistence model is the familiar one: save before risky work when the on-di
 
 ### 2026-08-14 — I-069: the installed private build passes the core document-context path
 
-The freshly built and installed AutoCAD 2027 plugin passed live document-scoped execution in a fresh process. `exec` ran multiple forms in order, `acadctl:println` streamed explicit output, and `eval` returned a number, nested dotted list, escaped string, symbol, and entity handle. A failing second form returned AutoLISP's own `bad argument type` detail and removed geometry created by the first form. An inactive target executed successfully while AutoCAD restored the previously active drawing.
+The freshly built and installed AutoCAD 2027 plugin passed live document-scoped execution in a fresh process. `exec` ran multiple forms in order, and `eval` returned a number, nested dotted list, escaped string, symbol, and entity handle. A failing second form returned AutoLISP's own `bad argument type` detail and removed geometry created by the first form. An inactive target executed successfully while AutoCAD restored the previously active drawing.
 
 One fixed `U`, one fixed `REDO`, and a final `U` moved the same execution-created entity through absent, present, and absent states. The same history action also routed to an inactive target and restored the prior active drawing. A request issued while AutoCAD was still completing the preceding document command failed busy and succeeded after the document became quiescent; it did not cancel or intrude on that work.
 
@@ -1035,21 +973,11 @@ Both modes wait until the selected PID disappears. Graceful termination waits at
 
 ### 2026-08-14 — I-073: the remaining macOS live gates pass
 
-Live AutoCAD 2027 testing closed the remaining current-platform gates. Cancellation during a multi-form batch returned status 130 at the next checkpoint, skipped the later form, and rolled both test entities back. Killing the attached CLI process after admission did not cancel the scheduler-owned job; its later form and both drawing mutations completed and were observed by a new client. With both stdout and stderr directed to one non-reading pipe and enough `acadctl:println` output to saturate every application buffer, Ctrl+C still reached the server, woke the blocked producer, and rolled the drawing back.
+Live AutoCAD 2027 testing closed the remaining current-platform gates. Cancellation during a multi-form batch returned status 130 at the next checkpoint, skipped the later form, and rolled both test entities back. Killing the attached CLI process after admission did not cancel the scheduler-owned job; its later form and both drawing mutations completed and were observed by a new client.
 
 A source of exactly 4 MiB crossed the real CLI, RPC, plugin scanner, and evaluator boundary successfully; one byte more was rejected locally with the specified diagnostic. A deliberately single 4 MiB string reached AutoLISP and produced AutoLISP's own `string too long on input` error, confirming that the application source limit is not falsely presented as a guarantee that every host reader form is valid. Busy admission was already proven in I-069: an action issued while AutoCAD was still completing a document command failed without cancelling that work and succeeded after quiescence.
 
 Process testing used disposable drawings. A saved drawing closed through graceful `acadctl kill` in about 2.5 seconds. With unsaved `test.dwg`, graceful kill waited the full five seconds, returned failure, and left the same process alive; only a later explicit `--force` terminated that exact PID. A separate forced request also terminated the prior exact process and subsequent selection refused the now-absent PID. The Windows CLI path compiles with the pinned target, but native Windows runtime and console-signal behavior remain a platform-specific validation task rather than evidence inferred from the macOS run.
-
-### 2026-08-15 — I-074: public `acadctl:println` accepts one value and reuses the Rust-owned visitor
-
-This entry supersedes I-010 and the public direct-argument traversal described in I-035 and I-038. Live AutoCAD 2027 proved that the external-function argument boundary rejects ordinary symbols, error objects, files, and functions before the registered callback can normalize them. A dotted pair can also arrive in a legacy result-buffer shape that is not safely streamable without retaining or pre-scanning composite state. AutoLISP does not support a user-defined variadic formal list, so neither the direct native walker nor a variadic Lisp replacement provides the promised arbitrary-value contract.
-
-The public function is therefore a fixed-arity AutoLISP wrapper that accepts exactly one value. It stores that value in the reserved evaluator slot, asks a private native callback to claim the current form writer, evaluates the existing Rust-generated iterative value visitor, and calls a second private callback to finish the writer and publish `nil`. The same visitor protocol now normalizes explicit display output and the post-commit readable eval value; Rust still owns event codes, payload validation, formatting, output routing, backpressure, cancellation, and the exactly-one-root rule. C++ only stages the bounded visitor source and holds the writer for the wrapper's dynamic lifetime. An interrupted wrapper leaves that writer on the pending document dispatch so the next execution callback or terminal cleanup can fail and release the correct form lease.
-
-Callers that want a label and value on one line construct one value, normally with `strcat`, `itoa`, or another ordinary AutoLISP conversion. Zero or multiple arguments produce AutoLISP's normal arity errors. Outside an active request the wrapper returns `nil` without visiting or emitting its argument. Whole-value rendering, a C++ composite walker, undocumented result-buffer fields, multiple private event schemas, and a second Lisp formatter remain rejected.
-
-The exact installed build printed a string, symbol, nested dotted list, caught error, file, function, entity, and selection set through this path. It also returned `nil` without output outside a request, reported ordinary too-few and too-many argument errors, preserved implicit readable eval output, and rolled back a mutation before a failing later form.
 
 ### 2026-08-15 — I-075: process termination retains platform identity; explicit force uses `SIGKILL` on macOS
 
@@ -1061,23 +989,19 @@ On Windows, discovery retains a query-and-synchronize process handle and creatio
 
 ### 2026-08-15 — I-076: host-cancelled Lisp resumes the Rust-owned unwind
 
-This entry supersedes I-041's description of a visitor writer whose native lifetime is limited to one synchronous command and refines I-070's unconditional quarantine rule for premature driver termination. The public one-value wrapper crosses several registered-function callbacks, so its owned writer remains on the pending document dispatch for that wrapper's dynamic lifetime. A thread-local borrowed pointer only makes the currently retained writer reachable to the private value-event callback; it carries no routing identity or independent lifetime. The finish callback and every interruption path invalidate and release the writer before the dispatch can settle.
+This entry refines I-070's unconditional quarantine rule for premature driver termination. A thread-local borrowed pointer makes the post-commit eval writer reachable to the private value-event callback only while the visitor runs; it carries no routing identity or independent lifetime. Every interruption path invalidates and releases the writer before the dispatch can settle.
 
 An AutoCAD `lispCancelled` event can terminate the queued outer driver after `_UNDO _Begin` without returning through the normal evaluator checkpoint. Treating that event as an ordinary bridge failure would leave the drawing group and reserved evaluator state outside Rust's unwind. The native bridge therefore records the interrupted evaluator or value visitor as a failed Rust step, clears evaluator symbols only in the proved target context, and queues the same fixed outer driver again. The existing Rust execution state then chooses `ClearRetainedEvalValue`, `RollbackUndoGroup`, and terminal cleanup exactly as it does for an ordinary form failure. If the interrupted step cannot be correlated, the bridge abandons it into the Rust failure state; if exact context or rescheduling cannot be proved, finalization fails closed and quarantines further mutation instead of guessing at cleanup.
-
-The claimed public println path revalidates the pending execution phase, target document, current and active document, and database generation before staging, reading, or clearing target execution state. An unclaimed begin discards only the ambient `acadctl:*value*` that the wrapper has just stored and returns `nil`. A mismatch after a writer was claimed invalidates that writer and enters the existing context-loss path without clearing state in another drawing.
 
 The exact installed AutoCAD 2027 build was interrupted with Escape while an infinite second form was running after creating a uniquely sized circle. The client returned AutoLISP's `Function cancelled` failure. AutoCAD then reported the undo-group bit clear and all seven reserved evaluator symbols `nil`; the marker circle was absent, and a fresh request in the same process succeeded. This closes host-level cancellation recovery for the tested build independently of cooperative CLI cancellation.
 
 ### 2026-08-15 — I-077: names describe the final ownership and handoff boundaries
 
-This entry supersedes the architecture-significant vocabulary in I-071 and the output-path terms amended by I-074 and I-076. A fresh first-principles review of the committed implementation found the ownership split sound but identified names whose temporal or semantic scope became false in the final queued-driver architecture.
+This entry supersedes the architecture-significant vocabulary in I-071 and the output-path terms amended by I-076. A fresh first-principles review of the committed implementation found the ownership split sound but identified names whose temporal or semantic scope became false in the final queued-driver architecture.
 
 C++ holds one `DocumentContextDispatch` from queueing through running and finalization; calling it pending during the latter phases hid cleanup-critical lifetime. Its methods are `queueDocumentContextDispatch`, `scheduleDocumentContextFinalizer`, and `finalizeDocumentContextDispatch`. Execution is the `ExecutionDriver` dispatch kind, and `advanceCallbackActive` plus `finishAdvanceCallback` describe the one `_advance-execution` callback fact rather than execution policy.
 
-The shared AutoLISP slots are execution-bridge symbols, not evaluator-only state. Native cleanup is therefore `clearExecutionBridgeSymbols`, its mechanical result is `LispBridgeStepResult`, retained-state evidence is `bridgeSymbolsMayBeRetained`, and the Rust/native failure is `ExecutionBridgeSymbolsClearFailed`. The actual private globals use `acadctl:*bridge-*` names; undefined failure sentinels use `_invalid-*`, and the loader temporary is `acadctl:*loader-directory*`. Only `acadctl:println` remains public.
-
-Explicit request output is the `Println` value-output kind and writer policy. `Form` was rejected because it was easily confused with the separate implicit eval form value. The RPC `ExecutionOutput.chunk` field likewise states that one transport event can contain only part of a printed value or line. The message remains `ExecutionOutput` because it is still one ordered output event.
+The shared AutoLISP slots are execution-bridge symbols, not evaluator-only state. Native cleanup is therefore `clearExecutionBridgeSymbols`, its mechanical result is `LispBridgeStepResult`, retained-state evidence is `bridgeSymbolsMayBeRetained`, and the Rust/native failure is `ExecutionBridgeSymbolsClearFailed`. The actual private globals use `acadctl:*bridge-*` names; undefined failure sentinels use `_invalid-*`, and the loader temporary is `acadctl:*loader-directory*`. There is no public Lisp API.
 
 Rust's mutating wake transition is `try_claim_native_action_wake`, not a predicate. Poisoned scheduler access is `SchedulerStateUnavailable`. The first-form boundary is represented by `form_handed_off`, `has_handed_off_form`, and `execution_has_not_handed_off_form`, because Rust can prove that it yielded `EvaluateForm` but cannot claim native evaluation already began. The associated five-second timer is consequently the execution-start deadline, beginning at accepted admission and ending at that handoff.
 
@@ -1085,9 +1009,9 @@ Message-scoped request fields remain `id`, and `NativeExecutionStep` and `Native
 
 ### 2026-08-15 — I-078: final macOS evidence is scoped to the implemented bridge and measured bounds
 
-This entry supersedes the obsolete reachable-path details in I-027, I-028, I-035, and I-038 and narrows I-073's phrase “remaining current-platform gates” to the behavioral cases recorded there. Public `acadctl:println` and implicit eval output now share one Rust-owned event schema produced by the fixed Lisp visitor. Points cross as ordinary Lisp lists of reals. Selection sets, VLA objects, and functions carry only their stable opaque kind; the former native payload and direct `resbuf` walker no longer exist. The writer accepts exactly one root, and Rust owns every event code, payload check, rendering decision, output limit, and terminal failure. C++ retains only the opaque writer and forwards the visitor's bounded raw fields.
+This entry supersedes the obsolete reachable-path details in I-027 and I-028 and narrows I-073's phrase “remaining current-platform gates” to the behavioral cases recorded there. The implicit eval output uses one Rust-owned event schema produced by the fixed Lisp visitor. Points cross as ordinary Lisp lists of reals. Selection sets, VLA objects, and functions carry only their stable opaque kind; the former native payload and direct `resbuf` walker no longer exist. The writer accepts exactly one root, and Rust owns every event code, payload check, rendering decision, output limit, and terminal failure. C++ retains only the opaque writer and forwards the visitor's bounded raw fields.
 
-The freshly built and installed AutoCAD 2027 bundle passed the final disposable-drawing matrix. A four-edge closed polyline was created through `exec`, then moved through one ordinary `undo` and `redo` and remained addressable by its handle. Explicit output and the implicit eval value preserved symbols, Unicode, dotted structure, and a selection-set tag. A failing second form removed the first form's marker entity. Escape during an infinite second form returned `Function cancelled`, removed its marker, left the undo-group bit clear, cleared every reserved bridge symbol, and allowed a fresh request. Abrupt stdout loss did not cancel an accepted 5,000-print execution; the counter reached 5,000 and a subsequent request succeeded.
+The freshly built and installed AutoCAD 2027 bundle passed the final disposable-drawing matrix. A four-edge closed polyline was created through `exec`, then moved through one ordinary `undo` and `redo` and remained addressable by its handle. The implicit eval value preserved symbols, Unicode, dotted structure, and a selection-set tag. A failing second form removed the first form's marker entity. Escape during an infinite second form returned `Function cancelled`, removed its marker, left the undo-group bit clear, cleared every reserved bridge symbol, and allowed a fresh request.
 
 The first-Ctrl+C boundary was also exercised after commit while a 500,000-element eval value was streaming under backpressure. AutoCAD returned `TooLate`; the CLI reported that fact and remained attached, then exited with status 130 only after the terminal result. The acknowledgement is therefore a receipt, not implicit detachment. A second Ctrl+C may detach after either `Accepted` or `TooLate`, while the third remains the unconfirmed escape described by I-057.
 
