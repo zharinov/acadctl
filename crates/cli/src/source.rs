@@ -48,13 +48,6 @@ impl SourceError {
 fn read_stdin(eval: bool) -> Result<SourceInput, SourceError> {
     let stdin = io::stdin();
 
-    if stdin.is_terminal() {
-        #[cfg(windows)]
-        eprintln!("acadctl: reading AutoLISP from stdin; press Ctrl+Z, then Enter, to execute.");
-        #[cfg(not(windows))]
-        eprintln!("acadctl: reading AutoLISP from stdin; press Ctrl+D to execute.");
-    }
-
     let bytes = read_bounded(stdin.lock()).map_err(|error| {
         SourceError::Message(format!("Could not read AutoLISP from stdin: {error}"))
     })?;
