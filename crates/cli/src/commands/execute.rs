@@ -182,27 +182,21 @@ async fn receive_response(
             Some(execution_server_event::Event::CancelAcknowledgement(acknowledgement))
                 if accepted =>
             {
-                if cancellation_acknowledged {
-                    return invalid_response(
-                        interrupts,
-                        "AutoCAD acknowledged the same cancellation more than once",
-                    )
-                    .await;
-                }
-                match ExecutionCancelDisposition::try_from(acknowledgement.disposition) {
-                    Ok(ExecutionCancelDisposition::Accepted) => {
-                        cancellation_acknowledged = true;
-                        if interrupts.detach_requested() {
-                            return confirmed_detach_exit(interrupts);
-                        }
+                match record_cancellation_acknowledgement(
+                    interrupts,
+                    &mut cancellation_acknowledged,
+                    acknowledgement.disposition,
+                ) {
+                    CancellationReceipt::Continue => {}
+                    CancellationReceipt::Detach => return confirmed_detach_exit(interrupts),
+                    CancellationReceipt::Duplicate => {
+                        return invalid_response(
+                            interrupts,
+                            "AutoCAD acknowledged the same cancellation more than once",
+                        )
+                        .await;
                     }
-                    Ok(ExecutionCancelDisposition::TooLate) => {
-                        interrupts.notice(
-                            "acadctl: cancellation was too late; detaching while AutoCAD finishes.",
-                        );
-                        return cancelled_exit();
-                    }
-                    Ok(ExecutionCancelDisposition::Unspecified) | Err(_) => {
+                    CancellationReceipt::Invalid => {
                         return invalid_response(
                             interrupts,
                             "AutoCAD returned an invalid cancellation acknowledgement",
@@ -350,6 +344,39 @@ async fn invalid_response(interrupts: &mut Interrupts, detail: &str) -> ExitCode
 
 fn cancelled_exit() -> ExitCode {
     ExitCode::from(130)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CancellationReceipt {
+    Continue,
+    Detach,
+    Duplicate,
+    Invalid,
+}
+
+fn record_cancellation_acknowledgement(
+    interrupts: &Interrupts,
+    acknowledged: &mut bool,
+    disposition: i32,
+) -> CancellationReceipt {
+    if *acknowledged {
+        return CancellationReceipt::Duplicate;
+    }
+    match ExecutionCancelDisposition::try_from(disposition) {
+        Ok(ExecutionCancelDisposition::Accepted) => {}
+        Ok(ExecutionCancelDisposition::TooLate) => interrupts.notice(
+            "acadctl: cancellation was too late; execution will continue. Press Ctrl+C again to detach.",
+        ),
+        Ok(ExecutionCancelDisposition::Unspecified) | Err(_) => {
+            return CancellationReceipt::Invalid;
+        }
+    }
+    *acknowledged = true;
+    if interrupts.detach_requested() {
+        CancellationReceipt::Detach
+    } else {
+        CancellationReceipt::Continue
+    }
 }
 
 fn confirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
@@ -893,6 +920,35 @@ mod tests {
         assert!(matches!(
             wait_for_control(pending::<()>(), &mut forced, false).await,
             ControlWait::UnconfirmedDetach
+        ));
+    }
+
+    #[tokio::test]
+    async fn too_late_after_the_first_interrupt_remains_attached() {
+        let (mut interrupts, sender) = Interrupts::test_pair();
+        sender
+            .send(Interrupt::Cancel { queued: true })
+            .await
+            .unwrap();
+        let interrupt = interrupts.next().await;
+        interrupts.note(interrupt);
+
+        let mut acknowledged = false;
+        assert_eq!(
+            record_cancellation_acknowledgement(
+                &interrupts,
+                &mut acknowledged,
+                ExecutionCancelDisposition::TooLate as i32,
+            ),
+            CancellationReceipt::Continue
+        );
+        assert!(acknowledged);
+        assert!(!interrupts.detach_requested());
+
+        sender.send(Interrupt::Detach).await.unwrap();
+        assert!(matches!(
+            wait_for_control(pending::<()>(), &mut interrupts, acknowledged).await,
+            ControlWait::ConfirmedDetach
         ));
     }
 
