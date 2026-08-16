@@ -14,20 +14,16 @@ pub struct Instance {
 }
 
 impl Instance {
-    async fn query(instance_id: InstanceId) -> Option<Self> {
+    async fn query(instance_id: InstanceId) -> Self {
         let drawings = match timeout(LIST_TIMEOUT, query_drawings(instance_id)).await {
             Ok(result) => result,
             Err(_) => Err(QueryError::TimedOut),
         };
 
-        if matches!(drawings, Err(QueryError::CannotConnect)) {
-            return None;
-        }
-
-        Some(Self {
+        Self {
             instance_id,
             drawings,
-        })
+        }
     }
 }
 
@@ -85,11 +81,7 @@ impl InstanceSnapshot {
             .collect::<FuturesUnordered<_>>();
         let mut instances = Vec::new();
 
-        while let Some(result) = pending.next().await {
-            let Some(instance) = result else {
-                continue;
-            };
-
+        while let Some(instance) = pending.next().await {
             instances.push(instance);
         }
 
@@ -173,6 +165,15 @@ pub use process::AutoCadInstance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn preserves_an_instance_when_its_plugin_is_unavailable() {
+        let instance_id = InstanceId::new(std::process::id()).unwrap();
+        let instance = Instance::query(instance_id).await;
+
+        assert_eq!(instance.instance_id, instance_id);
+        assert!(matches!(instance.drawings, Err(QueryError::CannotConnect)));
+    }
 
     #[test]
     fn instance_selection_errors_preserve_cli_guidance() {

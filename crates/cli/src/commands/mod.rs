@@ -22,28 +22,22 @@ fn fail(message: String) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn query_error_message(instance: acadctl_rpc::InstanceId, error: &QueryError) -> String {
+fn query_error_message(error: &QueryError) -> String {
     match error {
-        QueryError::CannotConnect => {
-            format!("Could not connect to AutoCAD instance {instance} (plugin unavailable)")
-        }
-        QueryError::TimedOut => {
-            format!("AutoCAD instance {instance} did not respond within 5 seconds")
-        }
-        QueryError::OutdatedPlugin => {
-            format!("Could not inspect AutoCAD instance {instance} (plugin incompatible)")
-        }
+        QueryError::CannotConnect => "Plugin unavailable. Install it and restart AutoCAD.".into(),
+        QueryError::TimedOut => "Plugin does not respond within 5 seconds.".into(),
+        QueryError::OutdatedPlugin => "Plugin incompatible. Update it and restart AutoCAD.".into(),
         QueryError::RequestFailed(message) if incompatible_message(message) => {
-            format!("Could not inspect AutoCAD instance {instance} (plugin incompatible)")
+            "Plugin incompatible. Update it and restart AutoCAD.".into()
         }
-        QueryError::RequestFailed(_) => format!("Could not inspect AutoCAD instance {instance}"),
+        QueryError::RequestFailed(_) => "Unknown error.".into(),
     }
 }
 
 async fn connect_drawings(instance_id: acadctl_rpc::InstanceId) -> Result<DrawingClient, String> {
     crate::instance::connect_drawings(instance_id)
         .await
-        .map_err(|error| query_error_message(instance_id, &error))
+        .map_err(|error| query_error_message(&error))
 }
 
 fn request_error_message(operation: &str, target: Option<Target>, status: Status) -> String {

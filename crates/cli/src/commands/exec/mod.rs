@@ -68,12 +68,9 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
     .await
     {
         Ok(Ok(client)) => client,
-        Ok(Err(error)) => return fail(query_error_message(target.instance_id, &error)),
+        Ok(Err(error)) => return fail(query_error_message(&error)),
         Err(_) => {
-            return fail(query_error_message(
-                target.instance_id,
-                &QueryError::TimedOut,
-            ));
+            return fail(query_error_message(&QueryError::TimedOut));
         }
     };
 

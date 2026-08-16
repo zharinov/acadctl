@@ -46,7 +46,7 @@ fn render(instances: &[Instance], long: bool) -> Rendered {
         let drawings = match &instance.drawings {
             Ok(drawings) => drawings,
             Err(error) => {
-                diagnostics.push(query_error_message(instance.instance_id, error));
+                diagnostics.push(query_error_message(error));
                 continue;
             }
         };
@@ -164,15 +164,15 @@ mod tests {
     fn preserves_healthy_drawings_and_explains_each_failed_instance() {
         assert_eq!(
             render(&[failed(123, QueryError::CannotConnect)], false).diagnostics,
-            ["Could not connect to AutoCAD instance 007B (plugin unavailable)"]
+            ["Plugin unavailable. Install it and restart AutoCAD."]
         );
         assert_eq!(
             render(&[failed(123, QueryError::TimedOut)], false).diagnostics,
-            ["AutoCAD instance 007B did not respond within 5 seconds"]
+            ["Plugin does not respond within 5 seconds."]
         );
         assert_eq!(
             render(&[failed(123, QueryError::OutdatedPlugin)], false).diagnostics,
-            ["Could not inspect AutoCAD instance 007B (plugin incompatible)"]
+            ["Plugin incompatible. Update it and restart AutoCAD."]
         );
         assert_eq!(
             render(
@@ -180,7 +180,7 @@ mod tests {
                 false,
             )
             .diagnostics,
-            ["Could not inspect AutoCAD instance 007B"]
+            ["Unknown error."]
         );
         assert_eq!(
             render(
@@ -193,7 +193,7 @@ mod tests {
                 false,
             )
             .diagnostics,
-            ["Could not inspect AutoCAD instance 007B (plugin incompatible)"]
+            ["Plugin incompatible. Update it and restart AutoCAD."]
         );
         assert_eq!(
             render(
@@ -204,7 +204,7 @@ mod tests {
                 false,
             )
             .diagnostics,
-            ["Could not inspect AutoCAD instance 007B"]
+            ["Unknown error."]
         );
 
         let rendered = render(
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(rendered.lines, ["007B:32F3  .  rw  a.dwg"]);
         assert_eq!(
             rendered.diagnostics,
-            ["AutoCAD instance 01C8 did not respond within 5 seconds"]
+            ["Plugin does not respond within 5 seconds."]
         );
     }
 

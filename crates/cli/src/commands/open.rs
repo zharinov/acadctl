@@ -139,14 +139,11 @@ fn select_instance(instances: &[Instance], running: &[InstanceId]) -> Result<Ins
         return Ok(instance_id);
     }
 
-    if let Some((instance, error)) = instances.iter().find_map(|instance| {
-        instance
-            .drawings
-            .as_ref()
-            .err()
-            .map(|error| (instance.instance_id, error))
-    }) {
-        return Err(query_error_message(instance, error));
+    if let Some(error) = instances
+        .iter()
+        .find_map(|instance| instance.drawings.as_ref().err())
+    {
+        return Err(query_error_message(error));
     }
 
     match running {
