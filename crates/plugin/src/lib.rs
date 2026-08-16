@@ -1,6 +1,6 @@
 #[cxx::bridge(namespace = "acadctl")]
 mod ffi {
-    struct NativeDocSnapshot {
+    struct NativeDocumentSnapshot {
         document_token: usize,
         database_token: usize,
         name: String,
@@ -25,8 +25,8 @@ mod ffi {
     #[repr(u8)]
     enum NativeActionResultKind {
         Success,
-        DocGone,
-        DocGenerationChanged,
+        DrawingGone,
+        DrawingGenerationChanged,
         Unnamed,
         ReadOnly,
         Dirty,
@@ -37,8 +37,8 @@ mod ffi {
         HistoryFailed,
         NotQuiescent,
         UndoDisabled,
-        DocContextFailed,
-        DocContextRestoreFailed,
+        DocumentContextFailed,
+        DocumentContextRestoreFailed,
         ExecBridgeFinalizationFailed,
         ExecBridgeSymbolsClearFailed,
         ExecBridgeFailed,
@@ -174,7 +174,7 @@ mod ffi {
 
         fn start_rpc_server() -> String;
 
-        fn publish_document_snapshot(documents: Vec<NativeDocSnapshot>);
+        fn publish_document_snapshot(drawings: Vec<NativeDocumentSnapshot>);
 
         fn take_native_action() -> Box<NativeAction>;
 
@@ -262,7 +262,7 @@ mod ffi {
     }
 }
 
-mod doc;
+mod drawing;
 mod exec;
 mod rpc;
 mod scheduler;
@@ -276,8 +276,8 @@ fn start_rpc_server() -> String {
     rpc::start().err().unwrap_or_default()
 }
 
-fn publish_document_snapshot(documents: Vec<ffi::NativeDocSnapshot>) {
-    scheduler::replace_document_snapshot(documents);
+fn publish_document_snapshot(drawings: Vec<ffi::NativeDocumentSnapshot>) {
+    scheduler::replace_drawing_snapshot(drawings);
 }
 
 fn take_native_action() -> Box<NativeAction> {

@@ -5,7 +5,7 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 
-use crate::ProcessId;
+use crate::InstanceId;
 
 const ERROR_PIPE_BUSY: i32 = 231;
 
@@ -18,8 +18,8 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub fn bind(process_id: ProcessId) -> io::Result<Self> {
-        let name = endpoint(process_id);
+    pub fn bind(instance_id: InstanceId) -> io::Result<Self> {
+        let name = endpoint(instance_id);
         let next = server_options(true).create(&name)?;
 
         Ok(Self { name, next })
@@ -33,8 +33,8 @@ impl Listener {
     }
 }
 
-pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
-    let name = endpoint(process_id);
+pub async fn connect(instance_id: InstanceId) -> io::Result<ClientStream> {
+    let name = endpoint(instance_id);
 
     loop {
         match ClientOptions::new().open(&name) {
@@ -47,8 +47,8 @@ pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
     }
 }
 
-fn endpoint(process_id: ProcessId) -> String {
-    format!(r"\\.\pipe\acadctl-{process_id}")
+fn endpoint(instance_id: InstanceId) -> String {
+    format!(r"\\.\pipe\acadctl-{instance_id}")
 }
 
 fn server_options(first: bool) -> ServerOptions {

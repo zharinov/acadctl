@@ -8,17 +8,17 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::server::Connected;
 
-use crate::ProcessId;
+use crate::InstanceId;
 
 pub type ClientStream = platform::ClientStream;
 pub type Incoming = Pin<Box<dyn Stream<Item = io::Result<ServerStream>> + Send>>;
 
-pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
-    platform::connect(process_id).await
+pub async fn connect(instance_id: InstanceId) -> io::Result<ClientStream> {
+    platform::connect(instance_id).await
 }
 
-pub fn incoming(process_id: ProcessId) -> io::Result<Incoming> {
-    let listener = platform::Listener::bind(process_id)?;
+pub fn incoming(instance_id: InstanceId) -> io::Result<Incoming> {
+    let listener = platform::Listener::bind(instance_id)?;
     let permits = Arc::new(Semaphore::new(super::MAX_SERVER_CONNECTIONS));
     let connections = futures_util::stream::try_unfold(
         (listener, permits),

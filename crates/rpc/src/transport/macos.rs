@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use objc2_foundation::NSTemporaryDirectory;
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::ProcessId;
+use crate::InstanceId;
 
 pub type ClientStream = UnixStream;
 pub type ServerStream = UnixStream;
@@ -15,8 +15,8 @@ pub struct Listener {
 }
 
 impl Listener {
-    pub fn bind(process_id: ProcessId) -> io::Result<Self> {
-        let path = endpoint(process_id);
+    pub fn bind(instance_id: InstanceId) -> io::Result<Self> {
+        let path = endpoint(instance_id);
 
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -44,12 +44,12 @@ impl Drop for Listener {
     }
 }
 
-pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
-    UnixStream::connect(endpoint(process_id)).await
+pub async fn connect(instance_id: InstanceId) -> io::Result<ClientStream> {
+    UnixStream::connect(endpoint(instance_id)).await
 }
 
-fn endpoint(process_id: ProcessId) -> PathBuf {
-    user_temp_dir().join(format!("acadctl-{process_id}.sock"))
+fn endpoint(instance_id: InstanceId) -> PathBuf {
+    user_temp_dir().join(format!("acadctl-{instance_id}.sock"))
 }
 
 fn user_temp_dir() -> PathBuf {
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn endpoint_uses_the_system_user_temp_directory() {
-        let endpoint = endpoint(ProcessId::new(123).unwrap());
+        let endpoint = endpoint(InstanceId::new(123).unwrap());
 
         assert_eq!(endpoint.parent(), Some(user_temp_dir().as_path()));
         assert_eq!(endpoint.file_name().unwrap(), "acadctl-007B.sock");

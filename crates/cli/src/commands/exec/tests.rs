@@ -9,9 +9,27 @@ use acadctl_rpc::{DrawingOutcome, ExecCancelDisposition, SourceLocation};
 
 use super::*;
 
+fn target() -> Target {
+    "6A84:36C8".parse().unwrap()
+}
+
 struct BlockingWriter {
     started: Arc<AtomicBool>,
     release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Write for BlockingWriter {
@@ -58,13 +76,15 @@ fn formats_runtime_and_reader_failures_with_honest_locations() {
             column: 1,
         }),
         drawing_outcome: DrawingOutcome::RolledBack as i32,
+        drawing_error: acadctl_rpc::DrawingErrorKind::Unspecified as i32,
     };
 
     assert_eq!(
-        failure_lines(&runtime, "<stdin>"),
+        failure_lines(&runtime, "<stdin>", target()),
         [
-            "Execution error in script.lsp, form 3 (line 12).",
+            "AutoLISP failed in script.lsp at form 3, line 12",
             "bad argument type: numberp nil",
+            "Drawing changes were rolled back (other side effects may remain)",
         ]
     );
 
@@ -77,13 +97,15 @@ fn formats_runtime_and_reader_failures_with_honest_locations() {
             column: 17,
         }),
         drawing_outcome: DrawingOutcome::NotStarted as i32,
+        drawing_error: acadctl_rpc::DrawingErrorKind::Unspecified as i32,
     };
 
     assert_eq!(
-        failure_lines(&reader, "<stdin>"),
+        failure_lines(&reader, "<stdin>", target()),
         [
-            "Read error in script.lsp (line 12, column 17).",
+            "Could not read AutoLISP in script.lsp at line 12, column 17",
             "unterminated string",
+            "AutoLISP was not run",
         ]
     );
 }
@@ -91,32 +113,122 @@ fn formats_runtime_and_reader_failures_with_honest_locations() {
 #[test]
 fn keeps_location_free_failures_concise() {
     let failure = ExecFailure {
-        message: "The document is busy".into(),
+        message: "The drawing is busy".into(),
         form_index: None,
         location: None,
         drawing_outcome: DrawingOutcome::NotStarted as i32,
+        drawing_error: acadctl_rpc::DrawingErrorKind::Busy as i32,
     };
 
     assert_eq!(
-        failure_lines(&failure, "script.lsp"),
-        ["acadctl: The document is busy"]
+        failure_lines(&failure, "script.lsp", target()),
+        ["Drawing 6A84:36C8 is busy", "AutoLISP was not run"]
+    );
+}
+
+#[test]
+fn reports_every_drawing_outcome() {
+    assert_eq!(
+        drawing_outcome_message(DrawingOutcome::NotStarted as i32),
+        "AutoLISP was not run"
+    );
+    assert_eq!(
+        drawing_outcome_message(DrawingOutcome::RolledBack as i32),
+        "Drawing changes were rolled back (other side effects may remain)"
+    );
+    assert_eq!(
+        drawing_outcome_message(DrawingOutcome::Committed as i32),
+        "Drawing changes were committed before the failure"
+    );
+    assert_eq!(
+        drawing_outcome_message(DrawingOutcome::Unknown as i32),
+        "Drawing outcome is unknown (running it again may repeat the operation)"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_feedback_is_one_status_line_until_detachment() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let diagnostics = PipeWriter::spawn(
+        SharedWriter(Arc::clone(&output)),
+        8,
+        "acadctl-test-status-output",
+    )
+    .unwrap();
+    let barrier = diagnostics.clone();
+    let (mut interrupts, _) = Interrupts::test_with_diagnostics(diagnostics);
+
+    interrupts.note(Interrupt::Cancel { queued: true });
+    interrupts.finish_stopping("done.");
+    barrier.write(String::new()).await.unwrap();
+
+    assert_eq!(
+        String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+        "Stopping... done.\n"
+    );
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let diagnostics = PipeWriter::spawn(
+        SharedWriter(Arc::clone(&output)),
+        8,
+        "acadctl-test-detach-output",
+    )
+    .unwrap();
+    let barrier = diagnostics.clone();
+    let (mut interrupts, _) = Interrupts::test_with_diagnostics(diagnostics);
+
+    interrupts.note(Interrupt::Cancel { queued: true });
+    interrupts.note(Interrupt::Detach);
+    assert_eq!(detach_exit(&interrupts), ExitCode::from(130));
+    barrier.write(String::new()).await.unwrap();
+
+    assert_eq!(
+        String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+        "Stopping... \nDetached (AutoLISP may still be running)\n"
+    );
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let diagnostics = PipeWriter::spawn(
+        SharedWriter(Arc::clone(&output)),
+        8,
+        "acadctl-test-connection-lost-output",
+    )
+    .unwrap();
+    let barrier = diagnostics.clone();
+    let (mut interrupts, _) = Interrupts::test_with_diagnostics(diagnostics);
+
+    interrupts.note(Interrupt::Cancel { queued: true });
+    assert_eq!(stopping_connection_lost(&interrupts), ExitCode::from(130));
+    barrier.write(String::new()).await.unwrap();
+
+    assert_eq!(
+        String::from_utf8(output.lock().unwrap().clone()).unwrap(),
+        "Stopping... connection lost (AutoLISP may still be running)\n"
     );
 }
 
 #[test]
 fn treats_transport_loss_after_request_exposure_as_an_unknown_handoff() {
     let message = response_start_error(tonic::Status::unavailable("connection reset"));
-    assert!(message.contains("may still have been accepted"));
-    assert!(message.contains("do not retry"));
+    assert_eq!(
+        message,
+        "AutoCAD did not report whether it started the AutoLISP (running it again may execute it twice)"
+    );
 
     assert_eq!(
         response_start_error(tonic::Status::unimplemented("missing service")),
-        "The acadctl plugin is outdated. Install the current version and restart AutoCAD."
+        "CLI and AutoCAD plugin are incompatible (AutoLISP was not run)"
+    );
+    assert_eq!(
+        response_start_error(tonic::Status::unknown(
+            "failed to decode Protobuf message: ExecRequest.drawing_id",
+        )),
+        "CLI and AutoCAD plugin are incompatible (AutoLISP was not run)"
     );
 }
 
 #[tokio::test]
-async fn safe_detach_waits_for_cancellation_acknowledgement() {
+async fn second_interrupt_detaches_without_waiting_for_an_acknowledgement() {
     let (mut interrupts, sender) = Interrupts::test_pair();
     sender
         .send(Interrupt::Cancel { queued: true })
@@ -124,20 +236,16 @@ async fn safe_detach_waits_for_cancellation_acknowledgement() {
         .unwrap();
     sender.send(Interrupt::Detach).await.unwrap();
 
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(10),
-            wait_for_control(pending::<()>(), &mut interrupts),
-        )
-        .await
-        .is_err()
-    );
+    assert!(matches!(
+        wait_for_control(pending::<()>(), &mut interrupts).await,
+        ControlWait::UnconfirmedDetach
+    ));
     assert!(interrupts.cancellation_requested());
     assert!(interrupts.detach_requested());
 }
 
 #[tokio::test]
-async fn acknowledged_or_forced_detach_stops_waiting() {
+async fn acknowledged_detach_stops_waiting() {
     let (mut acknowledged, acknowledged_sender) = Interrupts::test_pair();
     acknowledged_sender
         .send(Interrupt::Cancel { queued: true })
@@ -156,19 +264,6 @@ async fn acknowledged_or_forced_detach_stops_waiting() {
 
     assert!(matches!(
         wait_for_control(pending::<()>(), &mut acknowledged).await,
-        ControlWait::ConfirmedDetach
-    ));
-
-    let (mut forced, forced_sender) = Interrupts::test_pair();
-    forced_sender
-        .send(Interrupt::Cancel { queued: true })
-        .await
-        .unwrap();
-    forced_sender.send(Interrupt::Detach).await.unwrap();
-    forced_sender.send(Interrupt::ForceDetach).await.unwrap();
-
-    assert!(matches!(
-        wait_for_control(pending::<()>(), &mut forced).await,
         ControlWait::UnconfirmedDetach
     ));
 }
@@ -195,7 +290,7 @@ async fn too_late_after_the_first_interrupt_remains_attached() {
 
     assert!(matches!(
         wait_for_control(pending::<()>(), &mut interrupts).await,
-        ControlWait::ConfirmedDetach
+        ControlWait::UnconfirmedDetach
     ));
 }
 
@@ -322,7 +417,7 @@ async fn cancelling_stdout_wait_does_not_leave_tokio_blocking_work() {
 }
 
 #[tokio::test]
-async fn blocked_stdout_and_stderr_do_not_block_forced_detach() {
+async fn blocked_stdout_and_stderr_do_not_block_detachment() {
     let stdout_started = Arc::new(AtomicBool::new(false));
     let stderr_started = Arc::new(AtomicBool::new(false));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
@@ -363,7 +458,6 @@ async fn blocked_stdout_and_stderr_do_not_block_forced_detach() {
         .await
         .unwrap();
     sender.send(Interrupt::Detach).await.unwrap();
-    sender.send(Interrupt::ForceDetach).await.unwrap();
 
     assert!(matches!(
         tokio::time::timeout(

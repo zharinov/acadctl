@@ -1,13 +1,13 @@
-use acadctl_rpc::ProcessId;
+use acadctl_rpc::InstanceId;
 
-pub struct AutoCadProcess {
-    process_id: ProcessId,
+pub struct AutoCadInstance {
+    instance_id: InstanceId,
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
-impl AutoCadProcess {
-    pub fn process_id(&self) -> ProcessId {
-        self.process_id
+impl AutoCadInstance {
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
     }
 
     pub fn request_termination(&self, force: bool) -> bool {
@@ -24,7 +24,7 @@ impl AutoCadProcess {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
                 0,
-                self.process_id.get(),
+                self.instance_id.get(),
             )
         };
 
@@ -58,7 +58,7 @@ impl AutoCadProcess {
         };
 
         struct CloseRequest {
-            process_id: u32,
+            native_process_id: u32,
             original: windows_sys::Win32::Foundation::HANDLE,
             sent: bool,
         }
@@ -67,16 +67,17 @@ impl AutoCadProcess {
             // SAFETY: `request_windows_close` passes a live `CloseRequest` for this synchronous
             // enumeration, and `EnumWindows` returns before that value is dropped.
             let request = unsafe { &mut *(request as *mut CloseRequest) };
-            let mut process_id = 0;
-            // SAFETY: `window` came from `EnumWindows` and `process_id` is writable.
-            unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+            let mut native_process_id = 0;
+            // SAFETY: `window` came from `EnumWindows` and `native_process_id` is writable.
+            unsafe { GetWindowThreadProcessId(window, &mut native_process_id) };
 
-            if process_id != request.process_id {
+            if native_process_id != request.native_process_id {
                 return 1;
             }
 
             // SAFETY: `OpenProcess` receives only access flags and the enumerated process ID.
-            let current = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+            let current =
+                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, native_process_id) };
 
             if current.is_null() {
                 return 1;
@@ -99,7 +100,7 @@ impl AutoCadProcess {
         }
 
         let mut request = CloseRequest {
-            process_id: self.process_id.get(),
+            native_process_id: self.instance_id.get(),
             original: self.handle,
             sent: false,
         };
@@ -146,14 +147,14 @@ fn same_windows_process(
         .is_some_and(|(left_created, right_created)| left_created == right_created)
 }
 
-impl Drop for AutoCadProcess {
+impl Drop for AutoCadInstance {
     fn drop(&mut self) {
         // SAFETY: this object owns the non-null handle and closes it exactly once during drop.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
     }
 }
 
-pub(super) fn discover() -> Vec<AutoCadProcess> {
+pub(super) fn discover() -> Vec<AutoCadInstance> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
@@ -166,7 +167,7 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
     let mut processes = Vec::new();
 
     for process in system.processes().values() {
-        let Some(process_id) = ProcessId::new(process.pid().as_u32()) else {
+        let Some(instance_id) = InstanceId::new(process.pid().as_u32()) else {
             continue;
         };
 
@@ -175,7 +176,7 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
                 0,
-                process_id.get(),
+                instance_id.get(),
             )
         };
 
@@ -201,9 +202,12 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
             continue;
         }
 
-        processes.push(AutoCadProcess { process_id, handle });
+        processes.push(AutoCadInstance {
+            instance_id,
+            handle,
+        });
     }
 
-    processes.sort_unstable_by_key(AutoCadProcess::process_id);
+    processes.sort_unstable_by_key(AutoCadInstance::instance_id);
     processes
 }

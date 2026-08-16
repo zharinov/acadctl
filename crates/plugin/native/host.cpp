@@ -1149,9 +1149,10 @@ void ObjectArxBridge::processNextAction() {
       actionResult =
           matchesDatabase(target, action->database_token())
               ? save(target)
-              : result(acadctl::NativeActionResultKind::DocGenerationChanged);
+              : result(
+                    acadctl::NativeActionResultKind::DrawingGenerationChanged);
     } else {
-      actionResult = result(acadctl::NativeActionResultKind::DocGone);
+      actionResult = result(acadctl::NativeActionResultKind::DrawingGone);
     }
 
     break;
@@ -1160,9 +1161,10 @@ void ObjectArxBridge::processNextAction() {
       actionResult =
           matchesDatabase(target, action->database_token())
               ? close(target, action->close_discard())
-              : result(acadctl::NativeActionResultKind::DocGenerationChanged);
+              : result(
+                    acadctl::NativeActionResultKind::DrawingGenerationChanged);
     } else {
-      actionResult = result(acadctl::NativeActionResultKind::DocGone);
+      actionResult = result(acadctl::NativeActionResultKind::DrawingGone);
     }
 
     break;
@@ -1337,8 +1339,8 @@ acadctl::NativeActionResult ObjectArxBridge::close(AcApDocument* document,
 bool ObjectArxBridge::queueDocumentContextDispatch(
     const acadctl::NativeAction& action, acadctl::NativeActionResult& failure) {
   if (documentContextDispatch_) {
-    failure = bridgeFailure(acadctl::NativeActionResultKind::DocContextFailed,
-                            RTERROR);
+    failure = bridgeFailure(
+        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
 
     return false;
   }
@@ -1356,8 +1358,8 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     kind = DocContextDispatch::Kind::ExecDriver;
     break;
   default:
-    failure = bridgeFailure(acadctl::NativeActionResultKind::DocContextFailed,
-                            RTERROR);
+    failure = bridgeFailure(
+        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
 
     return false;
   }
@@ -1365,13 +1367,13 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   AcApDocument* target = document(action.document_token());
 
   if (!target) {
-    failure = result(acadctl::NativeActionResultKind::DocGone);
+    failure = result(acadctl::NativeActionResultKind::DrawingGone);
 
     return false;
   }
 
   if (!matchesDatabase(target, action.database_token())) {
-    failure = result(acadctl::NativeActionResultKind::DocGenerationChanged);
+    failure = result(acadctl::NativeActionResultKind::DrawingGenerationChanged);
 
     return false;
   }
@@ -1394,8 +1396,9 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   AcApDocument* previousActive = acDocManager->mdiActiveDocument();
 
   if (!previousActive) {
-    failure = nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
-                            Acad::eNoDocument);
+    failure =
+        nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
+                      Acad::eNoDocument);
 
     return false;
   }
@@ -1423,8 +1426,8 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   }
 
   if (pendingInput < 0) {
-    failure = bridgeFailure(acadctl::NativeActionResultKind::DocContextFailed,
-                            RTERROR);
+    failure = bridgeFailure(
+        acadctl::NativeActionResultKind::DocumentContextFailed, RTERROR);
 
     return false;
   }
@@ -1455,8 +1458,8 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
 
   nativeActionCallbacksOutstanding.fetch_sub(1, std::memory_order_seq_cst);
   documentContextDispatch_.reset();
-  failure = nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
-                          scheduleStatus);
+  failure = nativeFailure(
+      acadctl::NativeActionResultKind::DocumentContextFailed, scheduleStatus);
 
   Acad::ErrorStatus restoreStatus = Acad::eOk;
 
@@ -1469,7 +1472,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
       acDocManager->mdiActiveDocument() != previousActive ||
       acDocManager->curDocument() != previousActive) {
     failure = nativeFailure(
-        acadctl::NativeActionResultKind::DocContextRestoreFailed,
+        acadctl::NativeActionResultKind::DocumentContextRestoreFailed,
         restoreStatus == Acad::eOk ? Acad::eInvalidContext : restoreStatus);
   }
 
@@ -1492,7 +1495,8 @@ void ObjectArxBridge::scheduleDocumentContextFinalizer() {
   }
 
   dispatch.dispatchResult = nativeFailure(
-      acadctl::NativeActionResultKind::DocContextRestoreFailed, scheduleStatus);
+      acadctl::NativeActionResultKind::DocumentContextRestoreFailed,
+      scheduleStatus);
   const std::uint64_t jobId = dispatch.jobId;
   acadctl::NativeActionResult dispatchResult =
       std::move(dispatch.dispatchResult);
@@ -1671,7 +1675,7 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
 
   if (scheduleStatus != Acad::eOk) {
     dispatch.dispatchResult = nativeFailure(
-        acadctl::NativeActionResultKind::DocContextFailed, scheduleStatus);
+        acadctl::NativeActionResultKind::DocumentContextFailed, scheduleStatus);
     scheduleExecutionDispatchFinalizer();
   }
 }
@@ -1793,14 +1797,14 @@ int acadctlAdvanceExecution() noexcept {
 
     if (!target) {
       dispatch.dispatchResult =
-          result(acadctl::NativeActionResultKind::DocGone);
+          result(acadctl::NativeActionResultKind::DrawingGone);
     } else if (!matchesDatabase(target, dispatch.databaseToken)) {
       dispatch.dispatchResult =
-          result(acadctl::NativeActionResultKind::DocGenerationChanged);
+          result(acadctl::NativeActionResultKind::DrawingGenerationChanged);
     } else if (acDocManager->mdiActiveDocument() != target ||
                acDocManager->curDocument() != target) {
       dispatch.dispatchResult =
-          nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
+          nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
                         Acad::eInvalidContext);
     } else if (!bridge->lispFunctionsDefined(target)) {
       dispatch.dispatchResult = bridgeFailure(
@@ -2087,14 +2091,15 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
   AcApDocument* target = bridge->document(dispatch.documentToken);
 
   if (!target) {
-    dispatch.dispatchResult = result(acadctl::NativeActionResultKind::DocGone);
+    dispatch.dispatchResult =
+        result(acadctl::NativeActionResultKind::DrawingGone);
   } else if (!matchesDatabase(target, dispatch.databaseToken)) {
     dispatch.dispatchResult =
-        result(acadctl::NativeActionResultKind::DocGenerationChanged);
+        result(acadctl::NativeActionResultKind::DrawingGenerationChanged);
   } else if (acDocManager->mdiActiveDocument() != target ||
              acDocManager->curDocument() != target) {
     dispatch.dispatchResult =
-        nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
+        nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
                       Acad::eInvalidContext);
   } else {
     int undoStatus = RTERROR;
@@ -2115,12 +2120,12 @@ void ObjectArxBridge::runQueuedHistoryCommand() {
 
       if (acDocManager->mdiActiveDocument() != target ||
           acDocManager->curDocument() != target) {
-        dispatch.dispatchResult =
-            nativeFailure(acadctl::NativeActionResultKind::DocContextFailed,
-                          Acad::eInvalidContext);
+        dispatch.dispatchResult = nativeFailure(
+            acadctl::NativeActionResultKind::DocumentContextFailed,
+            Acad::eInvalidContext);
       } else if (!matchesDatabase(target, dispatch.databaseToken)) {
         dispatch.dispatchResult =
-            result(acadctl::NativeActionResultKind::DocGenerationChanged);
+            result(acadctl::NativeActionResultKind::DrawingGenerationChanged);
       } else if (status != RTNORM) {
         dispatch.dispatchResult = bridgeFailure(
             acadctl::NativeActionResultKind::HistoryFailed, status);
@@ -2167,7 +2172,7 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void*) {
         acDocManager->mdiActiveDocument() != previousActive ||
         acDocManager->curDocument() != previousActive) {
       dispatch.dispatchResult = nativeFailure(
-          acadctl::NativeActionResultKind::DocContextRestoreFailed,
+          acadctl::NativeActionResultKind::DocumentContextRestoreFailed,
           restoreStatus == Acad::eOk ? Acad::eInvalidContext : restoreStatus);
     }
   }
@@ -2191,7 +2196,7 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void*) {
 }
 
 void ObjectArxBridge::publishDocumentSnapshot() {
-  rust::Vec<acadctl::NativeDocSnapshot> states;
+  rust::Vec<acadctl::NativeDocumentSnapshot> states;
 
   for (DocSubscription& subscription : subscriptions_) {
     refreshSubscription(subscription);
@@ -2203,7 +2208,7 @@ void ObjectArxBridge::publishDocumentSnapshot() {
     AcApDocument* document = subscription.document;
     const bool named = document->isNamedDrawing();
     const AcString name(named ? document->fileName() : document->docTitle());
-    states.push_back(acadctl::NativeDocSnapshot{
+    states.push_back(acadctl::NativeDocumentSnapshot{
         static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(document)),
         static_cast<std::size_t>(
             reinterpret_cast<std::uintptr_t>(subscription.database)),
@@ -2399,7 +2404,7 @@ void ObjectArxBridge::actionTargetWillBeDestroyed(AcApDocument* document) {
   }
 
   documentContextDispatch_->dispatchResult =
-      result(acadctl::NativeActionResultKind::DocGone);
+      result(acadctl::NativeActionResultKind::DrawingGone);
   scheduleDocumentContextFinalizer();
 }
 

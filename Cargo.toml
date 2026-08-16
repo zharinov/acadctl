@@ -34,7 +34,7 @@ unimplemented = "deny"
 wildcard_dependencies = "deny"
 
 [workspace.metadata.cargo-shear]
-ignored = ["prost", "tonic-prost"]
+ignored = ["tonic-prost"]
 ignored-paths = [
     "crates/cli/src/process/macos.rs",
     "crates/cli/src/process/unsupported.rs",

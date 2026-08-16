@@ -2,10 +2,10 @@ use std::sync::{Mutex, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle as ThreadJoinHandle};
 use std::time::Duration;
 
-use acadctl_rpc::{DocServiceServer, ExecServiceServer};
+use acadctl_rpc::{DrawingServiceServer, ExecServiceServer};
 use tokio::sync::oneshot;
 
-use super::doc::DocRpc;
+use super::drawing::DrawingRpc;
 use super::exec::ExecRpc;
 
 const RESTART_BACKOFF: Duration = Duration::from_millis(100);
@@ -110,8 +110,8 @@ pub(crate) fn stop() {
 }
 
 fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), String>>) {
-    let process_id =
-        acadctl_rpc::ProcessId::new(std::process::id()).expect("the current process ID is nonzero");
+    let instance_id = acadctl_rpc::InstanceId::new(std::process::id())
+        .expect("the current process ID is nonzero");
 
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -126,30 +126,30 @@ fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), Str
         }
     };
 
-    runtime.block_on(serve(process_id, stop, startup))
+    runtime.block_on(serve(instance_id, stop, startup))
 }
 
 async fn serve(
-    process_id: acadctl_rpc::ProcessId,
+    instance_id: acadctl_rpc::InstanceId,
     stop: oneshot::Receiver<()>,
     startup: std_mpsc::SyncSender<Result<(), String>>,
 ) {
     let timer_driver = tokio::spawn(crate::scheduler::drive_timers());
 
-    serve_until_stopped(process_id, stop, startup).await;
+    serve_until_stopped(instance_id, stop, startup).await;
 
     timer_driver.abort();
 }
 
 async fn serve_until_stopped(
-    process_id: acadctl_rpc::ProcessId,
+    instance_id: acadctl_rpc::InstanceId,
     mut stop: oneshot::Receiver<()>,
     startup: std_mpsc::SyncSender<Result<(), String>>,
 ) {
     let mut startup = Some(startup);
 
     loop {
-        let connections = match acadctl_rpc::incoming(process_id) {
+        let connections = match acadctl_rpc::incoming(instance_id) {
             Ok(incoming) => incoming,
             Err(error) => {
                 let error = format!("could not create the RPC endpoint: {error}");
@@ -178,9 +178,9 @@ async fn serve_until_stopped(
         let serving = tonic::transport::Server::builder()
             .max_concurrent_streams(acadctl_rpc::MAX_STREAMS_PER_CONNECTION)
             .add_service(
-                DocServiceServer::new(DocRpc)
-                    .max_decoding_message_size(acadctl_rpc::MAX_DOCUMENT_REQUEST_BYTES)
-                    .max_encoding_message_size(acadctl_rpc::MAX_DOCUMENT_RESPONSE_BYTES),
+                DrawingServiceServer::new(DrawingRpc)
+                    .max_decoding_message_size(acadctl_rpc::MAX_DRAWING_REQUEST_BYTES)
+                    .max_encoding_message_size(acadctl_rpc::MAX_DRAWING_RESPONSE_BYTES),
             )
             .add_service(
                 ExecServiceServer::new(ExecRpc)

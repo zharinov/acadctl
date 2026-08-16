@@ -1,79 +1,85 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use acadctl_rpc::{DrawingPath, OpenRequest, ProcessId};
+use acadctl_rpc::{DrawingPath, InstanceId, OpenRequest};
 
-use crate::instance::{Instance, ProcessSnapshot};
+use crate::instance::{Instance, InstanceSnapshot};
 
-use super::{fail, parse_document_id, query_error_message, request_error_message};
+use super::{fail, parse_drawing_id, query_error_message, request_error_message};
 
-pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
+pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     let path = match DrawingPath::canonicalize(&path) {
         Ok(path) => path,
         Err(error) => return fail(error.to_string()),
     };
 
-    let process_id = match process_id {
-        Some(process_id) => process_id,
+    let instance_id = match instance_id {
+        Some(instance_id) => instance_id,
         None => {
-            let processes = ProcessSnapshot::discover();
-            let instances = processes.query_instances().await;
+            let snapshot = InstanceSnapshot::discover();
+            let instances = snapshot.query_instances().await;
 
             match select_instance(&instances) {
-                Ok(process_id) => process_id,
+                Ok(instance_id) => instance_id,
                 Err(error) => return fail(error),
             }
         }
     };
 
-    let mut client = match super::connect_documents(process_id).await {
+    let mut client = match super::connect_drawings(instance_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
 
     let opened = match client.open(OpenRequest::from(path)).await {
         Ok(response) => response.into_inner(),
-        Err(status) => return fail(request_error_message("open the drawing", status)),
+        Err(status) => return fail(request_error_message("open the DWG file", None, status)),
     };
 
-    let Some(document) = opened.document else {
-        return fail("AutoCAD did not identify the opened document.".into());
+    let Some(drawing) = opened.drawing else {
+        return fail("AutoCAD did not identify the opened drawing".into());
     };
 
-    let document_id = match parse_document_id(document.id) {
+    let drawing_id = match parse_drawing_id(drawing.id) {
         Ok(id) => id,
         Err(error) => return fail(error),
     };
 
-    println!("{process_id}:{document_id}");
+    println!("{instance_id}:{drawing_id}");
     ExitCode::SUCCESS
 }
 
-fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {
+fn select_instance(instances: &[Instance]) -> Result<InstanceId, String> {
     if instances.is_empty() {
-        return Err("AutoCAD is not running.".into());
+        return Err("AutoCAD is not running".into());
     }
 
     let available = instances
         .iter()
-        .filter(|instance| instance.documents.is_ok())
+        .filter(|instance| instance.drawings.is_ok())
         .collect::<Vec<_>>();
 
     match available.as_slice() {
-        [instance] => Ok(instance.process_id),
+        [instance] => Ok(instance.instance_id),
         [] => Err(instances
             .iter()
-            .find_map(|instance| instance.documents.as_ref().err())
-            .map(query_error_message)
-            .unwrap_or_else(|| "No acadctl-enabled AutoCAD instance is available.".into())),
+            .find_map(|instance| {
+                instance
+                    .drawings
+                    .as_ref()
+                    .err()
+                    .map(|error| (instance.instance_id, error))
+            })
+            .map(|(instance, error)| query_error_message(instance, error))
+            .unwrap_or_else(|| "No AutoCAD instance is available".into())),
         instances => {
-            let process_ids = instances
+            let instance_ids = instances
                 .iter()
-                .map(|instance| instance.process_id.to_string())
+                .map(|instance| instance.instance_id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(format!(
-                "More than one acadctl-enabled AutoCAD instance is running ({process_ids}). Use `acadctl open <path> --pid <pid>`."
+                "More than one AutoCAD instance is running ({instance_ids})"
             ))
         }
     }
@@ -88,37 +94,37 @@ mod tests {
     fn selects_the_only_available_instance() {
         let instances = vec![
             Instance {
-                process_id: ProcessId::new(123).unwrap(),
-                documents: Err(QueryError::CannotConnect),
+                instance_id: InstanceId::new(123).unwrap(),
+                drawings: Err(QueryError::CannotConnect),
             },
             Instance {
-                process_id: ProcessId::new(456).unwrap(),
-                documents: Ok(vec![]),
+                instance_id: InstanceId::new(456).unwrap(),
+                drawings: Ok(vec![]),
             },
         ];
 
         assert_eq!(
             select_instance(&instances).unwrap(),
-            ProcessId::new(456).unwrap()
+            InstanceId::new(456).unwrap()
         );
     }
 
     #[test]
-    fn requires_a_pid_when_multiple_instances_are_available() {
+    fn requires_an_instance_when_multiple_are_available() {
         let instances = vec![
             Instance {
-                process_id: ProcessId::new(123).unwrap(),
-                documents: Ok(vec![]),
+                instance_id: InstanceId::new(123).unwrap(),
+                drawings: Ok(vec![]),
             },
             Instance {
-                process_id: ProcessId::new(456).unwrap(),
-                documents: Ok(vec![]),
+                instance_id: InstanceId::new(456).unwrap(),
+                drawings: Ok(vec![]),
             },
         ];
 
         assert_eq!(
             select_instance(&instances).unwrap_err(),
-            "More than one acadctl-enabled AutoCAD instance is running (007B, 01C8). Use `acadctl open <path> --pid <pid>`."
+            "More than one AutoCAD instance is running (007B, 01C8)"
         );
     }
 }

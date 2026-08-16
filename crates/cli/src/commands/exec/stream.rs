@@ -6,7 +6,6 @@ use super::interrupt::Interrupts;
 
 pub(super) enum ControlWait<T> {
     Ready(T),
-    ConfirmedDetach,
     UnconfirmedDetach,
 }
 
@@ -44,7 +43,7 @@ where
             interrupt = interrupts.next() => {
                 interrupts.note(interrupt);
 
-                if interrupts.force_detach_requested() {
+                if interrupts.detach_requested() {
                     return ResponseStartWait::UnconfirmedDetach;
                 }
             }
@@ -71,12 +70,8 @@ where
             interrupt = interrupts.next() => {
                 interrupts.note(interrupt);
 
-                if interrupts.force_detach_requested() {
+                if interrupts.detach_requested() {
                     return ControlWait::UnconfirmedDetach;
-                }
-
-                if interrupts.cancellation_acknowledged() && interrupts.detach_requested() {
-                    return ControlWait::ConfirmedDetach;
                 }
             }
             result = &mut future => return ControlWait::Ready(result),
@@ -87,7 +82,6 @@ where
 pub(super) enum StdoutWait<T> {
     Ready(T),
     Interrupted,
-    ConfirmedDetach,
     UnconfirmedDetach,
 }
 
@@ -104,10 +98,8 @@ where
         interrupt = interrupts.next() => {
             interrupts.note(interrupt);
 
-            if interrupts.force_detach_requested() {
+            if interrupts.detach_requested() {
                 StdoutWait::UnconfirmedDetach
-            } else if interrupts.cancellation_acknowledged() && interrupts.detach_requested() {
-                StdoutWait::ConfirmedDetach
             } else {
                 StdoutWait::Interrupted
             }

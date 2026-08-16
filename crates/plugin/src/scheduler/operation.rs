@@ -1,6 +1,6 @@
-use acadctl_rpc::{DocId, DrawingPath};
+use acadctl_rpc::{DrawingId, DrawingPath};
 
-use crate::doc::{Doc, DocRegistry, DocTarget, NativeDocKey};
+use crate::drawing::{Drawing, DrawingRegistry, DrawingTarget, NativeDocumentKey};
 use crate::exec::output::OutputSink;
 use crate::exec::{Exec, ExecOutcome, ExecStepResult, NativeExecStep, ValueOutputLease};
 
@@ -12,18 +12,18 @@ pub(super) enum Operation {
         path: DrawingPath,
     },
     Save {
-        id: DocId,
+        id: DrawingId,
     },
     Close {
-        id: DocId,
+        id: DrawingId,
         discard: bool,
     },
     History {
-        id: DocId,
+        id: DrawingId,
         direction: HistoryDirection,
     },
     Execute {
-        id: DocId,
+        id: DrawingId,
         execution: Box<Exec>,
     },
 }
@@ -35,7 +35,7 @@ pub(crate) enum HistoryDirection {
 }
 
 pub(super) enum OperationOutcome {
-    Doc(Doc),
+    Drawing(Drawing),
     Closed,
     Exec(ExecOutcome),
 }
@@ -46,31 +46,31 @@ pub(super) enum Prepared {
 }
 
 impl Operation {
-    pub(super) fn prepare(&self, documents: &DocRegistry) -> Prepared {
+    pub(super) fn prepare(&self, drawings: &DrawingRegistry) -> Prepared {
         match self {
-            Operation::Open { path } => documents.find_by_path(path).map_or_else(
+            Operation::Open { path } => drawings.find_by_path(path).map_or_else(
                 || Prepared::Native(NativeCommand::open(path.clone())),
-                |target| Prepared::Immediate(Ok(OperationOutcome::Doc(target.document))),
+                |target| Prepared::Immediate(Ok(OperationOutcome::Drawing(target.drawing))),
             ),
-            Operation::Save { id } => match documents.find_by_id(*id) {
+            Operation::Save { id } => match drawings.find_by_id(*id) {
                 Some(target) => Self::prepare_save(*id, target),
-                None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
+                None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
-            Operation::Close { id, discard } => match documents.find_by_id(*id) {
-                Some(target) if target.document.modified && !discard => {
+            Operation::Close { id, discard } => match drawings.find_by_id(*id) {
+                Some(target) if target.drawing.modified && !discard => {
                     Prepared::Immediate(Err(Error::Dirty(*id)))
                 }
                 Some(target) => Prepared::Native(NativeCommand::close(target.native_key, *discard)),
-                None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
+                None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
-            Operation::History { id, direction } => match documents.find_by_id(*id) {
+            Operation::History { id, direction } => match drawings.find_by_id(*id) {
                 Some(target) => Prepared::Native(match direction {
                     HistoryDirection::Undo => NativeCommand::undo(target.native_key),
                     HistoryDirection::Redo => NativeCommand::redo(target.native_key),
                 }),
-                None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
+                None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
-            Operation::Execute { id, execution } => match documents.find_by_id(*id) {
+            Operation::Execute { id, execution } => match drawings.find_by_id(*id) {
                 Some(_) if execution.outcome().is_some() => {
                     Prepared::Immediate(Ok(OperationOutcome::Exec(
                         execution
@@ -82,17 +82,17 @@ impl Operation {
                 Some(target) => {
                     Prepared::Native(NativeCommand::queue_exec_driver(target.native_key))
                 }
-                None => Prepared::Immediate(Err(Error::DocNotFound(*id))),
+                None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
         }
     }
 
-    fn prepare_save(id: DocId, target: DocTarget) -> Prepared {
-        if target.document.read_only {
+    fn prepare_save(id: DrawingId, target: DrawingTarget) -> Prepared {
+        if target.drawing.read_only {
             return Prepared::Immediate(Err(Error::ReadOnly(id)));
         }
 
-        let Some(file_path) = target.document.file_path() else {
+        let Some(file_path) = target.drawing.file_path() else {
             return Prepared::Immediate(Err(Error::Unnamed(id)));
         };
 
@@ -100,8 +100,8 @@ impl Operation {
             return Prepared::Immediate(Err(Error::NotDwg));
         }
 
-        if !target.document.modified {
-            return Prepared::Immediate(Ok(OperationOutcome::Doc(target.document)));
+        if !target.drawing.modified {
+            return Prepared::Immediate(Ok(OperationOutcome::Drawing(target.drawing)));
         }
 
         Prepared::Native(NativeCommand::save(target.native_key))
@@ -109,39 +109,41 @@ impl Operation {
 
     pub(super) fn complete(
         &mut self,
-        documents: &DocRegistry,
-        native_target: Option<NativeDocKey>,
+        drawings: &DrawingRegistry,
+        native_target: Option<NativeDocumentKey>,
     ) -> Result<OperationOutcome, Error> {
         match self {
-            Operation::Open { path } => documents
+            Operation::Open { path } => drawings
                 .find_by_path(path)
-                .map(|target| OperationOutcome::Doc(target.document))
+                .map(|target| OperationOutcome::Drawing(target.drawing))
                 .ok_or(Error::OpenNotPublished),
             Operation::Save { id } => {
-                let target = documents.find_by_id(*id).ok_or(Error::DocNotFound(*id))?;
+                let target = drawings
+                    .find_by_id(*id)
+                    .ok_or(Error::DrawingNotFound(*id))?;
 
-                if target.document.modified {
+                if target.drawing.modified {
                     return Err(Error::SaveNotPublished);
                 }
 
-                Ok(OperationOutcome::Doc(target.document))
+                Ok(OperationOutcome::Drawing(target.drawing))
             }
             Operation::Close { id, .. } => {
-                if documents.find_by_id(*id).is_some() {
+                if drawings.find_by_id(*id).is_some() {
                     return Err(Error::CloseNotPublished);
                 }
 
                 Ok(OperationOutcome::Closed)
             }
             Operation::History { id, .. } => {
-                let expected = native_target.ok_or(Error::DocGone)?;
-                let target = documents.find_by_id(*id).ok_or(Error::DocGone)?;
+                let expected = native_target.ok_or(Error::DrawingGone)?;
+                let target = drawings.find_by_id(*id).ok_or(Error::DrawingGone)?;
 
                 if target.native_key != expected {
-                    return Err(Error::DocGenerationChanged);
+                    return Err(Error::DrawingGenerationChanged);
                 }
 
-                Ok(OperationOutcome::Doc(target.document))
+                Ok(OperationOutcome::Drawing(target.drawing))
             }
             Operation::Execute { execution, .. } => execution
                 .take_outcome()
@@ -154,7 +156,7 @@ impl Operation {
         self.execution().map(Exec::output_sink)
     }
 
-    pub(super) fn document_id(&self) -> Option<DocId> {
+    pub(super) fn drawing_id(&self) -> Option<DrawingId> {
         match self {
             Self::Open { .. } => None,
             Self::Save { id }

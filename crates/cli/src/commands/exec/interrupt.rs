@@ -12,7 +12,6 @@ use super::writer::PipeWriter;
 pub(super) enum Interrupt {
     Cancel { queued: bool },
     Detach,
-    ForceDetach,
 }
 
 pub(super) struct Interrupts {
@@ -27,7 +26,6 @@ enum InterruptPhase {
     Attached,
     CancelRequested(CancellationDisposition),
     DetachRequested(CancellationDisposition),
-    ForceDetachRequested(CancellationDisposition),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,15 +82,7 @@ impl Interrupts {
                 return;
             }
 
-            if event_sender.send(Interrupt::Detach).await.is_err() {
-                return;
-            }
-
-            if signals.recv().await.is_none() {
-                return;
-            }
-
-            let _ = event_sender.send(Interrupt::ForceDetach).await;
+            let _ = event_sender.send(Interrupt::Detach).await;
         });
 
         Ok((
@@ -128,38 +118,15 @@ impl Interrupts {
                     CancellationDisposition::NotQueued
                 };
                 self.phase = InterruptPhase::CancelRequested(disposition);
-
-                if queued {
-                    self.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
-                } else {
-                    self.notice(
-                        "acadctl: cancellation could not be sent; press Ctrl+C again to request detachment.",
-                    );
-                }
+                self.diagnostic("Stopping... ");
             }
             (InterruptPhase::CancelRequested(disposition), Interrupt::Detach) => {
                 self.phase = InterruptPhase::DetachRequested(disposition);
-
-                if disposition != CancellationDisposition::NotQueued {
-                    self.notice(
-                        "acadctl: detach requested; waiting for AutoCAD to acknowledge cancellation. Press Ctrl+C again to detach without confirmation.",
-                    );
-                } else {
-                    self.notice(
-                        "acadctl: detach requested, but cancellation was not queued. Press Ctrl+C again to detach without confirmation.",
-                    );
-                }
             }
-            (InterruptPhase::DetachRequested(disposition), Interrupt::ForceDetach) => {
-                self.phase = InterruptPhase::ForceDetachRequested(disposition);
+            (InterruptPhase::Attached, Interrupt::Detach)
+            | (InterruptPhase::CancelRequested(_), Interrupt::Cancel { .. })
+            | (InterruptPhase::DetachRequested(_), Interrupt::Cancel { .. } | Interrupt::Detach) => {
             }
-            (InterruptPhase::Attached, Interrupt::Detach | Interrupt::ForceDetach)
-            | (
-                InterruptPhase::CancelRequested(_),
-                Interrupt::Cancel { .. } | Interrupt::ForceDetach,
-            )
-            | (InterruptPhase::DetachRequested(_), Interrupt::Cancel { .. } | Interrupt::Detach)
-            | (InterruptPhase::ForceDetachRequested(_), _) => {}
         }
     }
 
@@ -168,16 +135,10 @@ impl Interrupts {
     }
 
     pub(super) fn detach_requested(&self) -> bool {
-        matches!(
-            self.phase,
-            InterruptPhase::DetachRequested(_) | InterruptPhase::ForceDetachRequested(_)
-        )
+        matches!(self.phase, InterruptPhase::DetachRequested(_))
     }
 
-    pub(super) fn force_detach_requested(&self) -> bool {
-        matches!(self.phase, InterruptPhase::ForceDetachRequested(_))
-    }
-
+    #[cfg(test)]
     pub(super) fn cancellation_acknowledged(&self) -> bool {
         matches!(
             self.cancellation_disposition(),
@@ -189,8 +150,7 @@ impl Interrupts {
         match self.phase {
             InterruptPhase::Attached => None,
             InterruptPhase::CancelRequested(disposition)
-            | InterruptPhase::DetachRequested(disposition)
-            | InterruptPhase::ForceDetachRequested(disposition) => Some(disposition),
+            | InterruptPhase::DetachRequested(disposition) => Some(disposition),
         }
     }
 
@@ -217,9 +177,6 @@ impl Interrupts {
         self.phase = match self.phase {
             InterruptPhase::CancelRequested(_) => InterruptPhase::CancelRequested(disposition),
             InterruptPhase::DetachRequested(_) => InterruptPhase::DetachRequested(disposition),
-            InterruptPhase::ForceDetachRequested(_) => {
-                InterruptPhase::ForceDetachRequested(disposition)
-            }
             InterruptPhase::Attached => return AcknowledgementResult::Invalid,
         };
 
@@ -232,12 +189,7 @@ impl Interrupts {
     ) -> CancellationReceipt {
         let disposition = match ExecCancelDisposition::try_from(disposition) {
             Ok(ExecCancelDisposition::Accepted) => CancellationDisposition::Accepted,
-            Ok(ExecCancelDisposition::TooLate) => {
-                self.notice(
-                    "acadctl: cancellation was too late; execution will continue. Press Ctrl+C again to detach.",
-                );
-                CancellationDisposition::TooLate
-            }
+            Ok(ExecCancelDisposition::TooLate) => CancellationDisposition::TooLate,
             Ok(ExecCancelDisposition::Unspecified) | Err(_) => {
                 return CancellationReceipt::Invalid;
             }
@@ -245,11 +197,7 @@ impl Interrupts {
 
         match self.acknowledge_cancellation(disposition) {
             AcknowledgementResult::Recorded => {}
-            AcknowledgementResult::RecordedBeforeInterrupt => {
-                if disposition == CancellationDisposition::Accepted {
-                    self.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
-                }
-            }
+            AcknowledgementResult::RecordedBeforeInterrupt => {}
             AcknowledgementResult::Duplicate => return CancellationReceipt::Duplicate,
             AcknowledgementResult::Invalid => return CancellationReceipt::Invalid,
         }
@@ -276,8 +224,10 @@ impl Interrupts {
         }
     }
 
-    pub(super) fn notice(&self, message: &str) {
-        self.diagnostic(&format!("{message}\n"));
+    pub(super) fn finish_stopping(&self, message: &str) {
+        if self.cancellation_requested() {
+            self.diagnostic(&format!("{message}\n"));
+        }
     }
 
     pub(super) fn diagnostic(&self, text: &str) {

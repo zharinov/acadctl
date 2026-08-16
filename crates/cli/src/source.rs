@@ -42,7 +42,10 @@ impl SourceSpec {
             Self::Stdin => {
                 let stdin = io::stdin();
                 let bytes = read_bounded(stdin.lock()).map_err(|error| {
-                    SourceError::Message(format!("Could not read AutoLISP from stdin: {error}"))
+                    SourceError::Message(format!(
+                        "Could not read AutoLISP from stdin ({})",
+                        io_error_description(&error)
+                    ))
                 })?;
 
                 SourceInput::try_from_bytes(diagnostic_name("<stdin>"), bytes, mode)
@@ -55,25 +58,31 @@ impl SourceSpec {
             Self::File(path) => {
                 let source_name = path.to_str().ok_or_else(|| {
                     SourceError::Message(format!(
-                        "Source path '{}' is not valid UTF-8.",
+                        "Source path '{}' is not valid UTF-8",
                         path.to_string_lossy()
                     ))
                 })?;
 
                 let source_name = SourceName::new(source_name).map_err(|error| match error {
                     SourceNameError::Empty => {
-                        SourceError::Message("The source path is empty.".into())
+                        SourceError::Message("The source path is empty".into())
                     }
                     SourceNameError::TooLong => {
-                        SourceError::Message("The source path exceeds the 4 KiB limit.".into())
+                        SourceError::Message("The source path exceeds the 4 KiB limit".into())
                     }
                 })?;
 
                 let file = std::fs::File::open(&path).map_err(|error| {
-                    SourceError::Message(format!("Could not read '{source_name}': {error}"))
+                    SourceError::Message(format!(
+                        "Could not read '{source_name}' ({})",
+                        io_error_description(&error)
+                    ))
                 })?;
                 let bytes = read_bounded(file).map_err(|error| {
-                    SourceError::Message(format!("Could not read '{source_name}': {error}"))
+                    SourceError::Message(format!(
+                        "Could not read '{source_name}' ({})",
+                        io_error_description(&error)
+                    ))
                 })?;
 
                 SourceInput::try_from_bytes(source_name, bytes, mode)
@@ -96,16 +105,16 @@ impl SourceInput {
 
         if bytes.len() > acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES {
             return Err(SourceError::Message(
-                "The source exceeds the 4 MiB limit.".into(),
+                "The source exceeds the 4 MiB limit".into(),
             ));
         }
 
         let source = std::str::from_utf8(&bytes)
-            .map_err(|_| SourceError::Message("The source is not valid UTF-8.".into()))?;
+            .map_err(|_| SourceError::Message("The source is not valid UTF-8".into()))?;
 
         if source.contains('\0') {
             return Err(SourceError::Message(
-                "The source contains U+0000, which AutoLISP cannot represent.".into(),
+                "The source contains U+0000, which AutoLISP cannot represent".into(),
             ));
         }
 
@@ -116,7 +125,7 @@ impl SourceInput {
 
         if mode == SourceMode::Eval && form_count != 1 {
             return Err(SourceError::Message(format!(
-                "eval requires exactly one top-level form; found {form_count}."
+                "eval accepts one AutoLISP expression (found {form_count} top-level forms)"
             )));
         }
 
@@ -134,15 +143,26 @@ impl SourceInput {
 impl SourceError {
     pub fn report(&self) {
         match self {
-            Self::Message(message) => eprintln!("acadctl: {message}"),
+            Self::Message(message) => eprintln!("{message}"),
             Self::Scan { source_name, error } => {
                 eprintln!(
-                    "Read error in {source_name} (line {}, column {}).",
+                    "Could not read AutoLISP in {source_name} at line {}, column {}",
                     error.line, error.column
                 );
                 eprintln!("{}", error.kind.message());
             }
         }
+    }
+}
+
+fn io_error_description(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "file not found",
+        io::ErrorKind::PermissionDenied => "permission denied",
+        io::ErrorKind::BrokenPipe => "broken pipe",
+        io::ErrorKind::InvalidData => "invalid data",
+        io::ErrorKind::TimedOut => "operation timed out",
+        _ => "I/O error",
     }
 }
 

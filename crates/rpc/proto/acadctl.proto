@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package acadctl;
 
-service DocService {
+service DrawingService {
   rpc List(ListRequest) returns (ListResponse);
   rpc Open(OpenRequest) returns (OpenResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
@@ -17,22 +17,22 @@ service ExecService {
 
 message ListRequest {}
 
-message ListResponse { repeated Doc documents = 1; }
+message ListResponse { repeated Drawing drawings = 1; }
 
 message OpenRequest { string path = 1; }
 
-message OpenResponse { Doc document = 1; }
+message OpenResponse { Drawing drawing = 1; }
 
-message SaveRequest { uint32 id = 1; }
+message SaveRequest { uint32 drawing_id = 1; }
 
-message SaveResponse { Doc document = 1; }
+message SaveResponse { Drawing drawing = 1; }
 
-message HistoryRequest { uint32 id = 1; }
+message HistoryRequest { uint32 drawing_id = 1; }
 
-message HistoryResponse { Doc document = 1; }
+message HistoryResponse { Drawing drawing = 1; }
 
 message CloseRequest {
-  uint32 id = 1;
+  uint32 drawing_id = 1;
   bool discard = 2;
 }
 
@@ -46,7 +46,7 @@ message ExecClientMessage {
 }
 
 message ExecRequest {
-  uint32 document_id = 1;
+  uint32 drawing_id = 1;
   ExecMode mode = 2;
   string source_name = 3;
   bytes source = 4;
@@ -100,6 +100,7 @@ message ExecFailure {
   optional uint64 form_index = 2;
   SourceLocation location = 3;
   DrawingOutcome drawing_outcome = 4;
+  DrawingErrorKind drawing_error = 5;
 }
 
 message SourceLocation {
@@ -116,7 +117,23 @@ enum DrawingOutcome {
   DRAWING_OUTCOME_UNKNOWN = 4;
 }
 
-message Doc {
+message DrawingError {
+  DrawingErrorKind kind = 1;
+  optional uint32 drawing_id = 2;
+}
+
+enum DrawingErrorKind {
+  DRAWING_ERROR_KIND_UNSPECIFIED = 0;
+  DRAWING_ERROR_KIND_NOT_OPEN = 1;
+  DRAWING_ERROR_KIND_REPLACED = 2;
+  DRAWING_ERROR_KIND_READ_ONLY = 3;
+  DRAWING_ERROR_KIND_UNSAVED_CHANGES = 4;
+  DRAWING_ERROR_KIND_NO_FILE_NAME = 5;
+  DRAWING_ERROR_KIND_BUSY = 6;
+  DRAWING_ERROR_KIND_UNDO_DISABLED = 7;
+}
+
+message Drawing {
   uint32 id = 1;
   string display_name = 2;
   optional string file_path = 3;

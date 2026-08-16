@@ -1,6 +1,6 @@
 use std::fmt;
 
-use acadctl_rpc::DocId;
+use acadctl_rpc::{DrawingErrorKind, DrawingId};
 
 use crate::exec::DrawingOutcome;
 
@@ -12,12 +12,12 @@ pub enum Error {
     ScheduleFailed(i32),
     Stopped,
     PluginStopping,
-    DocNotFound(DocId),
-    DocGone,
-    DocGenerationChanged,
-    Unnamed(DocId),
-    ReadOnly(DocId),
-    Dirty(DocId),
+    DrawingNotFound(DrawingId),
+    DrawingGone,
+    DrawingGenerationChanged,
+    Unnamed(DrawingId),
+    ReadOnly(DrawingId),
+    Dirty(DrawingId),
     NotDwg,
     OpenFailed(NativeFailure),
     LockFailed(NativeFailure),
@@ -32,8 +32,8 @@ pub enum Error {
     CloseNotPublished,
     NotQuiescent,
     UndoDisabled,
-    DocContextFailed(NativeFailure),
-    DocContextRestoreFailed(NativeFailure),
+    DocumentContextFailed(NativeFailure),
+    DocumentContextRestoreFailed(NativeFailure),
     ExecBridgeFinalizationFailed(NativeFailure),
     ExecBridgeSymbolsClearFailed(NativeFailure),
     ExecBridgeFailed(NativeFailure),
@@ -62,31 +62,31 @@ impl fmt::Display for Error {
             }
             Self::Stopped => formatter.write_str("the native operation stopped before completion"),
             Self::PluginStopping => formatter.write_str("the acadctl plugin is stopping"),
-            Self::DocNotFound(id) => write!(formatter, "Document '{id}' is not open."),
-            Self::DocGone => formatter.write_str("The document is no longer open"),
-            Self::DocGenerationChanged => formatter
-                .write_str("The document was replaced before AutoCAD could perform the operation"),
+            Self::DrawingNotFound(id) => write!(formatter, "Drawing '{id}' is not open."),
+            Self::DrawingGone => formatter.write_str("The drawing is no longer open"),
+            Self::DrawingGenerationChanged => formatter
+                .write_str("The drawing was replaced before AutoCAD could perform the operation"),
             Self::Unnamed(id) => write!(
                 formatter,
-                "Document '{id}' has no file name. Save As is not supported yet."
+                "Drawing '{id}' has no file name. Save As is not supported yet."
             ),
-            Self::ReadOnly(id) => write!(formatter, "Document '{id}' is read-only."),
+            Self::ReadOnly(id) => write!(formatter, "Drawing '{id}' is read-only."),
             Self::Dirty(id) => write!(
                 formatter,
-                "Document '{id}' has unsaved changes. Run `acadctl save {id}` first or use `acadctl close {id} --discard`."
+                "Drawing '{id}' has unsaved changes."
             ),
             Self::NotDwg => formatter.write_str("Only DWG drawings can be saved"),
             Self::OpenFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not open the drawing")
             }
             Self::LockFailed(failure) => {
-                failure.fmt_with_context(formatter, "Could not lock the document")
+                failure.fmt_with_context(formatter, "Could not lock the drawing")
             }
             Self::SaveFailed(failure) => {
-                failure.fmt_with_context(formatter, "Could not save the document")
+                failure.fmt_with_context(formatter, "Could not save the drawing")
             }
             Self::CloseFailed(failure) => {
-                failure.fmt_with_context(formatter, "Could not close the document")
+                failure.fmt_with_context(formatter, "Could not close the drawing")
             }
             Self::HistoryFailed { direction, failure } => failure.fmt_with_context(
                 formatter,
@@ -96,23 +96,23 @@ impl fmt::Display for Error {
                 },
             ),
             Self::OpenNotPublished => formatter
-                .write_str("AutoCAD opened the drawing but did not publish its document state"),
+                .write_str("AutoCAD opened the drawing but did not publish its drawing state"),
             Self::SaveNotPublished => {
                 formatter.write_str("AutoCAD completed the save but still reports unsaved changes")
             }
             Self::CloseNotPublished => {
-                formatter.write_str("AutoCAD completed the close but the document is still open")
+                formatter.write_str("AutoCAD completed the close but the drawing is still open")
             }
-            Self::NotQuiescent => formatter.write_str("The document is busy"),
+            Self::NotQuiescent => formatter.write_str("The drawing is busy"),
             Self::UndoDisabled => {
-                formatter.write_str("Undo recording is disabled for the document")
+                formatter.write_str("Undo recording is disabled for the drawing")
             }
-            Self::DocContextFailed(failure) => {
-                failure.fmt_with_context(formatter, "Could not establish document context")
+            Self::DocumentContextFailed(failure) => {
+                failure.fmt_with_context(formatter, "Could not establish AutoCAD document context")
             }
-            Self::DocContextRestoreFailed(failure) => failure.fmt_with_context(
+            Self::DocumentContextRestoreFailed(failure) => failure.fmt_with_context(
                 formatter,
-                "Could not release the AutoCAD document context safely",
+                "Could not release AutoCAD document context safely",
             ),
             Self::ExecBridgeFinalizationFailed(failure) => failure.fmt_with_context(
                 formatter,
@@ -160,6 +160,29 @@ impl NativeFailure {
 }
 
 impl Error {
+    pub const fn drawing_error_kind(&self) -> Option<DrawingErrorKind> {
+        match self {
+            Self::DrawingNotFound(_) | Self::DrawingGone => Some(DrawingErrorKind::NotOpen),
+            Self::DrawingGenerationChanged => Some(DrawingErrorKind::Replaced),
+            Self::Unnamed(_) => Some(DrawingErrorKind::NoFileName),
+            Self::ReadOnly(_) => Some(DrawingErrorKind::ReadOnly),
+            Self::Dirty(_) => Some(DrawingErrorKind::UnsavedChanges),
+            Self::NotQuiescent => Some(DrawingErrorKind::Busy),
+            Self::UndoDisabled => Some(DrawingErrorKind::UndoDisabled),
+            _ => None,
+        }
+    }
+
+    pub const fn drawing_id(&self) -> Option<DrawingId> {
+        match self {
+            Self::DrawingNotFound(id)
+            | Self::Unnamed(id)
+            | Self::ReadOnly(id)
+            | Self::Dirty(id) => Some(*id),
+            _ => None,
+        }
+    }
+
     pub const fn is_internal(&self) -> bool {
         matches!(
             self,
@@ -168,8 +191,8 @@ impl Error {
                 | Self::OpenNotPublished
                 | Self::SaveNotPublished
                 | Self::CloseNotPublished
-                | Self::DocContextFailed(_)
-                | Self::DocContextRestoreFailed(_)
+                | Self::DocumentContextFailed(_)
+                | Self::DocumentContextRestoreFailed(_)
                 | Self::ExecBridgeFinalizationFailed(_)
                 | Self::ExecBridgeSymbolsClearFailed(_)
                 | Self::ExecBridgeFailed(_)
@@ -181,7 +204,7 @@ impl Error {
     pub const fn drawing_outcome(&self) -> DrawingOutcome {
         if matches!(
             self,
-            Self::DocContextRestoreFailed(_)
+            Self::DocumentContextRestoreFailed(_)
                 | Self::ExecBridgeFinalizationFailed(_)
                 | Self::ExecBridgeSymbolsClearFailed(_)
                 | Self::ExecBridgeFailed(_)

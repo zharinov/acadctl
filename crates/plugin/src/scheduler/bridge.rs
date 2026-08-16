@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::doc::NativeDocKey;
+use crate::drawing::NativeDocumentKey;
 use crate::exec::value::writer::NativeValueWriter;
 use crate::exec::{ExecStepResult, NativeExecStep, bound_diagnostic};
 
@@ -25,7 +25,7 @@ pub(crate) fn begin_eval_value(
 
     let lease = scheduler.acquire_eval_value_output(
         job_id,
-        NativeDocKey {
+        NativeDocumentKey {
             document_token,
             database_token,
         },

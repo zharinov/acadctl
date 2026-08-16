@@ -1,42 +1,43 @@
 use acadctl_rpc::{
-    CloseRequest, CloseResponse, Doc as RpcDoc, DocService, DrawingPathError, HistoryRequest,
-    HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse, SaveRequest,
-    SaveResponse,
+    CloseRequest, CloseResponse, Drawing as RpcDrawing, DrawingPathError, DrawingService,
+    HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
+    SaveRequest, SaveResponse,
 };
 use tonic::{Request, Response, Status};
 
-use super::status::{parse_document_id, scheduler_error};
+use super::status::{parse_drawing_id, scheduler_error};
 
-pub(super) struct DocRpc;
+pub(super) struct DrawingRpc;
 
 #[tonic::async_trait]
-impl DocService for DocRpc {
+impl DrawingService for DrawingRpc {
     async fn list(&self, _request: Request<ListRequest>) -> Result<Response<ListResponse>, Status> {
-        let documents = crate::scheduler::list()
+        let drawings = crate::scheduler::list()
             .map_err(scheduler_error)?
             .into_iter()
             .map(Into::into)
             .collect();
-        Ok(Response::new(ListResponse { documents }))
+        Ok(Response::new(ListResponse { drawings }))
     }
 
     async fn open(&self, request: Request<OpenRequest>) -> Result<Response<OpenResponse>, Status> {
         let path = request.into_inner().path;
         let path = path.parse().map_err(drawing_path_status)?;
-        let document = crate::scheduler::open(path)
+        let drawing = crate::scheduler::open(path)
             .await
             .map_err(scheduler_error)?;
         Ok(Response::new(OpenResponse {
-            document: Some(document.into()),
+            drawing: Some(drawing.into()),
         }))
     }
 
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
-        let id = request.into_inner().id;
-        let id = parse_document_id(id)?;
-        let document = crate::scheduler::save(id).await.map_err(scheduler_error)?;
+        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
+        let drawing = crate::scheduler::save(drawing_id)
+            .await
+            .map_err(scheduler_error)?;
         Ok(Response::new(SaveResponse {
-            document: Some(document.into()),
+            drawing: Some(drawing.into()),
         }))
     }
 
@@ -44,11 +45,12 @@ impl DocService for DocRpc {
         &self,
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
-        let id = request.into_inner().id;
-        let id = parse_document_id(id)?;
-        let document = crate::scheduler::undo(id).await.map_err(scheduler_error)?;
+        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
+        let drawing = crate::scheduler::undo(drawing_id)
+            .await
+            .map_err(scheduler_error)?;
         Ok(Response::new(HistoryResponse {
-            document: Some(document.into()),
+            drawing: Some(drawing.into()),
         }))
     }
 
@@ -56,11 +58,12 @@ impl DocService for DocRpc {
         &self,
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
-        let id = request.into_inner().id;
-        let id = parse_document_id(id)?;
-        let document = crate::scheduler::redo(id).await.map_err(scheduler_error)?;
+        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
+        let drawing = crate::scheduler::redo(drawing_id)
+            .await
+            .map_err(scheduler_error)?;
         Ok(Response::new(HistoryResponse {
-            document: Some(document.into()),
+            drawing: Some(drawing.into()),
         }))
     }
 
@@ -69,22 +72,22 @@ impl DocService for DocRpc {
         request: Request<CloseRequest>,
     ) -> Result<Response<CloseResponse>, Status> {
         let request = request.into_inner();
-        let id = parse_document_id(request.id)?;
-        crate::scheduler::close(id, request.discard)
+        let drawing_id = parse_drawing_id(request.drawing_id)?;
+        crate::scheduler::close(drawing_id, request.discard)
             .await
             .map_err(scheduler_error)?;
         Ok(Response::new(CloseResponse {}))
     }
 }
 
-impl From<crate::doc::Doc> for RpcDoc {
-    fn from(document: crate::doc::Doc) -> Self {
+impl From<crate::drawing::Drawing> for RpcDrawing {
+    fn from(drawing: crate::drawing::Drawing) -> Self {
         Self {
-            id: document.id.into(),
-            display_name: document.display_name().to_owned(),
-            file_path: document.file_path().map(|path| path.as_str().to_owned()),
-            modified: document.modified,
-            read_only: document.read_only,
+            id: drawing.id.into(),
+            display_name: drawing.display_name().to_owned(),
+            file_path: drawing.file_path().map(|path| path.as_str().to_owned()),
+            modified: drawing.modified,
+            read_only: drawing.read_only,
         }
     }
 }

@@ -1,17 +1,17 @@
-use acadctl_rpc::ProcessId;
+use acadctl_rpc::InstanceId;
 
-pub struct AutoCadProcess {
-    process_id: ProcessId,
+pub struct AutoCadInstance {
+    instance_id: InstanceId,
     application: objc2::rc::Retained<objc2_app_kit::NSRunningApplication>,
 }
 
-impl AutoCadProcess {
-    pub fn process_id(&self) -> ProcessId {
-        self.process_id
+impl AutoCadInstance {
+    pub fn instance_id(&self) -> InstanceId {
+        self.instance_id
     }
 
     fn native_process_id(&self) -> libc::pid_t {
-        self.process_id
+        self.instance_id
             .get()
             .try_into()
             .expect("macOS process IDs fit pid_t")
@@ -22,17 +22,17 @@ impl AutoCadProcess {
             return self.application.terminate();
         }
 
-        let process_id = self.native_process_id();
+        let native_process_id = self.native_process_id();
         let Some(current) =
             objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(
-                process_id,
+                native_process_id,
             )
         else {
             return false;
         };
 
         // SAFETY: `kill` receives only an initialized process ID and a valid signal number.
-        current == self.application && unsafe { libc::kill(process_id, libc::SIGKILL) == 0 }
+        current == self.application && unsafe { libc::kill(native_process_id, libc::SIGKILL) == 0 }
     }
 
     pub fn has_exited(&self) -> bool {
@@ -46,25 +46,25 @@ impl AutoCadProcess {
     }
 }
 
-pub(super) fn discover() -> Vec<AutoCadProcess> {
+pub(super) fn discover() -> Vec<AutoCadInstance> {
     use objc2_app_kit::NSRunningApplication;
 
     let system = sysinfo::System::new_all();
     let mut processes = Vec::new();
 
     for process in system.processes().values() {
-        let raw_process_id = process.pid().as_u32();
-        let Ok(native_process_id) = i32::try_from(raw_process_id) else {
+        let native_process_id = process.pid().as_u32();
+        let Ok(native_process_identifier) = i32::try_from(native_process_id) else {
             continue;
         };
 
-        let Some(process_id) = ProcessId::new(raw_process_id) else {
+        let Some(instance_id) = InstanceId::new(native_process_id) else {
             continue;
         };
 
-        let Some(application) =
-            NSRunningApplication::runningApplicationWithProcessIdentifier(native_process_id)
-        else {
+        let Some(application) = NSRunningApplication::runningApplicationWithProcessIdentifier(
+            native_process_identifier,
+        ) else {
             continue;
         };
 
@@ -76,13 +76,13 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
             continue;
         }
 
-        processes.push(AutoCadProcess {
-            process_id,
+        processes.push(AutoCadInstance {
+            instance_id,
             application,
         });
     }
 
-    processes.sort_unstable_by_key(AutoCadProcess::process_id);
+    processes.sort_unstable_by_key(AutoCadInstance::instance_id);
     processes
 }
 

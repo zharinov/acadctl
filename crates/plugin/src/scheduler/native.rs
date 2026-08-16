@@ -1,6 +1,6 @@
 use acadctl_rpc::DrawingPath;
 
-use crate::doc::{DocRegistry, NativeDocKey};
+use crate::drawing::{DrawingRegistry, NativeDocumentKey};
 use crate::exec::{ExecOutcome, ExecStepResult};
 use crate::ffi::{
     NativeActionKind, NativeActionResult, NativeActionResultKind, NativeExecFinalizationObservation,
@@ -11,13 +11,13 @@ use super::operation::{Operation, OperationOutcome};
 
 pub(super) enum NativeCommand {
     Open(DrawingPath),
-    Document {
-        target: NativeDocKey,
-        operation: NativeDocumentOperation,
+    Drawing {
+        target: NativeDocumentKey,
+        operation: NativeDrawingOperation,
     },
 }
 
-pub(super) enum NativeDocumentOperation {
+pub(super) enum NativeDrawingOperation {
     Save,
     Close { discard: bool },
     Undo,
@@ -39,46 +39,46 @@ impl NativeCommand {
         Self::Open(path)
     }
 
-    pub(super) fn save(target: NativeDocKey) -> Self {
-        Self::document(target, NativeDocumentOperation::Save)
+    pub(super) fn save(target: NativeDocumentKey) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Save)
     }
 
-    pub(super) fn close(target: NativeDocKey, discard: bool) -> Self {
-        Self::document(target, NativeDocumentOperation::Close { discard })
+    pub(super) fn close(target: NativeDocumentKey, discard: bool) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Close { discard })
     }
 
-    pub(super) fn undo(target: NativeDocKey) -> Self {
-        Self::document(target, NativeDocumentOperation::Undo)
+    pub(super) fn undo(target: NativeDocumentKey) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Undo)
     }
 
-    pub(super) fn redo(target: NativeDocKey) -> Self {
-        Self::document(target, NativeDocumentOperation::Redo)
+    pub(super) fn redo(target: NativeDocumentKey) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Redo)
     }
 
-    pub(super) fn queue_exec_driver(target: NativeDocKey) -> Self {
-        Self::document(target, NativeDocumentOperation::QueueExecDriver)
+    pub(super) fn queue_exec_driver(target: NativeDocumentKey) -> Self {
+        Self::drawing(target, NativeDrawingOperation::QueueExecDriver)
     }
 
-    fn document(target: NativeDocKey, operation: NativeDocumentOperation) -> Self {
-        Self::Document { target, operation }
+    fn drawing(target: NativeDocumentKey, operation: NativeDrawingOperation) -> Self {
+        Self::Drawing { target, operation }
     }
 
-    pub(super) fn target(&self) -> Option<NativeDocKey> {
+    pub(super) fn target(&self) -> Option<NativeDocumentKey> {
         match self {
             Self::Open(_) => None,
-            Self::Document { target, .. } => Some(*target),
+            Self::Drawing { target, .. } => Some(*target),
         }
     }
 
     fn kind(&self) -> NativeActionKind {
         match self {
             Self::Open(_) => NativeActionKind::Open,
-            Self::Document { operation, .. } => operation.kind(),
+            Self::Drawing { operation, .. } => operation.kind(),
         }
     }
 }
 
-impl NativeDocumentOperation {
+impl NativeDrawingOperation {
     fn kind(&self) -> NativeActionKind {
         match self {
             Self::Save => NativeActionKind::Save,
@@ -119,11 +119,11 @@ impl NativeAction {
     }
 
     pub(crate) fn document_token(&self) -> usize {
-        self.document_target().document_token
+        self.drawing_target().document_token
     }
 
     pub(crate) fn database_token(&self) -> usize {
-        self.document_target().database_token
+        self.drawing_target().database_token
     }
 
     pub(crate) fn open_path(&self) -> &str {
@@ -142,8 +142,8 @@ impl NativeAction {
         match &self.state {
             NativeActionState::Issued {
                 command:
-                    NativeCommand::Document {
-                        operation: NativeDocumentOperation::Close { discard },
+                    NativeCommand::Drawing {
+                        operation: NativeDrawingOperation::Close { discard },
                         ..
                     },
                 ..
@@ -154,14 +154,14 @@ impl NativeAction {
         }
     }
 
-    fn document_target(&self) -> NativeDocKey {
+    fn drawing_target(&self) -> NativeDocumentKey {
         match &self.state {
             NativeActionState::Issued {
-                command: NativeCommand::Document { target, .. },
+                command: NativeCommand::Drawing { target, .. },
                 ..
             } => *target,
             NativeActionState::Idle | NativeActionState::Issued { .. } => {
-                panic!("native action has no document target")
+                panic!("native action has no drawing target")
             }
         }
     }
@@ -188,32 +188,32 @@ impl Operation {
     pub(super) fn complete_native(
         &mut self,
         mut result: NativeActionResult,
-        documents: &DocRegistry,
-        native_target: Option<NativeDocKey>,
+        drawings: &DrawingRegistry,
+        native_target: Option<NativeDocumentKey>,
     ) -> Result<OperationOutcome, Error> {
         if matches!(
             self,
             Operation::Execute { execution, .. } if execution.outcome().is_some()
         ) && !matches!(
             result.kind,
-            NativeActionResultKind::DocContextRestoreFailed
+            NativeActionResultKind::DocumentContextRestoreFailed
                 | NativeActionResultKind::ExecBridgeFinalizationFailed
                 | NativeActionResultKind::ExecBridgeSymbolsClearFailed
                 | NativeActionResultKind::ExecBridgeFailed
         ) {
-            return self.complete(documents, native_target);
+            return self.complete(drawings, native_target);
         }
 
         if result.kind == NativeActionResultKind::ExecBridgeSymbolsClearFailed
             && let Operation::Execute { execution, .. } = self
             && matches!(execution.outcome(), Some(ExecOutcome::Failure(_)))
         {
-            return self.complete(documents, native_target);
+            return self.complete(drawings, native_target);
         }
 
         if matches!(
             result.kind,
-            NativeActionResultKind::DocContextRestoreFailed
+            NativeActionResultKind::DocumentContextRestoreFailed
                 | NativeActionResultKind::ExecBridgeFinalizationFailed
         ) && let Operation::Execute { execution, .. } = self
             && execution.outcome().is_some()
@@ -227,11 +227,11 @@ impl Operation {
             });
             debug_assert!(recorded);
 
-            return self.complete(documents, native_target);
+            return self.complete(drawings, native_target);
         }
 
         interpret(result, self)?;
-        self.complete(documents, native_target)
+        self.complete(drawings, native_target)
     }
 }
 
@@ -243,18 +243,18 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
 
     match result.kind {
         NativeActionResultKind::Success => Ok(()),
-        NativeActionResultKind::DocGone => Err(Error::DocGone),
-        NativeActionResultKind::DocGenerationChanged => Err(Error::DocGenerationChanged),
+        NativeActionResultKind::DrawingGone => Err(Error::DrawingGone),
+        NativeActionResultKind::DrawingGenerationChanged => Err(Error::DrawingGenerationChanged),
         NativeActionResultKind::Unnamed => Err(operation
-            .document_id()
+            .drawing_id()
             .map(Error::Unnamed)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::ReadOnly => Err(operation
-            .document_id()
+            .drawing_id()
             .map(Error::ReadOnly)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::Dirty => Err(operation
-            .document_id()
+            .drawing_id()
             .map(Error::Dirty)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::OpenFailed => Err(Error::OpenFailed(failure)),
@@ -273,9 +273,9 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
         }
         NativeActionResultKind::NotQuiescent => Err(Error::NotQuiescent),
         NativeActionResultKind::UndoDisabled => Err(Error::UndoDisabled),
-        NativeActionResultKind::DocContextFailed => Err(Error::DocContextFailed(failure)),
-        NativeActionResultKind::DocContextRestoreFailed => {
-            Err(Error::DocContextRestoreFailed(failure))
+        NativeActionResultKind::DocumentContextFailed => Err(Error::DocumentContextFailed(failure)),
+        NativeActionResultKind::DocumentContextRestoreFailed => {
+            Err(Error::DocumentContextRestoreFailed(failure))
         }
         NativeActionResultKind::ExecBridgeFinalizationFailed => {
             Err(Error::ExecBridgeFinalizationFailed(failure))
@@ -291,7 +291,7 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
 pub(super) fn native_result_requires_quarantine(kind: NativeActionResultKind) -> bool {
     matches!(
         kind,
-        NativeActionResultKind::DocContextRestoreFailed
+        NativeActionResultKind::DocumentContextRestoreFailed
             | NativeActionResultKind::ExecBridgeFinalizationFailed
             | NativeActionResultKind::ExecBridgeSymbolsClearFailed
     )
@@ -313,7 +313,7 @@ pub(super) fn classify_execution_finalization(
         && observation.only_symbol_cleanup_unproved();
 
     if native_state_unproved
-        && result.kind != NativeActionResultKind::DocContextRestoreFailed
+        && result.kind != NativeActionResultKind::DocumentContextRestoreFailed
         && !preserve_symbol_failure
     {
         result.kind = NativeActionResultKind::ExecBridgeFinalizationFailed;

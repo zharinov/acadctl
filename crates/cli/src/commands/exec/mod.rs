@@ -2,8 +2,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use acadctl_rpc::{
-    ExecClientMessage, ExecFailure, ExecMode, ExecRequest, ExecServerEvent, exec_client_message,
-    exec_outcome, exec_server_event,
+    DrawingOutcome, ExecClientMessage, ExecFailure, ExecMode, ExecRequest, ExecServerEvent,
+    exec_client_message, exec_outcome, exec_server_event,
 };
 use futures_util::stream as futures_stream;
 use tonic::Code;
@@ -25,7 +25,7 @@ use stream::{
 };
 use writer::PipeWriter;
 
-use super::{fail, query_error_message, request_error_message, target::Target};
+use super::{fail, incompatible_message, query_error_message, target::Target};
 
 const EXECUTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTION_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,6 +39,7 @@ enum ResponsePhase {
 struct ResponseSession {
     response: Option<tonic::Streaming<ExecServerEvent>>,
     source_name: String,
+    target: Target,
     phase: ResponsePhase,
     stdout: Option<std::io::Result<PipeWriter>>,
     interrupts: Interrupts,
@@ -62,20 +63,25 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
 
     let mut client = match tokio::time::timeout(
         EXECUTION_CONNECT_TIMEOUT,
-        crate::instance::connect_execution(target.process_id),
+        crate::instance::connect_execution(target.instance_id),
     )
     .await
     {
         Ok(Ok(client)) => client,
-        Ok(Err(error)) => return fail(query_error_message(&error)),
-        Err(_) => return fail(query_error_message(&QueryError::TimedOut)),
+        Ok(Err(error)) => return fail(query_error_message(target.instance_id, &error)),
+        Err(_) => {
+            return fail(query_error_message(
+                target.instance_id,
+                &QueryError::TimedOut,
+            ));
+        }
     };
 
     let (source_name, source_bytes) = source.into_parts();
     let diagnostic_source_name = source_name.to_string();
     let request = ExecClientMessage {
         message: Some(exec_client_message::Message::Request(ExecRequest::new(
-            target.document_id,
+            target.drawing_id,
             mode,
             source_name,
             source_bytes,
@@ -84,12 +90,12 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
 
     let diagnostics = match PipeWriter::stderr() {
         Ok(diagnostics) => diagnostics,
-        Err(error) => return fail(format!("Could not start the stderr writer: {error}")),
+        Err(_) => return fail("Could not start diagnostic output".into()),
     };
 
     let (mut interrupts, receiver) = match Interrupts::new(request, diagnostics) {
         Ok(interrupts) => interrupts,
-        Err(error) => return fail(format!("Could not install the Ctrl+C handler: {error}")),
+        Err(_) => return fail("Could not listen for Ctrl+C".into()),
     };
 
     let outbound = futures_stream::unfold(receiver, |mut receiver| async move {
@@ -99,8 +105,12 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
     let response = match wait_for_response_start(client.execute(outbound), &mut interrupts).await {
         ResponseStartWait::Ready(Ok(response)) => response,
         ResponseStartWait::Ready(Err(status)) => {
-            if interrupts.force_detach_requested() {
-                return unconfirmed_detach_exit(&interrupts);
+            if interrupts.detach_requested() {
+                return detach_exit(&interrupts);
+            }
+
+            if interrupts.cancellation_requested() {
+                return stopping_connection_lost(&interrupts);
             }
 
             return diagnostic_failure(&mut interrupts, response_start_error(status)).await;
@@ -108,28 +118,35 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
         ResponseStartWait::TimedOut => {
             return diagnostic_failure(
                 &mut interrupts,
-                "Timed out waiting for AutoCAD to respond to the execution request. The request may still have been accepted; do not retry it blindly."
+                "AutoCAD did not report whether it started the AutoLISP (running it again may execute it twice)"
                     .into(),
             )
             .await;
         }
-        ResponseStartWait::UnconfirmedDetach => return unconfirmed_detach_exit(&interrupts),
+        ResponseStartWait::UnconfirmedDetach => return detach_exit(&interrupts),
     };
 
-    ResponseSession::new(response.into_inner(), diagnostic_source_name, interrupts)
-        .drive()
-        .await
+    ResponseSession::new(
+        response.into_inner(),
+        diagnostic_source_name,
+        target,
+        interrupts,
+    )
+    .drive()
+    .await
 }
 
 impl ResponseSession {
     fn new(
         response: tonic::Streaming<ExecServerEvent>,
         source_name: String,
+        target: Target,
         interrupts: Interrupts,
     ) -> Self {
         Self {
             response: Some(response),
             source_name,
+            target,
             phase: ResponsePhase::AwaitingAcceptance,
             stdout: None,
             interrupts,
@@ -153,27 +170,22 @@ impl ResponseSession {
             {
                 ControlWait::Ready(Ok(Some(event))) => event,
                 ControlWait::Ready(Ok(None)) => {
-                    if self.interrupts.force_detach_requested() {
-                        return unconfirmed_detach_exit(&self.interrupts);
+                    if self.interrupts.detach_requested() {
+                        return detach_exit(&self.interrupts);
                     }
 
-                    return self.lost_response("The execution stream ended").await;
+                    return self.lost_response().await;
                 }
-                ControlWait::Ready(Err(status)) => {
-                    if self.interrupts.force_detach_requested() {
-                        return unconfirmed_detach_exit(&self.interrupts);
+                ControlWait::Ready(Err(_status)) => {
+                    if self.interrupts.detach_requested() {
+                        return detach_exit(&self.interrupts);
                     }
 
-                    let detail = if status.message().is_empty() {
-                        "The execution connection failed".into()
-                    } else {
-                        format!("The execution connection failed: {}", status.message())
-                    };
-
-                    return self.lost_response(&detail).await;
+                    return self.lost_response().await;
                 }
-                ControlWait::ConfirmedDetach => return confirmed_detach_exit(&self.interrupts),
-                ControlWait::UnconfirmedDetach => return unconfirmed_detach_exit(&self.interrupts),
+                ControlWait::UnconfirmedDetach => {
+                    return detach_exit(&self.interrupts);
+                }
             };
 
             match event.event {
@@ -199,15 +211,13 @@ impl ResponseSession {
 
                     let writer = match self.stdout.get_or_insert_with(PipeWriter::stdout).as_ref() {
                         Ok(writer) => writer,
-                        Err(error) => {
-                            let error = error.to_string();
+                        Err(_) => {
                             self.response.take();
 
                             return diagnostic_failure(
                                 &mut self.interrupts,
-                                format!(
-                                    "Could not start the stdout writer: {error}. The accepted execution request may still be running; do not retry it blindly."
-                                ),
+                                "Could not write AutoLISP output (AutoLISP may still be running)"
+                                    .into(),
                             )
                             .await;
                         }
@@ -215,23 +225,19 @@ impl ResponseSession {
 
                     match wait_for_stdout(writer.write(output.chunk), &mut self.interrupts).await {
                         StdoutWait::Ready(Ok(())) => {}
-                        StdoutWait::Ready(Err(error)) => {
+                        StdoutWait::Ready(Err(_)) => {
                             self.response.take();
 
                             return diagnostic_failure(
                                 &mut self.interrupts,
-                                format!(
-                                    "Could not write stdout: {error}. The accepted execution request may still be running; do not retry it blindly."
-                                ),
+                                "Could not write AutoLISP output (AutoLISP may still be running)"
+                                    .into(),
                             )
                             .await;
                         }
                         StdoutWait::Interrupted => continue,
-                        StdoutWait::ConfirmedDetach => {
-                            return confirmed_detach_exit(&self.interrupts);
-                        }
                         StdoutWait::UnconfirmedDetach => {
-                            return unconfirmed_detach_exit(&self.interrupts);
+                            return detach_exit(&self.interrupts);
                         }
                     }
                 }
@@ -250,7 +256,7 @@ impl ResponseSession {
                     {
                         CancellationReceipt::Continue => {}
                         CancellationReceipt::Detach => {
-                            return confirmed_detach_exit(&self.interrupts);
+                            return detach_exit(&self.interrupts);
                         }
                         CancellationReceipt::Duplicate => {
                             return self
@@ -292,10 +298,10 @@ impl ResponseSession {
                         exec_outcome::Outcome::Success(_)
                             if self.interrupts.cancellation_requested() =>
                         {
-                            cancelled_exit()
+                            stopped_exit(&self.interrupts)
                         }
                         exec_outcome::Outcome::Success(_) => ExitCode::SUCCESS,
-                        exec_outcome::Outcome::Cancelled(_) => cancelled_exit(),
+                        exec_outcome::Outcome::Cancelled(_) => stopped_exit(&self.interrupts),
                         exec_outcome::Outcome::Failure(failure) => {
                             self.report_failure(failure).await
                         }
@@ -310,32 +316,29 @@ impl ResponseSession {
         }
     }
 
-    async fn lost_response(&mut self, detail: &str) -> ExitCode {
-        let message = if self.accepted() {
-            format!(
-                "{detail} before a result was returned. The accepted execution request may still be running; do not retry it blindly."
-            )
-        } else {
-            format!(
-                "{detail} before acceptance was reported. The request may still have been accepted; do not retry it blindly."
-            )
-        };
+    async fn lost_response(&mut self) -> ExitCode {
+        if self.interrupts.cancellation_requested() {
+            return stopping_connection_lost(&self.interrupts);
+        }
 
-        diagnostic_failure(&mut self.interrupts, message).await
-    }
-
-    async fn invalid_response(&mut self, detail: &str) -> ExitCode {
         diagnostic_failure(
             &mut self.interrupts,
-            format!(
-                "Invalid execution response: {detail}. The execution outcome is unknown; do not retry it blindly."
-            ),
+            "Connection lost (AutoLISP may still be running)".into(),
+        )
+        .await
+    }
+
+    async fn invalid_response(&mut self, _detail: &str) -> ExitCode {
+        diagnostic_failure(
+            &mut self.interrupts,
+            "Invalid response from AutoCAD (execution outcome unknown)".into(),
         )
         .await
     }
 
     async fn report_failure(&mut self, failure: ExecFailure) -> ExitCode {
-        let mut text = failure_lines(&failure, &self.source_name).join("\n");
+        self.interrupts.finish_stopping("done.");
+        let mut text = failure_lines(&failure, &self.source_name, self.target).join("\n");
         text.push('\n');
 
         match self.interrupts.write_diagnostic(text).await {
@@ -345,14 +348,16 @@ impl ResponseSession {
     }
 }
 
-fn failure_lines(failure: &ExecFailure, fallback_source_name: &str) -> Vec<String> {
+fn failure_lines(failure: &ExecFailure, fallback_source_name: &str, target: Target) -> Vec<String> {
     let message = if failure.message.is_empty() {
-        "AutoCAD could not complete the execution."
+        format!("Could not execute AutoLISP in drawing {target}")
+    } else if failure.location.is_some() || failure.form_index.is_some() {
+        failure.message.clone()
     } else {
-        &failure.message
+        location_free_failure_message(failure, target)
     };
 
-    match (&failure.location, failure.form_index) {
+    let mut lines = match (&failure.location, failure.form_index) {
         (Some(location), Some(form_index)) => {
             let source_name = if location.source_name.is_empty() {
                 fallback_source_name
@@ -362,10 +367,10 @@ fn failure_lines(failure: &ExecFailure, fallback_source_name: &str) -> Vec<Strin
 
             vec![
                 format!(
-                    "Execution error in {source_name}, form {form_index} (line {}).",
+                    "AutoLISP failed in {source_name} at form {form_index}, line {}",
                     location.line
                 ),
-                message.into(),
+                message,
             ]
         }
         (Some(location), None) => {
@@ -377,57 +382,78 @@ fn failure_lines(failure: &ExecFailure, fallback_source_name: &str) -> Vec<Strin
 
             vec![
                 format!(
-                    "Read error in {source_name} (line {}, column {}).",
+                    "Could not read AutoLISP in {source_name} at line {}, column {}",
                     location.line, location.column
                 ),
-                message.into(),
+                message,
             ]
         }
         (None, Some(form_index)) => vec![
-            format!("Execution error in {fallback_source_name}, form {form_index}."),
-            message.into(),
+            format!("AutoLISP failed in {fallback_source_name} at form {form_index}"),
+            message,
         ],
-        (None, None) => vec![format!("acadctl: {message}")],
+        (None, None) => vec![message],
+    };
+
+    lines.push(drawing_outcome_message(failure.drawing_outcome).into());
+    lines
+}
+
+fn location_free_failure_message(failure: &ExecFailure, target: Target) -> String {
+    if let Ok(kind) = acadctl_rpc::DrawingErrorKind::try_from(failure.drawing_error)
+        && kind != acadctl_rpc::DrawingErrorKind::Unspecified
+    {
+        super::drawing_error_message(kind, target)
+    } else if failure.message.starts_with("The source ") || failure.message.starts_with("eval ") {
+        failure.message.trim_end_matches('.').to_owned()
+    } else {
+        format!("Could not execute AutoLISP in drawing {target}")
+    }
+}
+
+fn drawing_outcome_message(outcome: i32) -> &'static str {
+    match DrawingOutcome::try_from(outcome) {
+        Ok(DrawingOutcome::NotStarted) => "AutoLISP was not run",
+        Ok(DrawingOutcome::RolledBack) => {
+            "Drawing changes were rolled back (other side effects may remain)"
+        }
+        Ok(DrawingOutcome::Committed) => "Drawing changes were committed before the failure",
+        Ok(DrawingOutcome::Unknown | DrawingOutcome::Unspecified) | Err(_) => {
+            "Drawing outcome is unknown (running it again may repeat the operation)"
+        }
     }
 }
 
 fn response_start_error(status: tonic::Status) -> String {
-    if status.code() == Code::Unimplemented {
-        return request_error_message("start the AutoLISP execution", status);
+    if status.code() == Code::Unimplemented || incompatible_message(status.message()) {
+        return "CLI and AutoCAD plugin are incompatible (AutoLISP was not run)".into();
     }
 
-    let detail = if status.message().is_empty() {
-        String::new()
-    } else {
-        format!(": {}", status.message())
-    };
-
-    format!(
-        "Could not confirm whether AutoCAD accepted the execution{detail}. The request may still have been accepted; do not retry it blindly."
-    )
+    "AutoCAD did not report whether it started the AutoLISP (running it again may execute it twice)"
+        .into()
 }
 
 fn cancelled_exit() -> ExitCode {
     ExitCode::from(130)
 }
 
-fn confirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
-    interrupts.notice("acadctl: detached; AutoCAD acknowledged the cancellation request.");
+fn stopped_exit(interrupts: &Interrupts) -> ExitCode {
+    interrupts.finish_stopping("done.");
     cancelled_exit()
 }
 
-fn unconfirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
-    interrupts.notice(
-        "acadctl: detached without cancellation confirmation; the accepted execution request may still be running.",
-    );
+fn detach_exit(interrupts: &Interrupts) -> ExitCode {
+    interrupts.diagnostic("\nDetached (AutoLISP may still be running)\n");
+    cancelled_exit()
+}
+
+fn stopping_connection_lost(interrupts: &Interrupts) -> ExitCode {
+    interrupts.finish_stopping("connection lost (AutoLISP may still be running)");
     cancelled_exit()
 }
 
 async fn diagnostic_failure(interrupts: &mut Interrupts, message: String) -> ExitCode {
-    match interrupts
-        .write_diagnostic(format!("acadctl: {message}\n"))
-        .await
-    {
+    match interrupts.write_diagnostic(format!("{message}\n")).await {
         DiagnosticWait::Complete => ExitCode::FAILURE,
         DiagnosticWait::Interrupted => cancelled_exit(),
     }

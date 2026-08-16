@@ -309,6 +309,7 @@ impl Exec {
                                     &error,
                                 )),
                                 drawing_outcome: DrawingOutcome::Unknown,
+                                drawing_error: None,
                             }));
                         }
                         None => {
@@ -402,6 +403,7 @@ impl Exec {
                         form_index: Some(index),
                         location: Some(SourceLocation::new(self.source_name.clone(), line, column)),
                         drawing_outcome: DrawingOutcome::Unknown,
+                        drawing_error: None,
                     }));
                 } else {
                     if self.cancel_requested {
@@ -567,6 +569,7 @@ impl Exec {
             form_index: Some(1),
             location: self.eval_location.clone(),
             drawing_outcome,
+            drawing_error: None,
         }
     }
 
@@ -615,6 +618,7 @@ impl Exec {
                     form_index,
                     location,
                     drawing_outcome: DrawingOutcome::Unknown,
+                    drawing_error: None,
                 }
             }
         };

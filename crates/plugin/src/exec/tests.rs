@@ -196,6 +196,7 @@ fn a_missing_post_commit_writer_is_a_committed_failure() {
                 column: 1,
             }),
             drawing_outcome: DrawingOutcome::Committed,
+            drawing_error: None,
         }))
     );
 }
@@ -364,6 +365,7 @@ fn rolls_back_a_lisp_failure_at_its_form_location() {
                 column: 3,
             }),
             drawing_outcome: DrawingOutcome::RolledBack,
+            drawing_error: None,
         }))
     );
 }
@@ -415,6 +417,7 @@ fn commit_failure_is_rolled_back() {
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::RolledBack,
+            drawing_error: None,
         }))
     );
 }
@@ -465,6 +468,7 @@ fn begin_failure_never_claims_that_drawing_work_started() {
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::NotStarted,
+            drawing_error: None,
         }))
     );
 }
@@ -480,6 +484,7 @@ fn cleanup_failure_overrides_success_with_an_unknown_drawing_outcome() {
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::Unknown,
+            drawing_error: None,
         }))
     );
 }
@@ -538,6 +543,7 @@ fn abandonment_terminalizes_an_in_flight_form_as_unknown() {
                 column: 1,
             }),
             drawing_outcome: DrawingOutcome::Unknown,
+            drawing_error: None,
         }))
     );
 }
@@ -670,6 +676,7 @@ fn rollback_failure_overrides_cancellation() {
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::Unknown,
+            drawing_error: None,
         }))
     );
 }

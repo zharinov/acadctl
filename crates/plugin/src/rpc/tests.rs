@@ -13,12 +13,12 @@ fn source_name(value: &str) -> SourceName {
 }
 
 #[test]
-fn reports_documents_and_stops_promptly() {
+fn reports_drawings_and_stops_promptly() {
     let _test = crate::scheduler::TEST_LOCK.blocking_lock();
     let house = test_drawing_path("house");
     let site = test_drawing_path("site");
-    crate::scheduler::replace_document_snapshot(vec![
-        crate::ffi::NativeDocSnapshot {
+    crate::scheduler::replace_drawing_snapshot(vec![
+        crate::ffi::NativeDocumentSnapshot {
             document_token: 1,
             database_token: 101,
             name: house.as_str().into(),
@@ -26,7 +26,7 @@ fn reports_documents_and_stops_promptly() {
             modified: false,
             read_only: false,
         },
-        crate::ffi::NativeDocSnapshot {
+        crate::ffi::NativeDocumentSnapshot {
             document_token: 2,
             database_token: 102,
             name: site.as_str().into(),
@@ -42,64 +42,68 @@ fn reports_documents_and_stops_promptly() {
         .unwrap();
 
     let client = runtime.block_on(async {
-        let mut client = acadctl_rpc::connect_documents(
-            acadctl_rpc::ProcessId::new(std::process::id()).unwrap(),
+        let mut client = acadctl_rpc::connect_drawings(
+            acadctl_rpc::InstanceId::new(std::process::id()).unwrap(),
         )
         .await
         .unwrap();
         let listed = client.list(ListRequest {}).await.unwrap().into_inner();
-        assert_eq!(listed.documents.len(), 2);
-        assert!(DocId::try_from(listed.documents[0].id).is_ok());
+        assert_eq!(listed.drawings.len(), 2);
+        assert!(DrawingId::try_from(listed.drawings[0].id).is_ok());
         assert_eq!(
-            listed.documents[0].display_name,
+            listed.drawings[0].display_name,
             house.as_path().file_name().unwrap()
         );
         assert_eq!(
-            listed.documents[0].file_path.as_deref(),
+            listed.drawings[0].file_path.as_deref(),
             Some(house.as_str())
         );
-        assert!(!listed.documents[0].modified);
-        assert!(!listed.documents[0].read_only);
-        assert!(DocId::try_from(listed.documents[1].id).is_ok());
-        assert_ne!(listed.documents[0].id, listed.documents[1].id);
+        assert!(!listed.drawings[0].modified);
+        assert!(!listed.drawings[0].read_only);
+        assert!(DrawingId::try_from(listed.drawings[1].id).is_ok());
+        assert_ne!(listed.drawings[0].id, listed.drawings[1].id);
         assert_eq!(
-            listed.documents[1].display_name,
+            listed.drawings[1].display_name,
             site.as_path().file_name().unwrap()
         );
-        assert_eq!(
-            listed.documents[1].file_path.as_deref(),
-            Some(site.as_str())
-        );
-        assert!(listed.documents[1].modified);
-        assert!(listed.documents[1].read_only);
+        assert_eq!(listed.drawings[1].file_path.as_deref(), Some(site.as_str()));
+        assert!(listed.drawings[1].modified);
+        assert!(listed.drawings[1].read_only);
 
         let opened = client
             .open(OpenRequest::from(house.clone()))
             .await
             .unwrap()
             .into_inner()
-            .document
+            .drawing
             .unwrap();
-        assert_eq!(opened.id, listed.documents[0].id);
+        assert_eq!(opened.id, listed.drawings[0].id);
 
         let saved = client
-            .save(SaveRequest { id: opened.id })
+            .save(SaveRequest {
+                drawing_id: opened.id,
+            })
             .await
             .unwrap()
             .into_inner()
-            .document
+            .drawing
             .unwrap();
         assert_eq!(saved.id, opened.id);
         assert!(!saved.modified);
 
         let mut undo_client = client.clone();
         let undo_id = opened.id;
-        let undo_response =
-            tokio::spawn(async move { undo_client.undo(HistoryRequest { id: undo_id }).await });
+        let undo_response = tokio::spawn(async move {
+            undo_client
+                .undo(HistoryRequest {
+                    drawing_id: undo_id,
+                })
+                .await
+        });
         let undo_action = next_native_action().await;
         assert_eq!(undo_action.kind(), crate::ffi::NativeActionKind::Undo);
-        crate::scheduler::replace_document_snapshot(vec![
-            crate::ffi::NativeDocSnapshot {
+        crate::scheduler::replace_drawing_snapshot(vec![
+            crate::ffi::NativeDocumentSnapshot {
                 document_token: 1,
                 database_token: 101,
                 name: house.as_str().into(),
@@ -107,7 +111,7 @@ fn reports_documents_and_stops_promptly() {
                 modified: true,
                 read_only: false,
             },
-            crate::ffi::NativeDocSnapshot {
+            crate::ffi::NativeDocumentSnapshot {
                 document_token: 2,
                 database_token: 102,
                 name: site.as_str().into(),
@@ -129,19 +133,24 @@ fn reports_documents_and_stops_promptly() {
             .unwrap()
             .unwrap()
             .into_inner()
-            .document
+            .drawing
             .unwrap();
         assert_eq!(undone.id, opened.id);
         assert!(undone.modified);
 
         let mut redo_client = client.clone();
         let redo_id = opened.id;
-        let redo_response =
-            tokio::spawn(async move { redo_client.redo(HistoryRequest { id: redo_id }).await });
+        let redo_response = tokio::spawn(async move {
+            redo_client
+                .redo(HistoryRequest {
+                    drawing_id: redo_id,
+                })
+                .await
+        });
         let redo_action = next_native_action().await;
         assert_eq!(redo_action.kind(), crate::ffi::NativeActionKind::Redo);
-        crate::scheduler::replace_document_snapshot(vec![
-            crate::ffi::NativeDocSnapshot {
+        crate::scheduler::replace_drawing_snapshot(vec![
+            crate::ffi::NativeDocumentSnapshot {
                 document_token: 1,
                 database_token: 101,
                 name: house.as_str().into(),
@@ -149,7 +158,7 @@ fn reports_documents_and_stops_promptly() {
                 modified: false,
                 read_only: false,
             },
-            crate::ffi::NativeDocSnapshot {
+            crate::ffi::NativeDocumentSnapshot {
                 document_token: 2,
                 database_token: 102,
                 name: site.as_str().into(),
@@ -171,20 +180,28 @@ fn reports_documents_and_stops_promptly() {
             .unwrap()
             .unwrap()
             .into_inner()
-            .document
+            .drawing
             .unwrap();
         assert_eq!(redone.id, opened.id);
         assert!(!redone.modified);
 
         let close_error = client
             .close(CloseRequest {
-                id: listed.documents[1].id,
+                drawing_id: listed.drawings[1].id,
                 discard: false,
             })
             .await
             .unwrap_err();
         assert_eq!(close_error.code(), tonic::Code::FailedPrecondition);
-        assert!(close_error.message().contains("has unsaved changes"));
+        assert_eq!(
+            DrawingError::from_status(&close_error),
+            Some(DrawingError {
+                kind: DrawingErrorKind::UnsavedChanges as i32,
+                drawing_id: DrawingId::try_from(listed.drawings[1].id)
+                    .ok()
+                    .map(Into::into),
+            })
+        );
         client
     });
 
@@ -226,7 +243,7 @@ async fn next_native_action() -> crate::scheduler::NativeAction {
 #[test]
 fn execute_transport_preserves_the_four_mib_source_boundary() {
     let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-    crate::scheduler::replace_document_snapshot(vec![crate::ffi::NativeDocSnapshot {
+    crate::scheduler::replace_drawing_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
         document_token: 1,
         database_token: 101,
         name: "/tmp/house.dwg".into(),
@@ -234,7 +251,7 @@ fn execute_transport_preserves_the_four_mib_source_boundary() {
         modified: false,
         read_only: false,
     }]);
-    let document_id = crate::scheduler::list().unwrap()[0].id;
+    let drawing_id = crate::scheduler::list().unwrap()[0].id;
     start().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -243,13 +260,13 @@ fn execute_transport_preserves_the_four_mib_source_boundary() {
 
     runtime.block_on(async {
         let mut client = acadctl_rpc::connect_execution(
-            acadctl_rpc::ProcessId::new(std::process::id()).unwrap(),
+            acadctl_rpc::InstanceId::new(std::process::id()).unwrap(),
         )
         .await
         .unwrap();
         execute_and_cancel(
             &mut client,
-            document_id,
+            drawing_id,
             Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES]),
         )
         .await;
@@ -257,10 +274,10 @@ fn execute_transport_preserves_the_four_mib_source_boundary() {
         let mut with_bom = Vec::with_capacity(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3);
         with_bom.extend_from_slice(&[0xef, 0xbb, 0xbf]);
         with_bom.resize(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3, b'x');
-        execute_and_cancel(&mut client, document_id, Bytes::from(with_bom)).await;
+        execute_and_cancel(&mut client, drawing_id, Bytes::from(with_bom)).await;
 
         let request = execution_request(
-            document_id,
+            drawing_id,
             Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1]),
         );
         let mut response = client
@@ -318,7 +335,7 @@ fn terminal_execution_response_holds_capacity_until_observed() {
 #[test]
 fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
     let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-    crate::scheduler::replace_document_snapshot(vec![crate::ffi::NativeDocSnapshot {
+    crate::scheduler::replace_drawing_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
         document_token: 1,
         database_token: 101,
         name: "/tmp/house.dwg".into(),
@@ -326,7 +343,7 @@ fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
         modified: false,
         read_only: false,
     }]);
-    let document_id = crate::scheduler::list().unwrap()[0].id;
+    let drawing_id = crate::scheduler::list().unwrap()[0].id;
     start().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -335,13 +352,13 @@ fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
 
     runtime.block_on(async {
         let mut client = acadctl_rpc::connect_execution(
-            acadctl_rpc::ProcessId::new(std::process::id()).unwrap(),
+            acadctl_rpc::InstanceId::new(std::process::id()).unwrap(),
         )
         .await
         .unwrap();
         let (sender, receiver) = mpsc::channel(1);
         sender
-            .send(execution_request(document_id, Bytes::from_static(b"form")))
+            .send(execution_request(drawing_id, Bytes::from_static(b"form")))
             .await
             .unwrap();
         let outbound = stream::unfold(receiver, |mut receiver| async move {
@@ -405,12 +422,12 @@ fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
 
 async fn execute_and_cancel(
     client: &mut acadctl_rpc::ExecServiceClient<tonic::transport::Channel>,
-    document_id: DocId,
+    drawing_id: DrawingId,
     source: Bytes,
 ) {
     let (sender, receiver) = mpsc::channel(2);
     sender
-        .send(execution_request(document_id, source))
+        .send(execution_request(drawing_id, source))
         .await
         .unwrap();
     let outbound = stream::unfold(receiver, |mut receiver| async move {
@@ -464,10 +481,10 @@ async fn execute_and_cancel(
     assert!(finished_seen);
 }
 
-fn execution_request(document_id: DocId, source: Bytes) -> ExecClientMessage {
+fn execution_request(drawing_id: DrawingId, source: Bytes) -> ExecClientMessage {
     ExecClientMessage {
         message: Some(exec_client_message::Message::Request(ExecRequest::new(
-            document_id,
+            drawing_id,
             RpcExecMode::Exec,
             source_name("<stdin>"),
             source,

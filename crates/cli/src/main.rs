@@ -5,12 +5,31 @@ mod source;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::error::{ContextKind, ErrorKind};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use commands::target::Target;
 
+const ABOUT: &str = r#"Command line utility to control AutoCAD
+
+Examples:
+
+$ acadctl ps
+6A84:36C8  *  rw  foo.dwg
+6A84:91B2  .  ro  bar.dwg
+
+`foo.dwg` (6A84:36C8) contains unsaved changes while `bar.dwg` (6A84:91B2) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
+
+$ acadctl exec 6A84:36C8 <<'LISP'
+(defun square (x)
+  (* x x))
+LISP
+
+$ acadctl eval 6A84:36C8 '(square 7)'
+49"#;
+
 #[derive(Parser)]
-#[command(version, about = "Control AutoCAD from the command line")]
+#[command(version, about = ABOUT, disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,68 +37,81 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List acadctl-enabled AutoCAD instances and their documents.
+    /// List instances and drawings.
     Ps {
         /// Show the full path of named drawings.
         #[arg(long)]
         long: bool,
     },
-    /// Open a DWG in AutoCAD.
+    /// Open a DWG file.
     Open {
-        /// Drawing to open.
+        /// DWG file to open.
+        #[arg(value_name = "FILE")]
         path: PathBuf,
 
-        /// Target AutoCAD process when more than one instance is running.
-        #[arg(long)]
-        pid: Option<acadctl_rpc::ProcessId>,
+        /// AutoCAD instance to use when more than one is running.
+        #[arg(long, value_name = "INSTANCE")]
+        instance: Option<acadctl_rpc::InstanceId>,
     },
-    /// Save an open AutoCAD document in place.
+    /// Save changes.
     Save {
-        /// Document target shown by `acadctl ps`.
-        id: Target,
+        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        #[arg(value_name = "TARGET")]
+        target: Target,
     },
-    /// Undo the drawing's last AutoCAD history step.
+    /// Undo the previous action.
     Undo {
-        /// Document target shown by `acadctl ps`.
-        id: Target,
+        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        #[arg(value_name = "TARGET")]
+        target: Target,
     },
-    /// Redo the drawing's next AutoCAD history step.
+    /// Redo the previous action.
     Redo {
-        /// Document target shown by `acadctl ps`.
-        id: Target,
+        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        #[arg(value_name = "TARGET")]
+        target: Target,
     },
-    /// Close an open AutoCAD document.
+    /// Close a drawing.
     Close {
-        /// Document target shown by `acadctl ps`.
-        id: Target,
+        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        #[arg(value_name = "TARGET")]
+        target: Target,
 
         /// Discard unsaved changes.
         #[arg(long)]
         discard: bool,
     },
-    /// Evaluate one AutoLISP form and print its value.
+    /// Evaluate an AutoLISP expression.
     Eval(EvalArgs),
-    /// Execute an AutoLISP batch without implicit value output.
+    /// Execute an AutoLISP script.
     Exec(ExecArgs),
-    /// Terminate an AutoCAD instance.
+    /// Stop an instance.
     Kill {
-        /// Target AutoCAD process when more than one instance is running.
-        pid: Option<acadctl_rpc::ProcessId>,
+        /// AutoCAD instance to stop when more than one is running.
+        #[arg(value_name = "INSTANCE")]
+        instance: Option<acadctl_rpc::InstanceId>,
 
-        /// Terminate immediately without waiting for AutoCAD to close normally.
+        /// Stop immediately without waiting for AutoCAD to close normally.
         #[arg(long)]
         force: bool,
+    },
+    /// Print help for a command.
+    Help {
+        /// Command to describe.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
     },
 }
 
 #[derive(Args)]
 struct EvalArgs {
-    /// Document target shown by `acadctl ps`.
-    id: Target,
+    /// INSTANCE:DRAWING target shown by `acadctl ps`.
+    #[arg(value_name = "TARGET")]
+    target: Target,
 
-    /// AutoLISP form. Reads stdin when omitted.
+    /// AutoLISP expression. Reads stdin when omitted.
     #[arg(
-        value_name = "FORM",
+        value_name = "EXPRESSION",
         allow_hyphen_values = true,
         conflicts_with = "file"
     )]
@@ -97,12 +129,13 @@ struct EvalArgs {
 
 #[derive(Args)]
 struct ExecArgs {
-    /// Document target shown by `acadctl ps`.
-    id: Target,
+    /// INSTANCE:DRAWING target shown by `acadctl ps`.
+    #[arg(value_name = "TARGET")]
+    target: Target,
 
-    /// AutoLISP forms. Reads stdin when omitted.
+    /// AutoLISP script. Reads stdin when omitted.
     #[arg(
-        value_name = "FORMS",
+        value_name = "SCRIPT",
         allow_hyphen_values = true,
         conflicts_with = "file"
     )]
@@ -129,20 +162,25 @@ fn source_spec(inline: Option<String>, file: Option<PathBuf>) -> source::SourceS
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    match Cli::parse().command {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return report_parse_error(error),
+    };
+
+    match cli.command {
         Command::Ps { long } => commands::ps::run(long).await,
-        Command::Open { path, pid } => commands::open::run(path, pid).await,
-        Command::Save { id } => commands::save::run(id).await,
-        Command::Undo { id } => {
-            commands::history::run(id, commands::history::Direction::Undo).await
+        Command::Open { path, instance } => commands::open::run(path, instance).await,
+        Command::Save { target } => commands::save::run(target).await,
+        Command::Undo { target } => {
+            commands::history::run(target, commands::history::Direction::Undo).await
         }
-        Command::Redo { id } => {
-            commands::history::run(id, commands::history::Direction::Redo).await
+        Command::Redo { target } => {
+            commands::history::run(target, commands::history::Direction::Redo).await
         }
-        Command::Close { id, discard } => commands::close::run(id, discard).await,
+        Command::Close { target, discard } => commands::close::run(target, discard).await,
         Command::Eval(arguments) => {
             commands::exec::run(
-                arguments.id,
+                arguments.target,
                 source_spec(arguments.inline, arguments.file),
                 acadctl_rpc::ExecMode::Eval,
             )
@@ -150,13 +188,97 @@ async fn main() -> ExitCode {
         }
         Command::Exec(arguments) => {
             commands::exec::run(
-                arguments.id,
+                arguments.target,
                 source_spec(arguments.inline, arguments.file),
                 acadctl_rpc::ExecMode::Exec,
             )
             .await
         }
-        Command::Kill { pid, force } => commands::kill::run(pid, force).await,
+        Command::Kill { instance, force } => commands::kill::run(instance, force).await,
+        Command::Help { command } => print_help(command),
+    }
+}
+
+fn report_parse_error(error: clap::Error) -> ExitCode {
+    match error.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            let _ = error.print();
+            ExitCode::SUCCESS
+        }
+        ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let mut command = Cli::command();
+            let _ = command.print_help();
+            println!();
+            ExitCode::from(2)
+        }
+        ErrorKind::ValueValidation => {
+            let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
+            let value = error_context(&error, ContextKind::InvalidValue).unwrap_or_default();
+
+            if argument.contains("TARGET") {
+                eprintln!("Invalid target '{value}' (expected INSTANCE:DRAWING from acadctl ps)");
+            } else if argument.contains("INSTANCE") {
+                eprintln!("Invalid instance '{value}' (expected 4–8 hexadecimal digits)");
+            } else {
+                eprintln!("Invalid value '{value}' for {argument}");
+            }
+
+            ExitCode::from(2)
+        }
+        ErrorKind::UnknownArgument => {
+            let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
+            eprintln!("Unknown argument '{argument}'");
+            ExitCode::from(2)
+        }
+        ErrorKind::InvalidSubcommand => {
+            let command = error_context(&error, ContextKind::InvalidSubcommand).unwrap_or_default();
+            eprintln!("Unknown command '{command}'");
+            ExitCode::from(2)
+        }
+        ErrorKind::MissingRequiredArgument => {
+            let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
+            eprintln!("Missing required argument {argument}");
+            ExitCode::from(2)
+        }
+        ErrorKind::ArgumentConflict => {
+            let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
+            let prior = error_context(&error, ContextKind::PriorArg).unwrap_or_default();
+            eprintln!("{argument} cannot be used with {prior}");
+            ExitCode::from(2)
+        }
+        _ => {
+            eprintln!("Invalid command arguments");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn error_context(error: &clap::Error, kind: ContextKind) -> Option<String> {
+    error.get(kind).map(ToString::to_string)
+}
+
+fn print_help(command_name: Option<String>) -> ExitCode {
+    let mut command = Cli::command();
+    let command = match command_name {
+        Some(name) => match command.find_subcommand_mut(&name) {
+            Some(command) => {
+                command.set_bin_name(format!("acadctl {name}"));
+                command
+            }
+            None => {
+                eprintln!("Unknown command '{name}'");
+                return ExitCode::from(2);
+            }
+        },
+        None => &mut command,
+    };
+
+    match command.print_help() {
+        Ok(()) => {
+            println!();
+            ExitCode::SUCCESS
+        }
+        Err(_) => ExitCode::FAILURE,
     }
 }
 
@@ -202,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn help_uses_mode_specific_source_value_names() {
+    fn help_uses_public_target_and_source_names() {
         let mut command = Cli::command();
         let eval_help = command
             .find_subcommand_mut("eval")
@@ -215,10 +337,24 @@ mod tests {
             .render_help()
             .to_string();
 
-        assert!(eval_help.contains("[FORM]"));
-        assert!(exec_help.contains("[FORMS]"));
+        assert!(eval_help.contains("<TARGET> [EXPRESSION]"));
+        assert!(exec_help.contains("<TARGET> [SCRIPT]"));
         assert!(eval_help.contains("-f, --file <FILE>"));
         assert!(exec_help.contains("-f, --file <FILE>"));
+    }
+
+    #[test]
+    fn top_level_help_teaches_the_cli_through_a_terminal_session() {
+        let help = Cli::command().render_help().to_string();
+
+        assert!(help.starts_with("Command line utility to control AutoCAD\n"));
+        assert!(help.contains("$ acadctl ps\n6A84:36C8  *  rw  foo.dwg"));
+        assert!(help.contains("$ acadctl exec 6A84:36C8 <<'LISP'"));
+        assert!(help.contains("$ acadctl eval 6A84:36C8 '(square 7)'\n49"));
+        assert!(!help.contains("--file script.lsp"));
+        assert!(!help.contains("document"));
+        assert!(!help.contains("process"));
+        assert!(!help.contains("pid"));
     }
 
     #[test]

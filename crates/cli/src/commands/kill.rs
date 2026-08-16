@@ -1,51 +1,47 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use acadctl_rpc::ProcessId;
+use acadctl_rpc::InstanceId;
 use tokio::time::{Instant, sleep};
 
 use super::fail;
-use crate::instance::{AutoCadProcess, ProcessSnapshot};
+use crate::instance::{AutoCadInstance, InstanceSnapshot};
 
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-pub async fn run(requested_process_id: Option<ProcessId>, force: bool) -> ExitCode {
-    let processes = ProcessSnapshot::discover();
-    let process = match processes.select(requested_process_id) {
-        Ok(process) => process,
+pub async fn run(requested_instance: Option<InstanceId>, force: bool) -> ExitCode {
+    let instances = InstanceSnapshot::discover();
+    let instance = match instances.select(requested_instance) {
+        Ok(instance) => instance,
         Err(error) => return fail(error.to_string()),
     };
-    let process_id = process.process_id();
+    let instance_id = instance.instance_id();
 
-    if !process.request_termination(force) {
-        let action = if force { "force" } else { "ask" };
-
-        return fail(format!(
-            "Could not {action} AutoCAD process {process_id} to quit."
-        ));
+    if !instance.request_termination(force) {
+        return fail(format!("Could not stop AutoCAD instance {instance_id}"));
     }
 
-    if wait_until_stopped(process).await {
+    if wait_until_stopped(instance).await {
         return ExitCode::SUCCESS;
     }
 
     if force {
         return fail(format!(
-            "AutoCAD process {process_id} did not terminate within 5 seconds."
+            "AutoCAD instance {instance_id} did not stop within 5 seconds"
         ));
     }
 
     fail(format!(
-        "AutoCAD process {process_id} did not exit within 5 seconds. Run `acadctl kill {process_id} --force` to terminate it immediately."
+        "AutoCAD instance {instance_id} did not stop within 5 seconds (--force stops it immediately)"
     ))
 }
 
-async fn wait_until_stopped(process: &AutoCadProcess) -> bool {
+async fn wait_until_stopped(instance: &AutoCadInstance) -> bool {
     let deadline = Instant::now() + EXIT_TIMEOUT;
 
     loop {
-        if process.has_exited() {
+        if instance.has_exited() {
             return true;
         }
 

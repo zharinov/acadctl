@@ -1,4 +1,4 @@
-mod doc;
+mod drawing;
 mod exec;
 mod server;
 mod status;

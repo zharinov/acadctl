@@ -1,5 +1,5 @@
 use acadctl_lisp::{FormSpan, ScanError};
-use acadctl_rpc::SourceName;
+use acadctl_rpc::{DrawingErrorKind, SourceName};
 
 use super::diagnostic::append_diagnostic;
 
@@ -43,6 +43,7 @@ pub struct ExecFailure {
     pub form_index: Option<usize>,
     pub location: Option<SourceLocation>,
     pub drawing_outcome: DrawingOutcome,
+    pub drawing_error: Option<DrawingErrorKind>,
 }
 
 impl ExecFailure {
@@ -52,6 +53,7 @@ impl ExecFailure {
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::NotStarted,
+            drawing_error: None,
         }
     }
 
@@ -61,6 +63,7 @@ impl ExecFailure {
             form_index: None,
             location: None,
             drawing_outcome: DrawingOutcome::Unknown,
+            drawing_error: None,
         }
     }
 }

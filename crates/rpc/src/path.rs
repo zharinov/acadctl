@@ -109,25 +109,34 @@ impl FromStr for DrawingPath {
 impl fmt::Display for DrawingPathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotDwg => formatter.write_str("Only DWG drawings can be opened."),
+            Self::NotDwg => formatter.write_str("Only DWG files can be opened"),
             Self::NotFile(path) => {
-                write!(formatter, "Drawing '{}' does not exist.", path.display())
+                write!(formatter, "DWG file '{}' does not exist", path.display())
             }
-            Self::NotAbsolute => formatter.write_str("The drawing path must be absolute."),
-            Self::TooLong => formatter.write_str("The drawing path exceeds the 32 KiB limit."),
+            Self::NotAbsolute => formatter.write_str("The drawing path must be absolute"),
+            Self::TooLong => formatter.write_str("The drawing path exceeds the 32 KiB limit"),
             Self::Resolve { path, source } => {
                 write!(
                     formatter,
-                    "Could not resolve '{}': {source}",
-                    path.display()
+                    "Could not resolve '{}' ({})",
+                    path.display(),
+                    io_error_description(source)
                 )
             }
             Self::InvalidUtf8(path) => write!(
                 formatter,
-                "Drawing path '{}' is not valid UTF-8.",
+                "Drawing path '{}' is not valid UTF-8",
                 path.to_string_lossy()
             ),
         }
+    }
+}
+
+fn io_error_description(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "file not found",
+        io::ErrorKind::PermissionDenied => "permission denied",
+        _ => "I/O error",
     }
 }
 

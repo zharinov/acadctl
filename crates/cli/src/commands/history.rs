@@ -11,30 +11,30 @@ pub enum Direction {
 }
 
 pub async fn run(target: Target, direction: Direction) -> ExitCode {
-    let mut client = match super::connect_documents(target.process_id).await {
+    let mut client = match super::connect_drawings(target.instance_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
 
     let response = match direction {
-        Direction::Undo => client.undo(HistoryRequest::from(target.document_id)).await,
-        Direction::Redo => client.redo(HistoryRequest::from(target.document_id)).await,
+        Direction::Undo => client.undo(HistoryRequest::from(target.drawing_id)).await,
+        Direction::Redo => client.redo(HistoryRequest::from(target.drawing_id)).await,
     };
 
     let response = match response {
         Ok(response) => response.into_inner(),
         Err(status) => {
             let operation = match direction {
-                Direction::Undo => "undo the drawing's last history step",
-                Direction::Redo => "redo the drawing's next history step",
+                Direction::Undo => format!("undo the previous action in drawing {target}"),
+                Direction::Redo => format!("redo the previous action in drawing {target}"),
             };
 
-            return fail(request_error_message(operation, status));
+            return fail(request_error_message(&operation, Some(target), status));
         }
     };
 
-    if response.document.is_none() {
-        return fail("AutoCAD did not identify the updated document.".into());
+    if response.drawing.is_none() {
+        return fail("AutoCAD did not identify the updated drawing".into());
     }
 
     ExitCode::SUCCESS

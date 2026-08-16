@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use acadctl_rpc::{Doc, DocServiceClient, ExecServiceClient, ListRequest, ProcessId};
+use acadctl_rpc::{Drawing, DrawingServiceClient, ExecServiceClient, InstanceId, ListRequest};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::time::timeout;
 use tonic::Code;
@@ -9,24 +9,24 @@ use tonic::transport::Channel;
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Instance {
-    pub process_id: ProcessId,
-    pub documents: Result<Vec<Doc>, QueryError>,
+    pub instance_id: InstanceId,
+    pub drawings: Result<Vec<Drawing>, QueryError>,
 }
 
 impl Instance {
-    async fn query(process_id: ProcessId) -> Option<Self> {
-        let documents = match timeout(LIST_TIMEOUT, query_documents(process_id)).await {
+    async fn query(instance_id: InstanceId) -> Option<Self> {
+        let drawings = match timeout(LIST_TIMEOUT, query_drawings(instance_id)).await {
             Ok(result) => result,
             Err(_) => Err(QueryError::TimedOut),
         };
 
-        if matches!(documents, Err(QueryError::CannotConnect)) {
+        if matches!(drawings, Err(QueryError::CannotConnect)) {
             return None;
         }
 
         Some(Self {
-            process_id,
-            documents,
+            instance_id,
+            drawings,
         })
     }
 }
@@ -38,38 +38,38 @@ pub enum QueryError {
     RequestFailed(String),
 }
 
-pub struct ProcessSnapshot {
-    processes: Vec<AutoCadProcess>,
+pub struct InstanceSnapshot {
+    instances: Vec<AutoCadInstance>,
 }
 
-impl ProcessSnapshot {
+impl InstanceSnapshot {
     pub fn discover() -> Self {
         Self {
-            processes: process::discover(),
+            instances: process::discover(),
         }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &AutoCadProcess> {
-        self.processes.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &AutoCadInstance> {
+        self.instances.iter()
     }
 
     pub fn select(
         &self,
-        requested_process_id: Option<ProcessId>,
-    ) -> Result<&AutoCadProcess, ProcessSelectionError> {
-        if let Some(process_id) = requested_process_id {
+        requested_instance_id: Option<InstanceId>,
+    ) -> Result<&AutoCadInstance, InstanceSelectionError> {
+        if let Some(instance_id) = requested_instance_id {
             return self
-                .processes
+                .instances
                 .iter()
-                .find(|process| process.process_id() == process_id)
-                .ok_or(ProcessSelectionError::NotRunning(process_id));
+                .find(|instance| instance.instance_id() == instance_id)
+                .ok_or(InstanceSelectionError::NotRunning(instance_id));
         }
 
-        match self.processes.as_slice() {
-            [process] => Ok(process),
-            [] => Err(ProcessSelectionError::NotRunningAny),
-            processes => Err(ProcessSelectionError::Ambiguous(
-                processes.iter().map(AutoCadProcess::process_id).collect(),
+        match self.instances.as_slice() {
+            [instance] => Ok(instance),
+            [] => Err(InstanceSelectionError::NotRunningAny),
+            instances => Err(InstanceSelectionError::Ambiguous(
+                instances.iter().map(AutoCadInstance::instance_id).collect(),
             )),
         }
     }
@@ -77,7 +77,7 @@ impl ProcessSnapshot {
     pub async fn query_instances(&self) -> Vec<Instance> {
         let mut pending = self
             .iter()
-            .map(|process| Instance::query(process.process_id()))
+            .map(|instance| Instance::query(instance.instance_id()))
             .collect::<FuturesUnordered<_>>();
         let mut instances = Vec::new();
 
@@ -89,30 +89,30 @@ impl ProcessSnapshot {
             instances.push(instance);
         }
 
-        instances.sort_unstable_by_key(|instance| instance.process_id);
+        instances.sort_unstable_by_key(|instance| instance.instance_id);
         instances
     }
 }
 
-pub enum ProcessSelectionError {
-    NotRunning(ProcessId),
+pub enum InstanceSelectionError {
+    NotRunning(InstanceId),
     NotRunningAny,
-    Ambiguous(Vec<ProcessId>),
+    Ambiguous(Vec<InstanceId>),
 }
 
-impl fmt::Display for ProcessSelectionError {
+impl fmt::Display for InstanceSelectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotRunning(process_id) => {
-                write!(formatter, "AutoCAD process {process_id} is not running.")
+            Self::NotRunning(instance_id) => {
+                write!(formatter, "AutoCAD instance {instance_id} is not running")
             }
-            Self::NotRunningAny => formatter.write_str("AutoCAD is not running."),
-            Self::Ambiguous(process_ids) => write!(
+            Self::NotRunningAny => formatter.write_str("AutoCAD is not running"),
+            Self::Ambiguous(instance_ids) => write!(
                 formatter,
-                "More than one AutoCAD instance is running ({}). Use `acadctl kill <pid>`.",
-                process_ids
+                "More than one AutoCAD instance is running ({})",
+                instance_ids
                     .iter()
-                    .map(ProcessId::to_string)
+                    .map(InstanceId::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -120,8 +120,8 @@ impl fmt::Display for ProcessSelectionError {
     }
 }
 
-async fn query_documents(process_id: ProcessId) -> Result<Vec<Doc>, QueryError> {
-    let mut client = connect_documents(process_id).await?;
+async fn query_drawings(instance_id: InstanceId) -> Result<Vec<Drawing>, QueryError> {
+    let mut client = connect_drawings(instance_id).await?;
 
     let listed = client
         .list(ListRequest {})
@@ -135,21 +135,21 @@ async fn query_documents(process_id: ProcessId) -> Result<Vec<Doc>, QueryError> 
         })?
         .into_inner();
 
-    Ok(listed.documents)
+    Ok(listed.drawings)
 }
 
-pub async fn connect_documents(
-    process_id: ProcessId,
-) -> Result<DocServiceClient<Channel>, QueryError> {
-    acadctl_rpc::connect_documents(process_id)
+pub async fn connect_drawings(
+    instance_id: InstanceId,
+) -> Result<DrawingServiceClient<Channel>, QueryError> {
+    acadctl_rpc::connect_drawings(instance_id)
         .await
         .map_err(|_| QueryError::CannotConnect)
 }
 
 pub async fn connect_execution(
-    process_id: ProcessId,
+    instance_id: InstanceId,
 ) -> Result<ExecServiceClient<Channel>, QueryError> {
-    acadctl_rpc::connect_execution(process_id)
+    acadctl_rpc::connect_execution(instance_id)
         .await
         .map_err(|_| QueryError::CannotConnect)
 }
@@ -164,28 +164,28 @@ mod process;
 #[path = "../process/unsupported.rs"]
 mod process;
 
-pub use process::AutoCadProcess;
+pub use process::AutoCadInstance;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn process_selection_errors_preserve_cli_guidance() {
-        let first = ProcessId::new(123).unwrap();
-        let second = ProcessId::new(456).unwrap();
+    fn instance_selection_errors_preserve_cli_guidance() {
+        let first = InstanceId::new(123).unwrap();
+        let second = InstanceId::new(456).unwrap();
 
         assert_eq!(
-            ProcessSelectionError::NotRunningAny.to_string(),
-            "AutoCAD is not running."
+            InstanceSelectionError::NotRunningAny.to_string(),
+            "AutoCAD is not running"
         );
         assert_eq!(
-            ProcessSelectionError::NotRunning(second).to_string(),
-            "AutoCAD process 01C8 is not running."
+            InstanceSelectionError::NotRunning(second).to_string(),
+            "AutoCAD instance 01C8 is not running"
         );
         assert_eq!(
-            ProcessSelectionError::Ambiguous(vec![first, second]).to_string(),
-            "More than one AutoCAD instance is running (007B, 01C8). Use `acadctl kill <pid>`."
+            InstanceSelectionError::Ambiguous(vec![first, second]).to_string(),
+            "More than one AutoCAD instance is running (007B, 01C8)"
         );
     }
 }

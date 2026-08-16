@@ -55,7 +55,7 @@ fn execution_finalization_classification_uses_native_facts_in_rust() {
     }
 
     let restore = classify_execution_finalization(
-        result(NativeActionResultKind::DocContextRestoreFailed),
+        result(NativeActionResultKind::DocumentContextRestoreFailed),
         ExecFinalizationObservation {
             undo_group_may_be_open: true,
             ..ExecFinalizationObservation::default()
@@ -63,7 +63,7 @@ fn execution_finalization_classification_uses_native_facts_in_rust() {
     );
     assert_eq!(
         restore.result.kind,
-        NativeActionResultKind::DocContextRestoreFailed
+        NativeActionResultKind::DocumentContextRestoreFailed
     );
     assert!(restore.quarantine);
 
@@ -99,21 +99,21 @@ fn execution_finalization_classification_uses_native_facts_in_rust() {
 fn preserves_native_guard_outcomes_as_types() {
     assert_eq!(
         interpret(
-            result(NativeActionResultKind::DocGone),
+            result(NativeActionResultKind::DrawingGone),
             &Operation::Save {
                 id: "D0C0".parse().unwrap(),
             },
         ),
-        Err(Error::DocGone)
+        Err(Error::DrawingGone)
     );
     assert_eq!(
         interpret(
-            result(NativeActionResultKind::DocGenerationChanged),
+            result(NativeActionResultKind::DrawingGenerationChanged),
             &Operation::Save {
                 id: "D0C0".parse().unwrap(),
             },
         ),
-        Err(Error::DocGenerationChanged)
+        Err(Error::DrawingGenerationChanged)
     );
     assert_eq!(
         interpret(
@@ -129,7 +129,7 @@ fn preserves_native_guard_outcomes_as_types() {
 #[tokio::test]
 async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, true)]);
+    reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
     let first = tokio::spawn(save(id));
@@ -144,7 +144,7 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
     tokio::task::yield_now().await;
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
-    replace_document_snapshot(vec![document(1, 101, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         save_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -153,7 +153,7 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
 
     let close_action = take_native_action();
     assert_eq!(close_action.kind(), NativeActionKind::Close);
-    replace_document_snapshot(Vec::new());
+    replace_drawing_snapshot(Vec::new());
     complete_native_action(
         close_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -165,7 +165,7 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
 #[tokio::test]
 async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
 
     let undo_waiter = tokio::spawn(undo(id));
@@ -179,7 +179,7 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
     tokio::task::yield_now().await;
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
-    replace_document_snapshot(vec![document(1, 101, true)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, true)]);
     complete_native_action(
         undo_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -190,7 +190,7 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
     assert_eq!(redo_action.kind(), NativeActionKind::Redo);
     assert_eq!(redo_action.document_token(), 1);
     assert_eq!(redo_action.database_token(), 101);
-    replace_document_snapshot(vec![document(1, 101, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         redo_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -200,23 +200,23 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
 }
 
 #[tokio::test]
-async fn drawing_history_fails_closed_on_missing_or_replaced_documents() {
+async fn drawing_history_fails_closed_on_missing_or_replaced_drawings() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
 
     assert_eq!(
         undo("DEAD".parse().unwrap()).await,
-        Err(Error::DocNotFound("DEAD".parse().unwrap()))
+        Err(Error::DrawingNotFound("DEAD".parse().unwrap()))
     );
 
     let waiter = tokio::spawn(redo(id));
     tokio::task::yield_now().await;
     let action = take_native_action();
     assert_eq!(action.kind(), NativeActionKind::Redo);
-    replace_document_snapshot(vec![document(1, 201, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 201, false)]);
     complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
-    assert_eq!(waiter.await.unwrap(), Err(Error::DocGenerationChanged));
+    assert_eq!(waiter.await.unwrap(), Err(Error::DrawingGenerationChanged));
     stop();
 }
 
@@ -243,7 +243,7 @@ async fn wake_failure_completes_every_job_waiting_on_that_wake() {
 #[tokio::test]
 async fn shutdown_rejects_pending_work_but_preserves_the_active_operation() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, true)]);
+    reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
     let active = tokio::spawn(save(id));
@@ -258,7 +258,7 @@ async fn shutdown_rejects_pending_work_but_preserves_the_active_operation() {
     assert_eq!(pending.await.unwrap(), Err(Error::PluginStopping));
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
-    replace_document_snapshot(vec![document(1, 101, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         save_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -269,7 +269,7 @@ async fn shutdown_rejects_pending_work_but_preserves_the_active_operation() {
 #[tokio::test]
 async fn routes_the_eval_value_only_after_commit_and_only_once() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
@@ -327,7 +327,7 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
 #[tokio::test]
 async fn queued_cancellation_removes_only_that_execution() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, true)]);
+    reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
     let active = tokio::spawn(save(id));
@@ -351,7 +351,7 @@ async fn queued_cancellation_removes_only_that_execution() {
     assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Cancelled);
     assert_eq!(output.next_chunk().await, None);
 
-    replace_document_snapshot(vec![document(1, 101, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         save_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -364,7 +364,7 @@ async fn queued_cancellation_removes_only_that_execution() {
 #[tokio::test]
 async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, true)]);
+    reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
     let active = tokio::spawn(save(id));
@@ -394,7 +394,7 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
     assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
     assert_eq!(output.next_chunk().await, None);
 
-    replace_document_snapshot(vec![document(1, 101, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         save_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -407,7 +407,7 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
 #[tokio::test]
 async fn wake_failure_stops_a_pending_execution_output_stream() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -425,7 +425,7 @@ async fn wake_failure_stops_a_pending_execution_output_stream() {
 #[tokio::test]
 async fn active_cancellation_rolls_back_after_the_current_form() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -466,7 +466,7 @@ async fn active_cancellation_rolls_back_after_the_current_form() {
 #[tokio::test]
 async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -499,7 +499,7 @@ async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group()
 #[tokio::test]
 async fn cancellation_after_commit_handoff_does_not_cancel_output() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -538,7 +538,7 @@ async fn cancellation_after_commit_handoff_does_not_cancel_output() {
 #[tokio::test]
 async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -575,7 +575,7 @@ async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
 #[tokio::test]
 async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -619,7 +619,7 @@ async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
     assert!(try_claim_native_action_wake());
     let close_action = take_native_action();
     assert_eq!(close_action.kind(), NativeActionKind::Close);
-    replace_document_snapshot(Vec::new());
+    replace_drawing_snapshot(Vec::new());
     complete_native_action(
         close_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -631,7 +631,7 @@ async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
 #[tokio::test]
 async fn document_context_restore_failure_amends_a_terminal_execution_outcome() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "ok".into()).unwrap();
@@ -666,7 +666,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
     complete_native_action(
         action.job_id(),
         NativeActionResult {
-            kind: NativeActionResultKind::DocContextRestoreFailed,
+            kind: NativeActionResultKind::DocumentContextRestoreFailed,
             native_status: 42,
             native_detail: "unlock failed".into(),
         },
@@ -679,6 +679,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
             form_index: None,
             location: None,
             drawing_outcome: crate::exec::DrawingOutcome::Unknown,
+            drawing_error: None,
         })
     );
     assert_eq!(
@@ -693,7 +694,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
 #[tokio::test]
 async fn start_does_not_clear_native_state_quarantine() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
@@ -717,7 +718,7 @@ async fn start_does_not_clear_native_state_quarantine() {
 #[tokio::test]
 async fn retained_execution_state_quarantines_without_erasing_commit_evidence() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
@@ -791,6 +792,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
                 column: 1,
             }),
             drawing_outcome: crate::exec::DrawingOutcome::Committed,
+            drawing_error: None,
         })
     );
     assert_eq!(
@@ -805,7 +807,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
 #[tokio::test]
 async fn queued_execution_expires_without_starting_a_form() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, true)]);
+    reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
     let saving = tokio::spawn(save(id));
     tokio::task::yield_now().await;
@@ -836,11 +838,12 @@ async fn queued_execution_expires_without_starting_a_form() {
             form_index: None,
             location: None,
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
+            drawing_error: None,
         })
     );
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
-    replace_document_snapshot(vec![document(1, 101, false)]);
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         save_action.job_id(),
         result(NativeActionResultKind::Success),
@@ -852,7 +855,7 @@ async fn queued_execution_expires_without_starting_a_form() {
 #[tokio::test]
 async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -881,7 +884,7 @@ async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
 #[tokio::test]
 async fn deadline_wins_while_the_busy_probe_is_in_flight() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -902,6 +905,7 @@ async fn deadline_wins_while_the_busy_probe_is_in_flight() {
         completion.wait().await.unwrap(),
         ExecOutcome::Failure(crate::exec::ExecFailure {
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
+            drawing_error: None,
             ..
         })
     ));
@@ -912,7 +916,7 @@ async fn deadline_wins_while_the_busy_probe_is_in_flight() {
 #[tokio::test]
 async fn deadline_winner_survives_a_native_preflight_failure() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -938,6 +942,7 @@ async fn deadline_winner_survives_a_native_preflight_failure() {
             form_index: None,
             location: None,
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
+            drawing_error: None,
         })
     );
     stop();
@@ -946,7 +951,7 @@ async fn deadline_winner_survives_a_native_preflight_failure() {
 #[tokio::test]
 async fn deadline_winner_survives_a_failing_begin_step() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -1003,7 +1008,7 @@ async fn deadline_winner_survives_a_failing_begin_step() {
 #[tokio::test]
 async fn execution_count_capacity_is_released_by_queued_cancellation() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let mut admissions = Vec::new();
 
@@ -1038,7 +1043,7 @@ async fn execution_count_capacity_is_released_by_queued_cancellation() {
 #[tokio::test]
 async fn detached_execution_retains_its_shared_admission_reservation() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
     let response_reservation = try_reserve_execution().unwrap();
     let (execution, output) =
@@ -1064,7 +1069,7 @@ async fn detached_execution_retains_its_shared_admission_reservation() {
 #[tokio::test]
 async fn queued_cancel_and_deadline_have_one_serialized_winner() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, false)]);
+    reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
 
     let (execution, output) =
@@ -1087,6 +1092,7 @@ async fn queued_cancel_and_deadline_have_one_serialized_winner() {
         expired_completion.wait().await.unwrap(),
         ExecOutcome::Failure(crate::exec::ExecFailure {
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
+            drawing_error: None,
             ..
         })
     ));
@@ -1107,7 +1113,7 @@ async fn queued_cancel_and_deadline_have_one_serialized_winner() {
 #[tokio::test]
 async fn mutation_job_capacity_bounds_disconnected_waiters() {
     let _test = TEST_LOCK.lock().await;
-    reset(vec![document(1, 101, true)]);
+    reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
     let active = tokio::spawn(save(id));
     tokio::task::yield_now().await;
@@ -1133,7 +1139,7 @@ async fn mutation_job_capacity_bounds_disconnected_waiters() {
 }
 
 fn admit_test_execution(
-    id: DocId,
+    id: DrawingId,
     execution: Exec,
     output: OutputStream,
 ) -> Result<ExecAdmission, Error> {
@@ -1142,7 +1148,7 @@ fn admit_test_execution(
 }
 
 fn spawn_test_execution(
-    id: DocId,
+    id: DrawingId,
     execution: Exec,
     output: OutputStream,
 ) -> (
@@ -1172,12 +1178,12 @@ fn step_success() -> ExecStepResult {
     }
 }
 
-fn document(
+fn drawing(
     document_token: usize,
     database_token: usize,
     modified: bool,
-) -> crate::ffi::NativeDocSnapshot {
-    crate::ffi::NativeDocSnapshot {
+) -> crate::ffi::NativeDocumentSnapshot {
+    crate::ffi::NativeDocumentSnapshot {
         document_token,
         database_token,
         name: "/tmp/house.dwg".into(),
@@ -1198,9 +1204,9 @@ fn drawing_path(name: &str) -> DrawingPath {
     drawing
 }
 
-fn reset(documents: Vec<crate::ffi::NativeDocSnapshot>) {
+fn reset(drawings: Vec<crate::ffi::NativeDocumentSnapshot>) {
     stop();
     SCHEDULER.lock().unwrap().quarantined = false;
-    replace_document_snapshot(documents);
+    replace_drawing_snapshot(drawings);
     start();
 }

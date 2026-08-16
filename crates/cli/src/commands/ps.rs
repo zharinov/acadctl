@@ -1,100 +1,125 @@
 use std::process::ExitCode;
 
-use acadctl_rpc::{Doc, ProcessId};
+use acadctl_rpc::{Drawing, InstanceId};
 
-use crate::instance::{Instance, ProcessSnapshot};
+use crate::instance::{Instance, InstanceSnapshot};
 
-use super::{fail, parse_document_id, query_error_message};
+use super::{parse_drawing_id, query_error_message};
 
 pub async fn run(long: bool) -> ExitCode {
-    let processes = ProcessSnapshot::discover();
-    let instances = processes.query_instances().await;
+    let snapshot = InstanceSnapshot::discover();
+    let instances = snapshot.query_instances().await;
 
-    let lines = match render(&instances, long) {
-        Ok(lines) => lines,
-        Err(error) => return fail(error),
-    };
+    let rendered = render(&instances, long);
 
-    for line in lines {
+    for line in rendered.lines {
         println!("{line}");
     }
 
-    ExitCode::SUCCESS
+    for diagnostic in &rendered.diagnostics {
+        eprintln!("{diagnostic}");
+    }
+
+    if rendered.diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
-fn render(instances: &[Instance], long: bool) -> Result<Vec<String>, String> {
-    let process_id_width = instances
+#[derive(Debug, PartialEq, Eq)]
+struct Rendered {
+    lines: Vec<String>,
+    diagnostics: Vec<String>,
+}
+
+fn render(instances: &[Instance], long: bool) -> Rendered {
+    let instance_id_width = instances
         .iter()
-        .map(|instance| instance.process_id.hex_width())
+        .map(|instance| instance.instance_id.hex_width())
         .max()
-        .unwrap_or(acadctl_rpc::ProcessId::MIN_HEX_WIDTH);
+        .unwrap_or(acadctl_rpc::InstanceId::MIN_HEX_WIDTH);
     let mut lines = Vec::new();
+    let mut diagnostics = Vec::new();
 
     for instance in instances {
-        let documents = instance.documents.as_ref().map_err(query_error_message)?;
+        let drawings = match &instance.drawings {
+            Ok(drawings) => drawings,
+            Err(error) => {
+                diagnostics.push(query_error_message(instance.instance_id, error));
+                continue;
+            }
+        };
 
-        for document in documents {
-            lines.push(document_line(
-                instance.process_id,
-                process_id_width,
-                document,
-                long,
-            )?);
+        for drawing in drawings {
+            match drawing_line(instance.instance_id, instance_id_width, drawing, long) {
+                Ok(line) => lines.push(line),
+                Err(error) => diagnostics.push(format!(
+                    "Could not inspect a drawing in AutoCAD instance {} ({error})",
+                    instance.instance_id
+                )),
+            }
         }
     }
 
-    Ok(lines)
+    Rendered { lines, diagnostics }
 }
 
-fn document_line(
-    process_id: ProcessId,
-    process_id_width: usize,
-    document: &Doc,
+fn drawing_line(
+    instance_id: InstanceId,
+    instance_id_width: usize,
+    drawing: &Drawing,
     long: bool,
 ) -> Result<String, String> {
-    let document_id = parse_document_id(document.id)?;
+    let drawing_id = parse_drawing_id(drawing.id)?;
 
-    let modified = if document.modified { "*" } else { "." };
-    let mode = if document.read_only { "ro" } else { "rw" };
+    let modified = if drawing.modified { "*" } else { "." };
+    let mode = if drawing.read_only { "ro" } else { "rw" };
     let name = if long {
-        document
+        drawing
             .file_path
             .as_deref()
-            .unwrap_or(&document.display_name)
+            .unwrap_or(&drawing.display_name)
     } else {
-        &document.display_name
+        &drawing.display_name
     };
 
     Ok(format!(
-        "{process_id:0process_id_width$X}:{document_id}  {modified}  {mode}  {name}"
+        "{instance_id:0instance_id_width$X}:{drawing_id}  {modified}  {mode}  {name}"
     ))
 }
 
 #[cfg(test)]
 mod tests {
-    use acadctl_rpc::Doc;
+    use acadctl_rpc::Drawing;
 
     use super::*;
     use crate::instance::{Instance, QueryError};
 
     #[test]
-    fn renders_only_actionable_document_state() {
+    fn renders_only_actionable_drawing_state() {
         let instances = vec![available(
             0xFA5,
             vec![
-                document("32F3", "/Users/me/Projects/House/house.dwg", true, false),
-                document("91B2", "/Users/me/Projects/House/house.dwg", false, true),
-                document("A04C", "Drawing1", false, false),
+                drawing("32F3", "/Users/me/Projects/House/house.dwg", true, false),
+                drawing("91B2", "/Users/me/Projects/House/house.dwg", false, true),
+                drawing("A04C", "Drawing1", false, false),
             ],
         )];
 
         assert_eq!(
-            render(&instances, false).unwrap(),
-            [
-                "0FA5:32F3  *  rw  house.dwg",
-                "0FA5:91B2  .  ro  house.dwg",
-                "0FA5:A04C  .  rw  Drawing1",
-            ]
+            render(&instances, false),
+            Rendered {
+                lines: vec![
+                    "0FA5:32F3  *  rw  house.dwg",
+                    "0FA5:91B2  .  ro  house.dwg",
+                    "0FA5:A04C  .  rw  Drawing1",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+                diagnostics: vec![],
+            }
         );
     }
 
@@ -102,7 +127,7 @@ mod tests {
     fn long_listing_uses_full_paths() {
         let instances = vec![available(
             0x1869F,
-            vec![document(
+            vec![drawing(
                 "32F3",
                 "/Users/me/Projects/House/house.dwg",
                 false,
@@ -111,80 +136,106 @@ mod tests {
         )];
 
         assert_eq!(
-            render(&instances, true).unwrap(),
+            render(&instances, true).lines,
             ["1869F:32F3  .  rw  /Users/me/Projects/House/house.dwg"]
         );
     }
 
     #[test]
-    fn aligns_process_ids_to_the_widest_live_value() {
+    fn aligns_instance_ids_to_the_widest_live_value() {
         let instances = vec![
-            available(0xFA5, vec![document("32F3", "/a.dwg", false, false)]),
-            available(0x1869F, vec![document("91B2", "/b.dwg", false, false)]),
+            available(0xFA5, vec![drawing("32F3", "/a.dwg", false, false)]),
+            available(0x1869F, vec![drawing("91B2", "/b.dwg", false, false)]),
         ];
 
         assert_eq!(
-            render(&instances, false).unwrap(),
+            render(&instances, false).lines,
             ["00FA5:32F3  .  rw  a.dwg", "1869F:91B2  .  rw  b.dwg"]
         );
     }
 
     #[test]
     fn an_empty_listing_is_successful() {
-        assert!(render(&[], false).unwrap().is_empty());
-        assert!(render(&[available(123, vec![])], false).unwrap().is_empty());
+        assert!(render(&[], false).lines.is_empty());
+        assert!(render(&[available(123, vec![])], false).lines.is_empty());
     }
 
     #[test]
-    fn explains_each_query_failure() {
+    fn preserves_healthy_drawings_and_explains_each_failed_instance() {
         assert_eq!(
-            render(&[failed(123, QueryError::CannotConnect)], false).unwrap_err(),
-            "Could not connect to the acadctl plugin. Install it and restart AutoCAD."
+            render(&[failed(123, QueryError::CannotConnect)], false).diagnostics,
+            ["Could not connect to AutoCAD instance 007B (plugin unavailable)"]
         );
         assert_eq!(
-            render(&[failed(123, QueryError::TimedOut)], false).unwrap_err(),
-            "AutoCAD did not respond within 5 seconds. Try again when it is idle."
+            render(&[failed(123, QueryError::TimedOut)], false).diagnostics,
+            ["AutoCAD instance 007B did not respond within 5 seconds"]
         );
         assert_eq!(
-            render(&[failed(123, QueryError::OutdatedPlugin)], false).unwrap_err(),
-            "The acadctl plugin is outdated. Install the current version and restart AutoCAD."
+            render(&[failed(123, QueryError::OutdatedPlugin)], false).diagnostics,
+            ["Could not inspect AutoCAD instance 007B (plugin incompatible)"]
         );
         assert_eq!(
             render(
                 &[failed(123, QueryError::RequestFailed(String::new()))],
                 false,
             )
-            .unwrap_err(),
-            "The acadctl plugin could not list documents."
+            .diagnostics,
+            ["Could not inspect AutoCAD instance 007B"]
         );
         assert_eq!(
             render(
                 &[failed(
                     123,
-                    QueryError::RequestFailed("document state is unavailable".into()),
+                    QueryError::RequestFailed(
+                        "failed to decode Protobuf message: Drawing.id: invalid wire type".into(),
+                    ),
                 )],
                 false,
             )
-            .unwrap_err(),
-            "Could not list AutoCAD documents: document state is unavailable"
+            .diagnostics,
+            ["Could not inspect AutoCAD instance 007B (plugin incompatible)"]
+        );
+        assert_eq!(
+            render(
+                &[failed(
+                    123,
+                    QueryError::RequestFailed("drawing state is unavailable".into()),
+                )],
+                false,
+            )
+            .diagnostics,
+            ["Could not inspect AutoCAD instance 007B"]
+        );
+
+        let rendered = render(
+            &[
+                available(123, vec![drawing("32F3", "/a.dwg", false, false)]),
+                failed(456, QueryError::TimedOut),
+            ],
+            false,
+        );
+        assert_eq!(rendered.lines, ["007B:32F3  .  rw  a.dwg"]);
+        assert_eq!(
+            rendered.diagnostics,
+            ["AutoCAD instance 01C8 did not respond within 5 seconds"]
         );
     }
 
-    fn available(process_id: u32, documents: Vec<Doc>) -> Instance {
+    fn available(instance_id: u32, drawings: Vec<Drawing>) -> Instance {
         Instance {
-            process_id: acadctl_rpc::ProcessId::new(process_id).unwrap(),
-            documents: Ok(documents),
+            instance_id: acadctl_rpc::InstanceId::new(instance_id).unwrap(),
+            drawings: Ok(drawings),
         }
     }
 
-    fn failed(process_id: u32, error: QueryError) -> Instance {
+    fn failed(instance_id: u32, error: QueryError) -> Instance {
         Instance {
-            process_id: acadctl_rpc::ProcessId::new(process_id).unwrap(),
-            documents: Err(error),
+            instance_id: acadctl_rpc::InstanceId::new(instance_id).unwrap(),
+            drawings: Err(error),
         }
     }
 
-    fn document(id: &str, path: &str, modified: bool, read_only: bool) -> Doc {
+    fn drawing(id: &str, path: &str, modified: bool, read_only: bool) -> Drawing {
         let file_path = path.contains('/').then(|| path.to_owned());
         let display_name = file_path
             .as_deref()
@@ -192,8 +243,8 @@ mod tests {
             .and_then(|name| name.to_str())
             .unwrap_or(path)
             .to_owned();
-        Doc {
-            id: u32::from(id.parse::<acadctl_rpc::DocId>().unwrap()),
+        Drawing {
+            id: u32::from(id.parse::<acadctl_rpc::DrawingId>().unwrap()),
             display_name,
             file_path,
             modified,

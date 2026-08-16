@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use acadctl_rpc::{DocId, DrawingPath};
+use acadctl_rpc::{DrawingId, DrawingPath};
 use tokio::sync::oneshot;
 
-use crate::doc::{Doc, DocRegistry, NativeDocKey};
+use crate::drawing::{Drawing, DrawingRegistry, NativeDocumentKey};
 use crate::exec::output::{OutputSink, OutputStream};
 use crate::exec::{
     Exec, ExecOutcome, ExecStepResult, NativeExecStep, ValueOutputLease, bound_diagnostic,
@@ -36,7 +36,7 @@ pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(super) struct MutationScheduler {
-    documents: DocRegistry,
+    drawings: DrawingRegistry,
     pending: VecDeque<MutationJob>,
     active: Option<MutationJob>,
     wake_pending: bool,
@@ -47,7 +47,7 @@ pub(super) struct MutationScheduler {
 struct MutationJob {
     job_id: MutationJobId,
     operation: Operation,
-    native_target: Option<NativeDocKey>,
+    native_target: Option<NativeDocumentKey>,
     start_deadline: Option<Instant>,
     waiting_for_readiness: bool,
     retry_at: Option<Instant>,
@@ -131,7 +131,7 @@ pub enum CancelResult {
 impl MutationScheduler {
     const fn new() -> Self {
         Self {
-            documents: DocRegistry::new(),
+            drawings: DrawingRegistry::new(),
             pending: VecDeque::new(),
             active: None,
             wake_pending: false,
@@ -144,12 +144,12 @@ impl MutationScheduler {
         self.active.is_none() && self.pending.is_empty() && !self.wake_pending
     }
 
-    fn list(&self) -> Vec<Doc> {
-        self.documents.list()
+    fn list(&self) -> Vec<Drawing> {
+        self.drawings.list()
     }
 
-    fn replace_document_snapshot(&mut self, documents: Vec<crate::ffi::NativeDocSnapshot>) {
-        self.documents.replace_snapshot(documents);
+    fn replace_drawing_snapshot(&mut self, drawings: Vec<crate::ffi::NativeDocumentSnapshot>) {
+        self.drawings.replace_snapshot(drawings);
     }
 
     fn start(&mut self) {
@@ -204,7 +204,7 @@ impl MutationScheduler {
     pub(super) fn acquire_eval_value_output(
         &self,
         job_id: MutationJobId,
-        target: NativeDocKey,
+        target: NativeDocumentKey,
     ) -> Option<ValueOutputLease> {
         self.active
             .as_ref()
@@ -270,7 +270,7 @@ impl MutationScheduler {
 
             if job.expire_if_due(now) {
                 let output = job.operation.output_sink();
-                let outcome = job.operation.complete(&self.documents, None);
+                let outcome = job.operation.complete(&self.drawings, None);
 
                 expired.push((job.completion, outcome, output));
             } else {
@@ -322,7 +322,7 @@ impl MutationScheduler {
 
     fn admit_execution(
         &mut self,
-        id: DocId,
+        id: DrawingId,
         execution: Exec,
         reservation: ExecReservation,
         now: Instant,
@@ -344,7 +344,7 @@ impl MutationScheduler {
                 execution: Box::new(execution),
             };
 
-            let outcome = match operation.prepare(&self.documents) {
+            let outcome = match operation.prepare(&self.drawings) {
                 Prepared::Immediate(outcome) => outcome,
                 Prepared::Native(_) => Err(Error::ExecNotFinished),
             };
@@ -401,7 +401,7 @@ impl MutationScheduler {
         }
 
         if self.idle()
-            && let Prepared::Immediate(outcome) = operation.prepare(&self.documents)
+            && let Prepared::Immediate(outcome) = operation.prepare(&self.drawings)
         {
             return Ok(SubmissionDecision::Immediate(outcome));
         }
@@ -446,7 +446,7 @@ impl MutationScheduler {
 
         job.expire_if_due(now);
 
-        match job.operation.prepare(&self.documents) {
+        match job.operation.prepare(&self.drawings) {
             Prepared::Immediate(outcome) => {
                 TakeDecision::Complete((job.completion, outcome, job.operation.output_sink()))
             }
@@ -496,10 +496,10 @@ impl MutationScheduler {
         let output = job.operation.output_sink();
         let native_target = job.native_target;
         let outcome = if settled_before_start {
-            job.operation.complete(&self.documents, native_target)
+            job.operation.complete(&self.drawings, native_target)
         } else {
             job.operation
-                .complete_native(result, &self.documents, native_target)
+                .complete_native(result, &self.drawings, native_target)
         };
 
         let rejected = if quarantine {
@@ -553,44 +553,44 @@ impl MutationScheduler {
     }
 }
 
-pub async fn open(path: DrawingPath) -> Result<Doc, Error> {
+pub async fn open(path: DrawingPath) -> Result<Drawing, Error> {
     match submit_operation(Operation::Open { path }).await? {
-        OperationOutcome::Doc(document) => Ok(document),
+        OperationOutcome::Drawing(drawing) => Ok(drawing),
         OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::OpenNotPublished),
     }
 }
 
-pub async fn save(id: DocId) -> Result<Doc, Error> {
+pub async fn save(id: DrawingId) -> Result<Drawing, Error> {
     match submit_operation(Operation::Save { id }).await? {
-        OperationOutcome::Doc(document) => Ok(document),
+        OperationOutcome::Drawing(drawing) => Ok(drawing),
         OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::SaveNotPublished),
     }
 }
 
-pub async fn close(id: DocId, discard: bool) -> Result<(), Error> {
+pub async fn close(id: DrawingId, discard: bool) -> Result<(), Error> {
     match submit_operation(Operation::Close { id, discard }).await? {
         OperationOutcome::Closed => Ok(()),
-        OperationOutcome::Doc(_) | OperationOutcome::Exec(_) => Err(Error::CloseNotPublished),
+        OperationOutcome::Drawing(_) | OperationOutcome::Exec(_) => Err(Error::CloseNotPublished),
     }
 }
 
-pub async fn undo(id: DocId) -> Result<Doc, Error> {
+pub async fn undo(id: DrawingId) -> Result<Drawing, Error> {
     history(id, HistoryDirection::Undo).await
 }
 
-pub async fn redo(id: DocId) -> Result<Doc, Error> {
+pub async fn redo(id: DrawingId) -> Result<Drawing, Error> {
     history(id, HistoryDirection::Redo).await
 }
 
-async fn history(id: DocId, direction: HistoryDirection) -> Result<Doc, Error> {
+async fn history(id: DrawingId, direction: HistoryDirection) -> Result<Drawing, Error> {
     match submit_operation(Operation::History { id, direction }).await? {
-        OperationOutcome::Doc(document) => Ok(document),
-        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::DocGone),
+        OperationOutcome::Drawing(drawing) => Ok(drawing),
+        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::DrawingGone),
     }
 }
 
 pub fn admit_execution(
-    id: DocId,
+    id: DrawingId,
     execution: Exec,
     output: OutputStream,
     reservation: ExecReservation,
@@ -638,21 +638,21 @@ impl ExecCompletion {
     pub async fn wait(self) -> Result<ExecOutcome, Error> {
         match self.receiver.await.map_err(|_| Error::Stopped)?? {
             OperationOutcome::Exec(outcome) => Ok(outcome),
-            OperationOutcome::Doc(_) | OperationOutcome::Closed => Err(Error::ExecNotFinished),
+            OperationOutcome::Drawing(_) | OperationOutcome::Closed => Err(Error::ExecNotFinished),
         }
     }
 }
 
-pub fn list() -> Result<Vec<Doc>, Error> {
+pub fn list() -> Result<Vec<Drawing>, Error> {
     SCHEDULER
         .lock()
         .map_err(|_| Error::SchedulerStateUnavailable)
         .map(|scheduler| scheduler.list())
 }
 
-pub fn replace_document_snapshot(documents: Vec<crate::ffi::NativeDocSnapshot>) {
+pub fn replace_drawing_snapshot(drawings: Vec<crate::ffi::NativeDocumentSnapshot>) {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
-        scheduler.replace_document_snapshot(documents);
+        scheduler.replace_drawing_snapshot(drawings);
     }
 }
 

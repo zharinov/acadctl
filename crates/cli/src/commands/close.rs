@@ -5,16 +5,20 @@ use acadctl_rpc::CloseRequest;
 use super::{fail, request_error_message, target::Target};
 
 pub async fn run(target: Target, discard: bool) -> ExitCode {
-    let mut client = match super::connect_documents(target.process_id).await {
+    let mut client = match super::connect_drawings(target.instance_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
 
     if let Err(status) = client
-        .close(CloseRequest::new(target.document_id, discard))
+        .close(CloseRequest::new(target.drawing_id, discard))
         .await
     {
-        return fail(request_error_message("close the document", status));
+        return fail(request_error_message(
+            &format!("close drawing {target}"),
+            Some(target),
+            status,
+        ));
     }
 
     ExitCode::SUCCESS

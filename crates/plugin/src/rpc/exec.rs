@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use acadctl_rpc::{
-    DocId, DrawingOutcome as RpcDrawingOutcome, ExecAccepted, ExecCancelAcknowledgement,
+    DrawingId, DrawingOutcome as RpcDrawingOutcome, ExecAccepted, ExecCancelAcknowledgement,
     ExecCancelDisposition, ExecCancelled, ExecClientMessage, ExecFailure as RpcExecFailure,
     ExecFinished, ExecMode as RpcExecMode, ExecOutcome as RpcExecOutcome, ExecOutput, ExecRequest,
     ExecServerEvent, ExecService, ExecSuccess, SourceLocation as RpcSourceLocation, SourceName,
@@ -75,7 +75,7 @@ impl ExecService for ExecRpc {
         };
 
         let ValidatedExecRequest {
-            document_id,
+            drawing_id,
             mode,
             source_name,
             source,
@@ -99,7 +99,7 @@ impl ExecService for ExecRpc {
         };
 
         let admission = match crate::scheduler::admit_execution(
-            document_id,
+            drawing_id,
             execution,
             output,
             reservation.clone(),
@@ -314,7 +314,7 @@ pub(super) fn terminal_response(
 }
 
 struct ValidatedExecRequest {
-    document_id: DocId,
+    drawing_id: DrawingId,
     mode: ExecMode,
     source_name: SourceName,
     source: bytes::Bytes,
@@ -324,8 +324,8 @@ impl TryFrom<ExecRequest> for ValidatedExecRequest {
     type Error = ExecFailure;
 
     fn try_from(request: ExecRequest) -> Result<Self, Self::Error> {
-        let document_id = DocId::try_from(request.document_id)
-            .map_err(|_| failure("The document ID is invalid"))?;
+        let drawing_id = DrawingId::try_from(request.drawing_id)
+            .map_err(|_| failure("The drawing ID is invalid"))?;
 
         let source_name = SourceName::new(request.source_name).map_err(|error| match error {
             SourceNameError::Empty => failure("The source name is required"),
@@ -341,7 +341,7 @@ impl TryFrom<ExecRequest> for ValidatedExecRequest {
         };
 
         Ok(Self {
-            document_id,
+            drawing_id,
             mode,
             source_name,
             source: request.source,
@@ -367,6 +367,7 @@ fn validation_failure(error: SourceValidationError, source_name: SourceName) -> 
                 &error,
             )),
             drawing_outcome: DrawingOutcome::NotStarted,
+            drawing_error: None,
         },
     }
 }
@@ -377,12 +378,14 @@ fn failure(message: impl Into<String>) -> ExecFailure {
 
 fn scheduler_failure(error: SchedulerError) -> ExecFailure {
     let drawing_outcome = error.drawing_outcome();
+    let drawing_error = error.drawing_error_kind();
 
     ExecFailure {
         message: bounded_diagnostic(error.to_string()),
         form_index: None,
         location: None,
         drawing_outcome,
+        drawing_error,
     }
 }
 
@@ -417,9 +420,34 @@ fn rpc_failure(failure: ExecFailure) -> RpcExecFailure {
             column: location.column as u64,
         }),
         drawing_outcome: drawing_outcome as i32,
+        drawing_error: failure
+            .drawing_error
+            .unwrap_or(acadctl_rpc::DrawingErrorKind::Unspecified) as i32,
     }
 }
 
 fn server_event(event: exec_server_event::Event) -> ExecServerEvent {
     ExecServerEvent { event: Some(event) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_failures_keep_their_typed_drawing_error() {
+        let failure = scheduler_failure(SchedulerError::DrawingNotFound(
+            DrawingId::new(0x36C8).unwrap(),
+        ));
+        let failure = rpc_failure(failure);
+
+        assert_eq!(
+            failure.drawing_error,
+            acadctl_rpc::DrawingErrorKind::NotOpen as i32
+        );
+        assert_eq!(
+            failure.drawing_outcome,
+            RpcDrawingOutcome::NotStarted as i32
+        );
+    }
 }

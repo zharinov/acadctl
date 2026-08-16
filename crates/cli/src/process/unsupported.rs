@@ -1,9 +1,9 @@
-use acadctl_rpc::ProcessId;
+use acadctl_rpc::InstanceId;
 
-pub struct AutoCadProcess;
+pub struct AutoCadInstance;
 
-impl AutoCadProcess {
-    pub fn process_id(&self) -> ProcessId {
+impl AutoCadInstance {
+    pub fn instance_id(&self) -> InstanceId {
         unreachable!("AutoCAD process discovery is unsupported on this platform")
     }
 
@@ -16,6 +16,6 @@ impl AutoCadProcess {
     }
 }
 
-pub(super) fn discover() -> Vec<AutoCadProcess> {
+pub(super) fn discover() -> Vec<AutoCadInstance> {
     Vec::new()
 }
