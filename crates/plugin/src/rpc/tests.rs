@@ -79,12 +79,29 @@ fn reports_drawings_and_stops_promptly() {
             .unwrap();
         assert_eq!(opened.id, listed.drawings[0].id);
 
-        let saved = client
-            .save(SaveRequest {
-                drawing_id: opened.id,
-                path: None,
-            })
+        let mut save_client = client.clone();
+        let save_id = opened.id;
+        let save_response = tokio::spawn(async move {
+            save_client
+                .save(SaveRequest {
+                    drawing_id: save_id,
+                    path: None,
+                })
+                .await
+        });
+        let save_action = next_native_action().await;
+        assert_eq!(save_action.kind(), crate::ffi::NativeActionKind::Save);
+        crate::scheduler::complete_native_action(
+            save_action.job_id(),
+            crate::ffi::NativeActionResult {
+                kind: crate::ffi::NativeActionResultKind::Success,
+                native_status: 0,
+                native_detail: String::new(),
+            },
+        );
+        let saved = save_response
             .await
+            .unwrap()
             .unwrap()
             .into_inner()
             .drawing

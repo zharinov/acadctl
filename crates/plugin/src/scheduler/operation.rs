@@ -111,10 +111,6 @@ impl Operation {
             }
         }
 
-        if path.is_none() && !target.drawing.modified {
-            return Prepared::Immediate(Ok(OperationOutcome::Drawing(target.drawing)));
-        }
-
         Prepared::Native(NativeCommand::save(target.native_key, path.cloned()))
     }
 

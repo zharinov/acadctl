@@ -169,6 +169,22 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
 }
 
 #[tokio::test]
+async fn save_with_a_clean_cached_snapshot_still_reaches_native_code() {
+    let _test = TEST_LOCK.lock().await;
+    reset(vec![drawing(1, 101, false)]);
+    let id = list().unwrap()[0].id;
+
+    let saving = tokio::spawn(save(id, None));
+    tokio::task::yield_now().await;
+    let action = take_native_action();
+    assert_eq!(action.kind(), NativeActionKind::Save);
+
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
+    assert!(saving.await.unwrap().is_ok());
+    stop();
+}
+
+#[tokio::test]
 async fn save_to_a_new_path_requires_the_published_path_and_clean_state() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, false)]);
