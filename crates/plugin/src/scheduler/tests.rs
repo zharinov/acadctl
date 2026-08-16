@@ -1,7 +1,12 @@
-use super::super::operation::interpret;
+use super::super::bridge::{begin_eval_value, complete_execution_step, take_execution_step};
+use super::super::native::{classify_execution_finalization, interpret};
+use super::super::timer::{BUSY_RETRY_MAX, EXECUTION_START_TIMEOUT, process_due_timers};
 use super::*;
-use crate::exec::ExecMode;
 use crate::exec::value::writer::{ValueEvent, WriteResult};
+use crate::exec::{ExecMode, ExecStepResult};
+use crate::ffi::{
+    NativeActionKind, NativeExecFinalizationObservation as ExecFinalizationObservation,
+};
 
 fn source_name(value: &str) -> acadctl_rpc::SourceName {
     acadctl_rpc::SourceName::new(value).unwrap()
@@ -130,23 +135,29 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
     let first = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
-    assert_eq!(save_action.kind, NativeActionKind::Save);
+    assert_eq!(save_action.kind(), NativeActionKind::Save);
 
     first.abort();
     assert!(first.await.unwrap_err().is_cancelled());
 
     let second = tokio::spawn(close(id, true));
     tokio::task::yield_now().await;
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
     replace_document_snapshot(vec![document(1, 101, false)]);
-    complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        save_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(try_claim_native_action_wake());
 
     let close_action = take_native_action();
-    assert_eq!(close_action.kind, NativeActionKind::Close);
+    assert_eq!(close_action.kind(), NativeActionKind::Close);
     replace_document_snapshot(Vec::new());
-    complete_native_action(close_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        close_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(second.await.unwrap().is_ok());
     stop();
 }
@@ -160,24 +171,30 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
     let undo_waiter = tokio::spawn(undo(id));
     tokio::task::yield_now().await;
     let undo_action = take_native_action();
-    assert_eq!(undo_action.kind, NativeActionKind::Undo);
-    assert_eq!(undo_action.document_token, 1);
-    assert_eq!(undo_action.database_token, 101);
+    assert_eq!(undo_action.kind(), NativeActionKind::Undo);
+    assert_eq!(undo_action.document_token(), 1);
+    assert_eq!(undo_action.database_token(), 101);
 
     let redo_waiter = tokio::spawn(redo(id));
     tokio::task::yield_now().await;
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
     replace_document_snapshot(vec![document(1, 101, true)]);
-    complete_native_action(undo_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        undo_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(undo_waiter.await.unwrap().unwrap().modified);
 
     let redo_action = take_native_action();
-    assert_eq!(redo_action.kind, NativeActionKind::Redo);
-    assert_eq!(redo_action.document_token, 1);
-    assert_eq!(redo_action.database_token, 101);
+    assert_eq!(redo_action.kind(), NativeActionKind::Redo);
+    assert_eq!(redo_action.document_token(), 1);
+    assert_eq!(redo_action.database_token(), 101);
     replace_document_snapshot(vec![document(1, 101, false)]);
-    complete_native_action(redo_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        redo_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(!redo_waiter.await.unwrap().unwrap().modified);
     stop();
 }
@@ -196,9 +213,9 @@ async fn drawing_history_fails_closed_on_missing_or_replaced_documents() {
     let waiter = tokio::spawn(redo(id));
     tokio::task::yield_now().await;
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::Redo);
+    assert_eq!(action.kind(), NativeActionKind::Redo);
     replace_document_snapshot(vec![document(1, 201, false)]);
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
     assert_eq!(waiter.await.unwrap(), Err(Error::DocGenerationChanged));
     stop();
 }
@@ -219,7 +236,7 @@ async fn wake_failure_completes_every_job_waiting_on_that_wake() {
         assert_eq!(job.await.unwrap(), Err(Error::ScheduleFailed(42)));
     }
 
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
 
@@ -232,17 +249,20 @@ async fn shutdown_rejects_pending_work_but_preserves_the_active_operation() {
     let active = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
-    assert_eq!(save_action.kind, NativeActionKind::Save);
+    assert_eq!(save_action.kind(), NativeActionKind::Save);
 
     let pending = tokio::spawn(close(id, true));
     tokio::task::yield_now().await;
     stop();
 
     assert_eq!(pending.await.unwrap(), Err(Error::PluginStopping));
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
     replace_document_snapshot(vec![document(1, 101, false)]);
-    complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        save_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(active.await.unwrap().is_ok());
 }
 
@@ -258,40 +278,40 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
 
     let action = take_native_action();
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
-    let form = take_execution_step(action.job_id);
+    assert!(complete_execution_step(action.job_id(), step_success()));
+    let form = take_execution_step(action.job_id());
     assert_eq!(form.kind(), crate::exec::ExecStepKind::EvaluateForm);
     assert!(form.retain_value());
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::CommitUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EmitEvalValue
     );
 
-    assert!(!begin_eval_value(action.job_id + 1, 1, 101).active());
-    assert!(!begin_eval_value(action.job_id, 2, 101).active());
-    assert!(!begin_eval_value(action.job_id, 1, 202).active());
-    let mut writer = begin_eval_value(action.job_id, 1, 101);
+    assert!(!begin_eval_value(action.job_id() + 1, 1, 101).active());
+    assert!(!begin_eval_value(action.job_id(), 2, 101).active());
+    assert!(!begin_eval_value(action.job_id(), 1, 202).active());
+    let mut writer = begin_eval_value(action.job_id(), 1, 101);
     assert!(writer.active());
-    assert!(!begin_eval_value(action.job_id, 1, 101).active());
+    assert!(!begin_eval_value(action.job_id(), 1, 101).active());
     assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
     assert_eq!(writer.finish(), WriteResult::Continue);
-    assert!(!begin_eval_value(action.job_id, 1, 101).active());
+    assert!(!begin_eval_value(action.job_id(), 1, 101).active());
 
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
 
     assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Success);
     let mut rendered = String::new();
@@ -313,7 +333,7 @@ async fn queued_cancellation_removes_only_that_execution() {
     let active = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
-    assert_eq!(save_action.kind, NativeActionKind::Save);
+    assert_eq!(save_action.kind(), NativeActionKind::Save);
 
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -332,7 +352,10 @@ async fn queued_cancellation_removes_only_that_execution() {
     assert_eq!(output.next_chunk().await, None);
 
     replace_document_snapshot(vec![document(1, 101, false)]);
-    complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        save_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(active.await.unwrap().is_ok());
     assert!(!try_claim_native_action_wake());
     stop();
@@ -347,7 +370,7 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
     let active = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
-    assert_eq!(save_action.kind, NativeActionKind::Save);
+    assert_eq!(save_action.kind(), NativeActionKind::Save);
 
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -372,7 +395,10 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
     assert_eq!(output.next_chunk().await, None);
 
     replace_document_snapshot(vec![document(1, 101, false)]);
-    complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        save_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(active.await.unwrap().is_ok());
     assert!(!try_claim_native_action_wake());
     stop();
@@ -392,7 +418,7 @@ async fn wake_failure_stops_a_pending_execution_output_stream() {
 
     assert_eq!(pending.await.unwrap(), Err(Error::ScheduleFailed(42)));
     assert_eq!(output.next_chunk().await, None);
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
 
@@ -407,32 +433,32 @@ async fn active_cancellation_rolls_back_after_the_current_form() {
     tokio::task::yield_now().await;
 
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(action.kind(), NativeActionKind::QueueExecDriver);
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EvaluateForm
     );
 
-    assert_eq!(cancel_execution(action.job_id), CancelResult::Accepted);
-    assert_eq!(cancel_execution(action.job_id), CancelResult::Accepted);
+    assert_eq!(cancel_execution(action.job_id()), CancelResult::Accepted);
+    assert_eq!(cancel_execution(action.job_id()), CancelResult::Accepted);
     assert_eq!(output.next_chunk().await, None);
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::RollbackUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
 
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
     assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Cancelled);
     stop();
 }
@@ -449,23 +475,23 @@ async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group()
 
     let action = take_native_action();
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
-    assert_eq!(cancel_execution(action.job_id), CancelResult::Accepted);
+    assert!(complete_execution_step(action.job_id(), step_success()));
+    assert_eq!(cancel_execution(action.job_id()), CancelResult::Accepted);
     assert_eq!(output.next_chunk().await, None);
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::CloseEmptyUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
 
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
     assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Cancelled);
     stop();
 }
@@ -482,27 +508,27 @@ async fn cancellation_after_commit_handoff_does_not_cancel_output() {
 
     let action = take_native_action();
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EvaluateForm
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::CommitUndoGroup
     );
 
-    assert_eq!(cancel_execution(action.job_id), CancelResult::TooLate);
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert_eq!(cancel_execution(action.job_id()), CancelResult::TooLate);
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
 
     assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Success);
     assert_eq!(output.next_chunk().await, None);
@@ -521,28 +547,28 @@ async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
 
     let action = take_native_action();
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EvaluateForm
     );
 
     stop();
     assert_eq!(output.next_chunk().await, None);
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::RollbackUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
     assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Cancelled);
 }
 
@@ -557,13 +583,13 @@ async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
     tokio::task::yield_now().await;
 
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(action.kind(), NativeActionKind::QueueExecDriver);
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
-    let form = take_execution_step(action.job_id);
+    assert!(complete_execution_step(action.job_id(), step_success()));
+    let form = take_execution_step(action.job_id());
     assert_eq!(form.source(), "form");
 
     executing.abort();
@@ -575,26 +601,29 @@ async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
     );
     let later = tokio::spawn(close(id, true));
     tokio::task::yield_now().await;
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::CommitUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
-    complete_native_action(action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
     assert_eq!(output.next_chunk().await, None);
 
     assert!(try_claim_native_action_wake());
     let close_action = take_native_action();
-    assert_eq!(close_action.kind, NativeActionKind::Close);
+    assert_eq!(close_action.kind(), NativeActionKind::Close);
     replace_document_snapshot(Vec::new());
-    complete_native_action(close_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        close_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(later.await.unwrap().is_ok());
     stop();
 }
@@ -610,24 +639,24 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
     tokio::task::yield_now().await;
 
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(action.kind(), NativeActionKind::QueueExecDriver);
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EvaluateForm
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::CommitUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
 
@@ -635,7 +664,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
     tokio::task::yield_now().await;
 
     complete_native_action(
-        action.job_id,
+        action.job_id(),
         NativeActionResult {
             kind: NativeActionResultKind::DocContextRestoreFailed,
             native_status: 42,
@@ -657,7 +686,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
         Err(Error::NativeMutationStateUnknown)
     );
     assert_eq!(save(id).await, Err(Error::NativeMutationStateUnknown));
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
 
@@ -696,32 +725,32 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
     tokio::task::yield_now().await;
 
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(action.kind(), NativeActionKind::QueueExecDriver);
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EvaluateForm
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::CommitUndoGroup
     );
-    assert!(complete_execution_step(action.job_id, step_success()));
+    assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::EmitEvalValue
     );
 
-    let mut writer = begin_eval_value(action.job_id, 1, 101);
+    let mut writer = begin_eval_value(action.job_id(), 1, 101);
     assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
     assert_eq!(writer.finish(), WriteResult::Continue);
     assert!(complete_execution_step(
-        action.job_id,
+        action.job_id(),
         ExecStepResult {
             kind: crate::exec::ExecStepResultKind::NativeError,
             native_status: 42,
@@ -731,14 +760,14 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
         }
     ));
     assert_eq!(
-        take_execution_step(action.job_id).kind(),
+        take_execution_step(action.job_id()).kind(),
         crate::exec::ExecStepKind::Done
     );
 
     let blocked = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     complete_execution_native_action(
-        action.job_id,
+        action.job_id(),
         NativeActionResult {
             kind: NativeActionResultKind::ExecBridgeSymbolsClearFailed,
             native_status: 42,
@@ -769,7 +798,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
         Err(Error::NativeMutationStateUnknown)
     );
     assert_eq!(save(id).await, Err(Error::NativeMutationStateUnknown));
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
 
@@ -781,7 +810,7 @@ async fn queued_execution_expires_without_starting_a_form() {
     let saving = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
-    assert_eq!(save_action.kind, NativeActionKind::Save);
+    assert_eq!(save_action.kind(), NativeActionKind::Save);
 
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
@@ -809,10 +838,13 @@ async fn queued_execution_expires_without_starting_a_form() {
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
         })
     );
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
     replace_document_snapshot(vec![document(1, 101, false)]);
-    complete_native_action(save_action.job_id, result(NativeActionResultKind::Success));
+    complete_native_action(
+        save_action.job_id(),
+        result(NativeActionResultKind::Success),
+    );
     assert!(saving.await.unwrap().is_ok());
     stop();
 }
@@ -828,14 +860,14 @@ async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
     let (job_id, _output, completion) = admission.into_parts();
 
     let first = take_native_action();
-    assert_eq!(first.kind, NativeActionKind::QueueExecDriver);
-    complete_native_action(first.job_id, result(NativeActionResultKind::NotQuiescent));
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(first.kind(), NativeActionKind::QueueExecDriver);
+    complete_native_action(first.job_id(), result(NativeActionResultKind::NotQuiescent));
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
     process_due_timers(Instant::now() + BUSY_RETRY_MAX);
     let retried = take_native_action();
-    assert_eq!(retried.kind, NativeActionKind::QueueExecDriver);
-    assert_eq!(retried.job_id, job_id);
+    assert_eq!(retried.kind(), NativeActionKind::QueueExecDriver);
+    assert_eq!(retried.job_id(), job_id);
     assert_eq!(cancel_execution(job_id), CancelResult::Accepted);
     assert_eq!(
         take_execution_step(job_id).kind(),
@@ -856,7 +888,7 @@ async fn deadline_wins_while_the_busy_probe_is_in_flight() {
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(action.kind(), NativeActionKind::QueueExecDriver);
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
         scheduler.active.as_mut().unwrap().start_deadline =
@@ -873,7 +905,7 @@ async fn deadline_wins_while_the_busy_probe_is_in_flight() {
             ..
         })
     ));
-    assert_eq!(take_native_action().kind, NativeActionKind::None);
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
 
@@ -886,7 +918,10 @@ async fn deadline_winner_survives_a_native_preflight_failure() {
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
-    assert_eq!(take_native_action().kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(
+        take_native_action().kind(),
+        NativeActionKind::QueueExecDriver
+    );
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
         scheduler.active.as_mut().unwrap().start_deadline =
@@ -917,7 +952,10 @@ async fn deadline_winner_survives_a_failing_begin_step() {
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (job_id, _output, completion) = admission.into_parts();
-    assert_eq!(take_native_action().kind, NativeActionKind::QueueExecDriver);
+    assert_eq!(
+        take_native_action().kind(),
+        NativeActionKind::QueueExecDriver
+    );
     assert_eq!(
         take_execution_step(job_id).kind(),
         crate::exec::ExecStepKind::BeginUndoGroup
@@ -1074,7 +1112,7 @@ async fn mutation_job_capacity_bounds_disconnected_waiters() {
     let active = tokio::spawn(save(id));
     tokio::task::yield_now().await;
     let action = take_native_action();
-    assert_eq!(action.kind, NativeActionKind::Save);
+    assert_eq!(action.kind(), NativeActionKind::Save);
 
     let mut queued = Vec::new();
 
@@ -1086,7 +1124,7 @@ async fn mutation_job_capacity_bounds_disconnected_waiters() {
     assert_eq!(save(id).await, Err(Error::MutationCapacity));
 
     stop();
-    complete_native_action(action.job_id, result(NativeActionResultKind::SaveFailed));
+    complete_native_action(action.job_id(), result(NativeActionResultKind::SaveFailed));
     assert!(matches!(active.await.unwrap(), Err(Error::SaveFailed(_))));
 
     for waiter in queued {

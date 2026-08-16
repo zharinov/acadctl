@@ -4,79 +4,56 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use acadctl_rpc::{DocId, DrawingPath};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
 
 use crate::doc::{Doc, DocRegistry, NativeDocKey};
 use crate::exec::output::{OutputSink, OutputStream};
-use crate::exec::value::writer::NativeValueWriter;
-use crate::exec::{Exec, ExecOutcome, ExecStepResult, NativeExecStep, bound_diagnostic};
-use crate::ffi::{
-    NativeAction, NativeActionKind, NativeActionResult, NativeActionResultKind,
-    NativeExecFinalizationObservation,
-};
+use crate::exec::{Exec, ExecOutcome, bound_diagnostic};
+use crate::ffi::{NativeActionResult, NativeActionResultKind, NativeExecFinalizationObservation};
 
 use super::error::Error;
-use super::operation::{
-    HistoryDirection, Operation, OperationOutcome, Prepared, complete_operation, finalize, prepare,
+use super::native::{
+    NativeAction, classify_execution_finalization, complete_operation,
+    native_result_requires_quarantine, schedule_native_actions,
 };
-
-#[cfg(test)]
-type ExecFinalizationObservation = NativeExecFinalizationObservation;
+use super::operation::{
+    HistoryDirection, Operation, OperationOutcome, Prepared, finalize, prepare,
+};
+use super::timer::{BUSY_RETRY_INITIAL, BUSY_RETRY_MAX, EXECUTION_START_TIMEOUT, notify_changed};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
-static SCHEDULER: LazyLock<Mutex<MutationScheduler>> =
+pub(super) static SCHEDULER: LazyLock<Mutex<MutationScheduler>> =
     LazyLock::new(|| Mutex::new(MutationScheduler::new()));
-static TIMERS_CHANGED: Notify = Notify::const_new();
 
 pub(crate) type MutationJobId = u64;
 
-pub const EXECUTION_START_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_MUTATION_JOBS: usize = 32;
 pub const MAX_ADMITTED_EXECUTIONS: usize = 8;
 pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(50);
-const BUSY_RETRY_MAX: Duration = Duration::from_millis(500);
-
-impl NativeExecFinalizationObservation {
-    fn native_state_unproved(&self) -> bool {
-        self.undo_group_may_be_open
-            || self.bridge_symbols_may_be_retained
-            || self.staged_form_may_be_retained
-            || self.value_writer_active
-            || self.terminal_cleanup_failed
-    }
-
-    fn only_symbol_cleanup_unproved(&self) -> bool {
-        (self.bridge_symbols_may_be_retained || self.terminal_cleanup_failed)
-            && !self.undo_group_may_be_open
-            && !self.staged_form_may_be_retained
-            && !self.value_writer_active
-    }
-}
 
 #[cfg(test)]
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-struct MutationScheduler {
-    documents: DocRegistry,
-    pending: VecDeque<MutationJob>,
-    active: Option<MutationJob>,
-    wake_pending: bool,
-    stopping: bool,
-    quarantined: bool,
+pub(super) struct MutationScheduler {
+    pub(super) documents: DocRegistry,
+    pub(super) pending: VecDeque<MutationJob>,
+    pub(super) active: Option<MutationJob>,
+    pub(super) wake_pending: bool,
+    pub(super) stopping: bool,
+    pub(super) quarantined: bool,
 }
 
-struct MutationJob {
-    job_id: MutationJobId,
-    operation: Operation,
-    native_target: Option<NativeDocKey>,
-    start_deadline: Option<Instant>,
-    waiting_for_readiness: bool,
-    retry_at: Option<Instant>,
-    retry_delay: Duration,
-    _execution_reservation: Option<ExecReservation>,
-    completion: oneshot::Sender<Result<OperationOutcome, Error>>,
+pub(super) struct MutationJob {
+    pub(super) job_id: MutationJobId,
+    pub(super) operation: Operation,
+    pub(super) native_target: Option<NativeDocKey>,
+    pub(super) start_deadline: Option<Instant>,
+    pub(super) waiting_for_readiness: bool,
+    pub(super) retry_at: Option<Instant>,
+    pub(super) retry_delay: Duration,
+    pub(super) _execution_reservation: Option<ExecReservation>,
+    pub(super) completion: oneshot::Sender<Result<OperationOutcome, Error>>,
 }
 
 #[derive(Clone)]
@@ -156,7 +133,7 @@ impl MutationScheduler {
         self.pending.len() + usize::from(self.active.is_some())
     }
 
-    fn request_wake(&mut self) -> bool {
+    pub(super) fn request_wake(&mut self) -> bool {
         if self.stopping
             || self.quarantined
             || self.active.is_some()
@@ -291,7 +268,7 @@ pub fn admit_execution(
         schedule_native_actions();
     }
 
-    TIMERS_CHANGED.notify_one();
+    notify_changed();
 
     Ok(ExecAdmission {
         job_id,
@@ -378,7 +355,7 @@ pub fn stop() {
         }
     }
 
-    TIMERS_CHANGED.notify_one();
+    notify_changed();
 }
 
 async fn submit_operation(operation: Operation) -> Result<OperationOutcome, Error> {
@@ -432,23 +409,23 @@ async fn submit_operation(operation: Operation) -> Result<OperationOutcome, Erro
 pub fn take_native_action() -> NativeAction {
     let decision = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
-            return empty_action();
+            return NativeAction::idle();
         };
 
         scheduler.wake_pending = false;
 
         if scheduler.stopping || scheduler.quarantined || scheduler.active.is_some() {
-            return empty_action();
+            return NativeAction::idle();
         }
 
         let Some(mut job) = scheduler.pending.pop_front() else {
-            return empty_action();
+            return NativeAction::idle();
         };
 
         if job.waiting_for_readiness {
             scheduler.pending.push_front(job);
 
-            return empty_action();
+            return NativeAction::idle();
         }
 
         job.expire_if_due(Instant::now());
@@ -457,9 +434,9 @@ pub fn take_native_action() -> NativeAction {
             Prepared::Immediate(outcome) => {
                 TakeDecision::Complete(job.completion, outcome, job.operation.output_sink())
             }
-            Prepared::Native(request) => {
-                let (action, native_target) = request.into_action(job.job_id);
-                job.native_target = native_target;
+            Prepared::Native(command) => {
+                job.native_target = command.target();
+                let action = NativeAction::issue(job.job_id, command);
                 scheduler.active = Some(job);
                 TakeDecision::Action(action)
             }
@@ -474,7 +451,7 @@ pub fn take_native_action() -> NativeAction {
             }
 
             let _ = completion.send(outcome);
-            empty_action()
+            NativeAction::idle()
         }
     }
 }
@@ -484,22 +461,14 @@ pub fn complete_native_action(job_id: MutationJobId, result: NativeActionResult)
     complete_native_action_with_quarantine(job_id, result, quarantine);
 }
 
-fn native_result_requires_quarantine(kind: NativeActionResultKind) -> bool {
-    matches!(
-        kind,
-        NativeActionResultKind::DocContextRestoreFailed
-            | NativeActionResultKind::ExecBridgeFinalizationFailed
-            | NativeActionResultKind::ExecBridgeSymbolsClearFailed
-    )
-}
-
 fn complete_native_action_with_quarantine(
     job_id: MutationJobId,
     mut result: NativeActionResult,
     quarantine: bool,
 ) {
     bound_diagnostic(&mut result.native_detail);
-    let (completion, pending) = {
+
+    let ((completion, outcome, output), rejected) = {
         let Ok(mut scheduler) = SCHEDULER.lock() else {
             return;
         };
@@ -526,7 +495,7 @@ fn complete_native_action_with_quarantine(
                 job.native_target = None;
                 job.defer_for_readiness(Instant::now());
                 scheduler.pending.push_front(job);
-                TIMERS_CHANGED.notify_one();
+                notify_changed();
 
                 return;
             }
@@ -547,7 +516,7 @@ fn complete_native_action_with_quarantine(
             )
         };
 
-        let pending = if quarantine {
+        let rejected = if quarantine {
             scheduler.quarantined = true;
             scheduler.wake_pending = false;
             std::mem::take(&mut scheduler.pending)
@@ -558,16 +527,16 @@ fn complete_native_action_with_quarantine(
             Vec::new()
         };
 
-        ((job.completion, outcome, output), pending)
+        ((job.completion, outcome, output), rejected)
     };
 
-    if let Some(output) = completion.2 {
+    if let Some(output) = output {
         output.finish();
     }
 
-    let _ = completion.0.send(completion.1);
+    let _ = completion.send(outcome);
 
-    for (completion, output) in pending {
+    for (completion, output) in rejected {
         if let Some(output) = output {
             output.stop();
         }
@@ -583,31 +552,6 @@ pub(crate) fn complete_execution_native_action(
 ) {
     let decision = classify_execution_finalization(result, observation);
     complete_native_action_with_quarantine(job_id, decision.result, decision.quarantine);
-}
-
-struct ExecFinalizationDecision {
-    result: NativeActionResult,
-    quarantine: bool,
-}
-
-fn classify_execution_finalization(
-    mut result: NativeActionResult,
-    observation: NativeExecFinalizationObservation,
-) -> ExecFinalizationDecision {
-    let native_state_unproved = observation.native_state_unproved();
-    let quarantine = native_state_unproved || native_result_requires_quarantine(result.kind);
-    let preserve_symbol_failure = result.kind
-        == NativeActionResultKind::ExecBridgeSymbolsClearFailed
-        && observation.only_symbol_cleanup_unproved();
-
-    if native_state_unproved
-        && result.kind != NativeActionResultKind::DocContextRestoreFailed
-        && !preserve_symbol_failure
-    {
-        result.kind = NativeActionResultKind::ExecBridgeFinalizationFailed;
-    }
-
-    ExecFinalizationDecision { result, quarantine }
 }
 
 pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
@@ -692,225 +636,10 @@ pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
                 schedule_native_actions();
             }
 
-            TIMERS_CHANGED.notify_one();
+            notify_changed();
             CancelResult::Accepted
         }
         Action::Result(result) => result,
-    }
-}
-
-pub async fn drive_timers() {
-    loop {
-        let changed = TIMERS_CHANGED.notified();
-
-        match next_timer_deadline() {
-            Some(deadline) => {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        process_due_timers(Instant::now());
-                    }
-                    _ = changed => {}
-                }
-            }
-            None => changed.await,
-        }
-    }
-}
-
-fn next_timer_deadline() -> Option<Instant> {
-    let scheduler = SCHEDULER.lock().ok()?;
-    let execution_start = scheduler
-        .pending
-        .iter()
-        .chain(scheduler.active.iter())
-        .filter(|job| job.execution_start_pending())
-        .filter_map(|job| job.start_deadline)
-        .min();
-    let retry = scheduler
-        .pending
-        .front()
-        .filter(|job| job.waiting_for_readiness)
-        .and_then(|job| job.retry_at);
-    execution_start.into_iter().chain(retry).min()
-}
-
-fn process_due_timers(now: Instant) {
-    let Some((expired, should_wake)) = SCHEDULER.lock().ok().map(|mut scheduler| {
-        if let Some(active) = scheduler.active.as_mut() {
-            active.expire_if_due(now);
-        }
-
-        let mut expired = Vec::new();
-        let mut index = 0;
-
-        while index < scheduler.pending.len() {
-            let should_expire = scheduler.pending[index].deadline_is_due(now);
-
-            if !should_expire {
-                index += 1;
-                continue;
-            }
-
-            let mut job = scheduler.pending.remove(index).expect("queued job exists");
-
-            if job.expire_if_due(now) {
-                let output = job.operation.output_sink();
-                let outcome = finalize(&mut job.operation, &scheduler.documents, None);
-                expired.push((job.completion, outcome, output));
-            } else {
-                scheduler.pending.insert(index, job);
-                index += 1;
-            }
-        }
-
-        if let Some(head) = scheduler.pending.front_mut()
-            && head.waiting_for_readiness
-            && head.retry_at.is_some_and(|retry_at| now >= retry_at)
-        {
-            head.waiting_for_readiness = false;
-            head.retry_at = None;
-        }
-
-        let should_wake = scheduler.request_wake();
-        (expired, should_wake)
-    }) else {
-        return;
-    };
-
-    for (completion, outcome, output) in expired {
-        if let Some(output) = output {
-            output.finish();
-        }
-
-        let _ = completion.send(outcome);
-    }
-
-    if should_wake {
-        schedule_native_actions();
-    }
-}
-
-pub fn native_state_may_be_ready() {
-    let should_wake = SCHEDULER.lock().is_ok_and(|mut scheduler| {
-        if let Some(job) = scheduler.pending.front_mut() {
-            job.waiting_for_readiness = false;
-            job.retry_at = None;
-            job.retry_delay = BUSY_RETRY_INITIAL;
-        }
-
-        scheduler.request_wake()
-    });
-
-    if should_wake {
-        schedule_native_actions();
-    }
-
-    TIMERS_CHANGED.notify_one();
-}
-
-pub fn take_execution_step(job_id: MutationJobId) -> NativeExecStep {
-    let Ok(mut scheduler) = SCHEDULER.lock() else {
-        return NativeExecStep::invalid();
-    };
-
-    let Some(job) = scheduler.active.as_mut() else {
-        return NativeExecStep::invalid();
-    };
-
-    if job.job_id != job_id {
-        return NativeExecStep::invalid();
-    }
-
-    job.expire_if_due(Instant::now());
-
-    match &mut job.operation {
-        Operation::Execute { execution, .. } => execution.take_step(),
-        Operation::Open { .. }
-        | Operation::Save { .. }
-        | Operation::Close { .. }
-        | Operation::History { .. } => NativeExecStep::invalid(),
-    }
-}
-
-pub fn begin_eval_value(
-    job_id: MutationJobId,
-    document_token: usize,
-    database_token: usize,
-) -> NativeValueWriter {
-    let lease = {
-        let Ok(scheduler) = SCHEDULER.lock() else {
-            return NativeValueWriter::inactive();
-        };
-
-        let Some(job) = scheduler.active.as_ref() else {
-            return NativeValueWriter::inactive();
-        };
-
-        if job.job_id != job_id
-            || job.native_target
-                != Some(NativeDocKey {
-                    document_token,
-                    database_token,
-                })
-        {
-            return NativeValueWriter::inactive();
-        }
-
-        match &job.operation {
-            Operation::Execute { execution, .. } => execution.acquire_eval_value_output(),
-            Operation::Open { .. }
-            | Operation::Save { .. }
-            | Operation::Close { .. }
-            | Operation::History { .. } => None,
-        }
-    };
-
-    lease.map_or_else(NativeValueWriter::inactive, NativeValueWriter::eval_value)
-}
-
-pub fn complete_execution_step(job_id: MutationJobId, mut result: ExecStepResult) -> bool {
-    bound_diagnostic(&mut result.detail);
-    let Ok(mut scheduler) = SCHEDULER.lock() else {
-        return false;
-    };
-
-    let Some(job) = scheduler.active.as_mut() else {
-        return false;
-    };
-
-    if job.job_id != job_id {
-        return false;
-    }
-
-    match &mut job.operation {
-        Operation::Execute { execution, .. } => execution.complete_step(result),
-        Operation::Open { .. }
-        | Operation::Save { .. }
-        | Operation::Close { .. }
-        | Operation::History { .. } => false,
-    }
-}
-
-pub fn abandon_execution(job_id: MutationJobId, mut result: ExecStepResult) -> bool {
-    bound_diagnostic(&mut result.detail);
-    let Ok(mut scheduler) = SCHEDULER.lock() else {
-        return false;
-    };
-
-    let Some(job) = scheduler.active.as_mut() else {
-        return false;
-    };
-
-    if job.job_id != job_id {
-        return false;
-    }
-
-    match &mut job.operation {
-        Operation::Execute { execution, .. } => execution.abandon(result),
-        Operation::Open { .. }
-        | Operation::Save { .. }
-        | Operation::Close { .. }
-        | Operation::History { .. } => false,
     }
 }
 
@@ -943,12 +672,12 @@ pub fn wake_failed(status: i32) {
 }
 
 impl MutationJob {
-    fn deadline_is_due(&self, now: Instant) -> bool {
+    pub(super) fn deadline_is_due(&self, now: Instant) -> bool {
         self.start_deadline.is_some_and(|deadline| now >= deadline)
             && self.execution_start_pending()
     }
 
-    fn expire_if_due(&mut self, now: Instant) -> bool {
+    pub(super) fn expire_if_due(&mut self, now: Instant) -> bool {
         if !self.deadline_is_due(now) {
             return false;
         }
@@ -972,7 +701,7 @@ impl MutationJob {
         )
     }
 
-    fn execution_start_pending(&self) -> bool {
+    pub(super) fn execution_start_pending(&self) -> bool {
         matches!(
             &self.operation,
             Operation::Execute { execution, .. } if execution.start_deadline_pending()
@@ -1007,39 +736,6 @@ impl MutationJob {
         self.retry_at = Some(now + self.retry_delay);
         self.retry_delay = self.retry_delay.saturating_mul(2).min(BUSY_RETRY_MAX);
     }
-}
-
-fn empty_action() -> NativeAction {
-    NativeAction {
-        job_id: 0,
-        kind: NativeActionKind::None,
-        document_token: 0,
-        database_token: 0,
-        path: String::new(),
-        discard: false,
-    }
-}
-
-fn schedule_native_actions() {
-    let status = wake_native_actions();
-
-    if status != 0 {
-        wake_failed(status);
-    }
-}
-
-#[cfg(not(test))]
-fn wake_native_actions() -> i32 {
-    unsafe extern "C" {
-        fn acadctl_wake_native_actions() -> i32;
-    }
-
-    unsafe { acadctl_wake_native_actions() }
-}
-
-#[cfg(test)]
-fn wake_native_actions() -> i32 {
-    0
 }
 
 #[cfg(test)]

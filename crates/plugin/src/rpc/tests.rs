@@ -102,7 +102,7 @@ fn reports_documents_and_stops_promptly() {
         let undo_response =
             tokio::spawn(async move { undo_client.undo(HistoryRequest { id: undo_id }).await });
         let undo_action = next_native_action().await;
-        assert_eq!(undo_action.kind, crate::ffi::NativeActionKind::Undo);
+        assert_eq!(undo_action.kind(), crate::ffi::NativeActionKind::Undo);
         crate::scheduler::replace_document_snapshot(vec![
             crate::ffi::NativeDocSnapshot {
                 document_token: 1,
@@ -122,7 +122,7 @@ fn reports_documents_and_stops_promptly() {
             },
         ]);
         crate::scheduler::complete_native_action(
-            undo_action.job_id,
+            undo_action.job_id(),
             crate::ffi::NativeActionResult {
                 kind: crate::ffi::NativeActionResultKind::Success,
                 native_status: 0,
@@ -144,7 +144,7 @@ fn reports_documents_and_stops_promptly() {
         let redo_response =
             tokio::spawn(async move { redo_client.redo(HistoryRequest { id: redo_id }).await });
         let redo_action = next_native_action().await;
-        assert_eq!(redo_action.kind, crate::ffi::NativeActionKind::Redo);
+        assert_eq!(redo_action.kind(), crate::ffi::NativeActionKind::Redo);
         crate::scheduler::replace_document_snapshot(vec![
             crate::ffi::NativeDocSnapshot {
                 document_token: 1,
@@ -164,7 +164,7 @@ fn reports_documents_and_stops_promptly() {
             },
         ]);
         crate::scheduler::complete_native_action(
-            redo_action.job_id,
+            redo_action.job_id(),
             crate::ffi::NativeActionResult {
                 kind: crate::ffi::NativeActionResultKind::Success,
                 native_status: 0,
@@ -210,13 +210,13 @@ fn test_drawing_path(name: &str) -> acadctl_rpc::DrawingPath {
     acadctl_rpc::DrawingPath::canonicalize(path).unwrap()
 }
 
-async fn next_native_action() -> crate::ffi::NativeAction {
+async fn next_native_action() -> crate::scheduler::NativeAction {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 
     loop {
         let action = crate::scheduler::take_native_action();
 
-        if action.kind != crate::ffi::NativeActionKind::None {
+        if action.kind() != crate::ffi::NativeActionKind::None {
             return action;
         }
 
@@ -336,41 +336,41 @@ fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let action = crate::scheduler::take_native_action();
-        assert_eq!(action.kind, crate::ffi::NativeActionKind::QueueExecDriver);
+        assert_eq!(action.kind(), crate::ffi::NativeActionKind::QueueExecDriver);
         assert_eq!(
-            crate::scheduler::take_execution_step(action.job_id).kind(),
+            crate::scheduler::take_execution_step(action.job_id()).kind(),
             crate::exec::ExecStepKind::BeginUndoGroup
         );
         assert!(crate::scheduler::complete_execution_step(
-            action.job_id,
+            action.job_id(),
             successful_step()
         ));
         assert_eq!(
-            crate::scheduler::take_execution_step(action.job_id).kind(),
+            crate::scheduler::take_execution_step(action.job_id()).kind(),
             crate::exec::ExecStepKind::EvaluateForm
         );
         assert_eq!(
-            crate::scheduler::cancel_execution(action.job_id),
+            crate::scheduler::cancel_execution(action.job_id()),
             CancelResult::Accepted
         );
         assert!(crate::scheduler::complete_execution_step(
-            action.job_id,
+            action.job_id(),
             successful_step()
         ));
         assert_eq!(
-            crate::scheduler::take_execution_step(action.job_id).kind(),
+            crate::scheduler::take_execution_step(action.job_id()).kind(),
             crate::exec::ExecStepKind::RollbackUndoGroup
         );
         assert!(crate::scheduler::complete_execution_step(
-            action.job_id,
+            action.job_id(),
             successful_step()
         ));
         assert_eq!(
-            crate::scheduler::take_execution_step(action.job_id).kind(),
+            crate::scheduler::take_execution_step(action.job_id()).kind(),
             crate::exec::ExecStepKind::Done
         );
         crate::scheduler::complete_native_action(
-            action.job_id,
+            action.job_id(),
             crate::ffi::NativeActionResult {
                 kind: crate::ffi::NativeActionResultKind::Success,
                 native_status: 0,

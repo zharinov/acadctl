@@ -99,15 +99,6 @@ mod ffi {
         Other,
     }
 
-    struct NativeAction {
-        job_id: u64,
-        kind: NativeActionKind,
-        document_token: usize,
-        database_token: usize,
-        path: String,
-        discard: bool,
-    }
-
     struct NativeActionResult {
         kind: NativeActionResultKind,
         native_status: i32,
@@ -177,6 +168,7 @@ mod ffi {
     }
 
     extern "Rust" {
+        type NativeAction;
         type NativeExecStep;
         type NativeValueWriter;
 
@@ -184,7 +176,19 @@ mod ffi {
 
         fn publish_document_snapshot(documents: Vec<NativeDocSnapshot>);
 
-        fn take_native_action() -> NativeAction;
+        fn take_native_action() -> Box<NativeAction>;
+
+        fn job_id(self: &NativeAction) -> u64;
+
+        fn kind(self: &NativeAction) -> NativeActionKind;
+
+        fn document_token(self: &NativeAction) -> usize;
+
+        fn database_token(self: &NativeAction) -> usize;
+
+        fn open_path(self: &NativeAction) -> &str;
+
+        fn close_discard(self: &NativeAction) -> bool;
 
         fn complete_native_action(job_id: u64, result: NativeActionResult);
 
@@ -266,6 +270,7 @@ mod scheduler;
 use exec::NativeExecStep;
 use exec::lisp::{LispObservation, LispStatus, NativeDiagnostic};
 use exec::value::writer::{NativeValueWriter, ValueEvent};
+use scheduler::NativeAction;
 
 fn start_rpc_server() -> String {
     rpc::start().err().unwrap_or_default()
@@ -275,8 +280,8 @@ fn publish_document_snapshot(documents: Vec<ffi::NativeDocSnapshot>) {
     scheduler::replace_document_snapshot(documents);
 }
 
-fn take_native_action() -> ffi::NativeAction {
-    scheduler::take_native_action()
+fn take_native_action() -> Box<NativeAction> {
+    Box::new(scheduler::take_native_action())
 }
 
 fn complete_native_action(job_id: u64, result: ffi::NativeActionResult) {

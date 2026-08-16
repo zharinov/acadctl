@@ -191,7 +191,7 @@ private:
 
   bool lispFunctionsDefined(AcApDocument *document) const;
 
-  acadctl::NativeActionResult open(const rust::String &path);
+  acadctl::NativeActionResult open(rust::Str path);
 
   acadctl::NativeActionResult save(AcApDocument *document);
 
@@ -1144,9 +1144,9 @@ bool ObjectArxBridge::stop() {
 
 void ObjectArxBridge::processNextAction() {
   drainDatabaseChanges();
-  acadctl::NativeAction action = acadctl::take_native_action();
+  rust::Box<acadctl::NativeAction> action = acadctl::take_native_action();
 
-  if (action.kind == acadctl::NativeActionKind::None) {
+  if (action->kind() == acadctl::NativeActionKind::None) {
     scheduleNextNativeAction();
 
     return;
@@ -1155,14 +1155,14 @@ void ObjectArxBridge::processNextAction() {
   acadctl::NativeActionResult actionResult =
       result(acadctl::NativeActionResultKind::Success);
 
-  switch (action.kind) {
+  switch (action->kind()) {
   case acadctl::NativeActionKind::Open:
-    actionResult = open(action.path);
+    actionResult = open(action->open_path());
     break;
   case acadctl::NativeActionKind::Save:
-    if (AcApDocument *target = document(action.document_token)) {
+    if (AcApDocument *target = document(action->document_token())) {
       actionResult =
-          matchesDatabase(target, action.database_token)
+          matchesDatabase(target, action->database_token())
               ? save(target)
               : result(acadctl::NativeActionResultKind::DocGenerationChanged);
     } else {
@@ -1171,10 +1171,10 @@ void ObjectArxBridge::processNextAction() {
 
     break;
   case acadctl::NativeActionKind::Close:
-    if (AcApDocument *target = document(action.document_token)) {
+    if (AcApDocument *target = document(action->document_token())) {
       actionResult =
-          matchesDatabase(target, action.database_token)
-              ? close(target, action.discard)
+          matchesDatabase(target, action->database_token())
+              ? close(target, action->close_discard())
               : result(acadctl::NativeActionResultKind::DocGenerationChanged);
     } else {
       actionResult = result(acadctl::NativeActionResultKind::DocGone);
@@ -1184,7 +1184,7 @@ void ObjectArxBridge::processNextAction() {
   case acadctl::NativeActionKind::Undo:
   case acadctl::NativeActionKind::Redo:
   case acadctl::NativeActionKind::QueueExecDriver:
-    if (queueDocumentContextDispatch(action, actionResult)) {
+    if (queueDocumentContextDispatch(*action, actionResult)) {
       return;
     }
 
@@ -1194,7 +1194,7 @@ void ObjectArxBridge::processNextAction() {
   }
 
   refreshDocumentSnapshot();
-  acadctl::complete_native_action(action.job_id, std::move(actionResult));
+  acadctl::complete_native_action(action->job_id(), std::move(actionResult));
   scheduleNextNativeAction();
 }
 
@@ -1248,7 +1248,7 @@ bool ObjectArxBridge::lispFunctionsDefined(AcApDocument *document) const {
          subscription->lispFunctionsDefined;
 }
 
-acadctl::NativeActionResult ObjectArxBridge::open(const rust::String &path) {
+acadctl::NativeActionResult ObjectArxBridge::open(rust::Str path) {
   const AcString drawingPath(path.data(), AcString::Utf8,
                              static_cast<Adesk::UInt32>(path.size()));
   AcApDocManager::DocOpenParams parameters{};
@@ -1361,7 +1361,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
 
   DocContextDispatch::Kind kind;
 
-  switch (action.kind) {
+  switch (action.kind()) {
   case acadctl::NativeActionKind::Undo:
     kind = DocContextDispatch::Kind::Undo;
     break;
@@ -1378,7 +1378,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     return false;
   }
 
-  AcApDocument *target = document(action.document_token);
+  AcApDocument *target = document(action.document_token());
 
   if (!target) {
     failure = result(acadctl::NativeActionResultKind::DocGone);
@@ -1386,7 +1386,7 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     return false;
   }
 
-  if (!matchesDatabase(target, action.database_token)) {
+  if (!matchesDatabase(target, action.database_token())) {
     failure =
         result(acadctl::NativeActionResultKind::DocGenerationChanged);
 
@@ -1447,9 +1447,9 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   }
 
   documentContextDispatch_.emplace(DocContextDispatch{
-      action.job_id,
-      action.document_token,
-      action.database_token,
+      action.job_id(),
+      action.document_token(),
+      action.database_token(),
       static_cast<std::size_t>(
           reinterpret_cast<std::uintptr_t>(previousActive)),
       kind,
