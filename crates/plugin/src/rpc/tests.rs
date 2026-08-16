@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use acadctl_rpc::{DrawingOutcome as RpcDrawingOutcome, ExecMode as RpcExecMode, *};
@@ -8,236 +9,312 @@ use tokio::sync::mpsc;
 use super::{start, stop};
 use crate::scheduler::CancelResult;
 
+struct RpcTest {
+    runtime: tokio::runtime::Runtime,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl RpcTest {
+    fn start(drawings: Vec<crate::ffi::NativeDocumentSnapshot>) -> Self {
+        let lock = crate::scheduler::TEST_LOCK.blocking_lock();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        crate::scheduler::replace_drawing_snapshot(drawings);
+        start().unwrap();
+
+        Self {
+            runtime,
+            _lock: lock,
+        }
+    }
+
+    fn with_drawing(drawing: crate::ffi::NativeDocumentSnapshot) -> (Self, DrawingId) {
+        let test = Self::start(vec![drawing]);
+        let drawing_id = crate::scheduler::list().unwrap()[0].id;
+        (test, drawing_id)
+    }
+
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
+    }
+}
+
+impl Drop for RpcTest {
+    fn drop(&mut self) {
+        stop();
+    }
+}
+
+struct TestDrawingPath(DrawingPath);
+
+impl TestDrawingPath {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-rpc-server-{}-{name}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, []).unwrap();
+        Self(DrawingPath::canonicalize(path).unwrap())
+    }
+
+    fn path(&self) -> &DrawingPath {
+        &self.0
+    }
+}
+
+impl Drop for TestDrawingPath {
+    fn drop(&mut self) {
+        std::fs::remove_file(self.0.as_path()).unwrap();
+    }
+}
+
+fn drawing_snapshot(
+    document_token: usize,
+    database_token: usize,
+    name: impl Into<String>,
+    modified: bool,
+    read_only: bool,
+) -> crate::ffi::NativeDocumentSnapshot {
+    crate::ffi::NativeDocumentSnapshot {
+        document_token,
+        database_token,
+        name: name.into(),
+        named: true,
+        modified,
+        read_only,
+    }
+}
+
 fn source_name(value: &str) -> SourceName {
     SourceName::new(value).unwrap()
 }
 
-#[test]
-fn reports_drawings_and_stops_promptly() {
-    let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-    let house = test_drawing_path("house");
-    let site = test_drawing_path("site");
-    crate::scheduler::replace_drawing_snapshot(vec![
-        crate::ffi::NativeDocumentSnapshot {
-            document_token: 1,
-            database_token: 101,
-            name: house.as_str().into(),
-            named: true,
-            modified: false,
-            read_only: false,
-        },
-        crate::ffi::NativeDocumentSnapshot {
-            document_token: 2,
-            database_token: 102,
-            name: site.as_str().into(),
-            named: true,
-            modified: true,
-            read_only: true,
-        },
-    ]);
-    start().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
-    let client = runtime.block_on(async {
-        let mut client = acadctl_rpc::connect_drawings(
-            acadctl_rpc::InstanceId::new(std::process::id()).unwrap(),
-        )
+async fn drawing_client() -> acadctl_rpc::DrawingServiceClient<tonic::transport::Channel> {
+    acadctl_rpc::connect_drawings(acadctl_rpc::InstanceId::new(std::process::id()).unwrap())
         .await
-        .unwrap();
+        .unwrap()
+}
+
+async fn execution_client() -> acadctl_rpc::ExecServiceClient<tonic::transport::Channel> {
+    acadctl_rpc::connect_execution(acadctl_rpc::InstanceId::new(std::process::id()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[test]
+fn list_serializes_a_drawing_snapshot() {
+    let site = TestDrawingPath::new("list-site");
+    let test = RpcTest::start(vec![drawing_snapshot(
+        2,
+        102,
+        site.path().as_str(),
+        true,
+        true,
+    )]);
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
         let listed = client.list(ListRequest {}).await.unwrap().into_inner();
-        assert_eq!(listed.drawings.len(), 2);
+
+        assert_eq!(listed.drawings.len(), 1);
         assert!(DrawingId::try_from(listed.drawings[0].id).is_ok());
         assert_eq!(
             listed.drawings[0].display_name,
-            house.as_path().file_name().unwrap()
+            site.path().as_path().file_name().unwrap()
         );
         assert_eq!(
             listed.drawings[0].file_path.as_deref(),
-            Some(house.as_str())
+            Some(site.path().as_str())
         );
-        assert!(!listed.drawings[0].modified);
-        assert!(!listed.drawings[0].read_only);
-        assert!(DrawingId::try_from(listed.drawings[1].id).is_ok());
-        assert_ne!(listed.drawings[0].id, listed.drawings[1].id);
-        assert_eq!(
-            listed.drawings[1].display_name,
-            site.as_path().file_name().unwrap()
-        );
-        assert_eq!(listed.drawings[1].file_path.as_deref(), Some(site.as_str()));
-        assert!(listed.drawings[1].modified);
-        assert!(listed.drawings[1].read_only);
+        assert!(listed.drawings[0].modified);
+        assert!(listed.drawings[0].read_only);
+    });
+}
 
+#[test]
+fn open_returns_an_already_open_drawing() {
+    let house = TestDrawingPath::new("open-house");
+    let (test, drawing_id) = RpcTest::with_drawing(drawing_snapshot(
+        1,
+        101,
+        house.path().as_str(),
+        false,
+        false,
+    ));
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
         let opened = client
-            .open(OpenRequest::from(house.clone()))
+            .open(OpenRequest::from(house.path().clone()))
             .await
             .unwrap()
             .into_inner()
             .drawing
             .unwrap();
-        assert_eq!(opened.id, listed.drawings[0].id);
 
-        let mut save_client = client.clone();
-        let save_id = opened.id;
-        let save_response = tokio::spawn(async move {
-            save_client
+        assert_eq!(opened.id, drawing_id.into());
+    });
+}
+
+#[test]
+fn save_returns_the_published_drawing() {
+    let house = TestDrawingPath::new("save-house");
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, house.path().as_str(), true, false));
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
+        let response = tokio::spawn(async move {
+            client
                 .save(SaveRequest {
-                    drawing_id: save_id,
+                    drawing_id: drawing_id.into(),
                     path: None,
                 })
                 .await
         });
-        let save_action = next_native_action().await;
-        assert_eq!(save_action.kind(), crate::ffi::NativeActionKind::Save);
-        crate::scheduler::complete_native_action(
-            save_action.job_id(),
-            crate::ffi::NativeActionResult {
-                kind: crate::ffi::NativeActionResultKind::Success,
-                native_status: 0,
-                native_detail: String::new(),
-            },
-        );
-        let saved = save_response
+        let action = next_native_action().await;
+        assert_eq!(action.kind(), crate::ffi::NativeActionKind::Save);
+        crate::scheduler::replace_drawing_snapshot(vec![drawing_snapshot(
+            1,
+            101,
+            house.path().as_str(),
+            false,
+            false,
+        )]);
+        complete_native_action_success(&action);
+
+        let saved = response
             .await
             .unwrap()
             .unwrap()
             .into_inner()
             .drawing
             .unwrap();
-        assert_eq!(saved.id, opened.id);
+        assert_eq!(saved.id, drawing_id.into());
         assert!(!saved.modified);
+    });
+}
 
-        let mut undo_client = client.clone();
-        let undo_id = opened.id;
-        let undo_response = tokio::spawn(async move {
-            undo_client
+#[test]
+fn undo_routes_to_undo_and_returns_the_published_drawing() {
+    let house = TestDrawingPath::new("undo-house");
+    let (test, drawing_id) = RpcTest::with_drawing(drawing_snapshot(
+        1,
+        101,
+        house.path().as_str(),
+        false,
+        false,
+    ));
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
+        let response = tokio::spawn(async move {
+            client
                 .undo(HistoryRequest {
-                    drawing_id: undo_id,
+                    drawing_id: drawing_id.into(),
                 })
                 .await
         });
-        let undo_action = next_native_action().await;
-        assert_eq!(undo_action.kind(), crate::ffi::NativeActionKind::Undo);
-        crate::scheduler::replace_drawing_snapshot(vec![
-            crate::ffi::NativeDocumentSnapshot {
-                document_token: 1,
-                database_token: 101,
-                name: house.as_str().into(),
-                named: true,
-                modified: true,
-                read_only: false,
-            },
-            crate::ffi::NativeDocumentSnapshot {
-                document_token: 2,
-                database_token: 102,
-                name: site.as_str().into(),
-                named: true,
-                modified: true,
-                read_only: true,
-            },
-        ]);
-        crate::scheduler::complete_native_action(
-            undo_action.job_id(),
-            crate::ffi::NativeActionResult {
-                kind: crate::ffi::NativeActionResultKind::Success,
-                native_status: 0,
-                native_detail: String::new(),
-            },
-        );
-        let undone = undo_response
+        let action = next_native_action().await;
+        assert_eq!(action.kind(), crate::ffi::NativeActionKind::Undo);
+        crate::scheduler::replace_drawing_snapshot(vec![drawing_snapshot(
+            1,
+            101,
+            house.path().as_str(),
+            true,
+            false,
+        )]);
+        complete_native_action_success(&action);
+
+        let undone = response
             .await
             .unwrap()
             .unwrap()
             .into_inner()
             .drawing
             .unwrap();
-        assert_eq!(undone.id, opened.id);
+        assert_eq!(undone.id, drawing_id.into());
         assert!(undone.modified);
+    });
+}
 
-        let mut redo_client = client.clone();
-        let redo_id = opened.id;
-        let redo_response = tokio::spawn(async move {
-            redo_client
+#[test]
+fn redo_routes_to_redo_and_returns_the_published_drawing() {
+    let house = TestDrawingPath::new("redo-house");
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, house.path().as_str(), true, false));
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
+        let response = tokio::spawn(async move {
+            client
                 .redo(HistoryRequest {
-                    drawing_id: redo_id,
+                    drawing_id: drawing_id.into(),
                 })
                 .await
         });
-        let redo_action = next_native_action().await;
-        assert_eq!(redo_action.kind(), crate::ffi::NativeActionKind::Redo);
-        crate::scheduler::replace_drawing_snapshot(vec![
-            crate::ffi::NativeDocumentSnapshot {
-                document_token: 1,
-                database_token: 101,
-                name: house.as_str().into(),
-                named: true,
-                modified: false,
-                read_only: false,
-            },
-            crate::ffi::NativeDocumentSnapshot {
-                document_token: 2,
-                database_token: 102,
-                name: site.as_str().into(),
-                named: true,
-                modified: true,
-                read_only: true,
-            },
-        ]);
-        crate::scheduler::complete_native_action(
-            redo_action.job_id(),
-            crate::ffi::NativeActionResult {
-                kind: crate::ffi::NativeActionResultKind::Success,
-                native_status: 0,
-                native_detail: String::new(),
-            },
-        );
-        let redone = redo_response
+        let action = next_native_action().await;
+        assert_eq!(action.kind(), crate::ffi::NativeActionKind::Redo);
+        crate::scheduler::replace_drawing_snapshot(vec![drawing_snapshot(
+            1,
+            101,
+            house.path().as_str(),
+            false,
+            false,
+        )]);
+        complete_native_action_success(&action);
+
+        let redone = response
             .await
             .unwrap()
             .unwrap()
             .into_inner()
             .drawing
             .unwrap();
-        assert_eq!(redone.id, opened.id);
+        assert_eq!(redone.id, drawing_id.into());
         assert!(!redone.modified);
+    });
+}
 
-        let close_error = client
+#[test]
+fn close_reports_typed_unsaved_changes() {
+    let house = TestDrawingPath::new("dirty-house");
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, house.path().as_str(), true, false));
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
+        let error = client
             .close(CloseRequest {
-                drawing_id: listed.drawings[1].id,
+                drawing_id: drawing_id.into(),
                 discard: false,
             })
             .await
             .unwrap_err();
-        assert_eq!(close_error.code(), tonic::Code::FailedPrecondition);
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
-            DrawingError::from_status(&close_error),
+            DrawingError::from_status(&error),
             Some(DrawingError {
                 kind: DrawingErrorKind::UnsavedChanges as i32,
-                drawing_id: DrawingId::try_from(listed.drawings[1].id)
-                    .ok()
-                    .map(Into::into),
+                drawing_id: Some(drawing_id.into()),
             })
         );
-        client
     });
+}
+
+#[test]
+fn stop_returns_promptly_with_a_connected_client() {
+    let test = RpcTest::start(Vec::new());
+    let client = test.block_on(drawing_client());
 
     let started = Instant::now();
     stop();
+
     assert!(started.elapsed() < Duration::from_secs(1));
     drop(client);
-    std::fs::remove_file(house.as_path()).unwrap();
-    std::fs::remove_file(site.as_path()).unwrap();
-}
-
-fn test_drawing_path(name: &str) -> acadctl_rpc::DrawingPath {
-    let path = std::env::temp_dir().join(format!(
-        "acadctl-rpc-server-{}-{name}.dwg",
-        std::process::id()
-    ));
-    std::fs::write(&path, []).unwrap();
-    acadctl_rpc::DrawingPath::canonicalize(path).unwrap()
 }
 
 async fn next_native_action() -> crate::scheduler::NativeAction {
@@ -258,42 +335,58 @@ async fn next_native_action() -> crate::scheduler::NativeAction {
     }
 }
 
-#[test]
-fn execute_transport_preserves_the_four_mib_source_boundary() {
-    let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-    crate::scheduler::replace_drawing_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
-        document_token: 1,
-        database_token: 101,
-        name: "/tmp/house.dwg".into(),
-        named: true,
-        modified: false,
-        read_only: false,
-    }]);
-    let drawing_id = crate::scheduler::list().unwrap()[0].id;
-    start().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+fn complete_native_action_success(action: &crate::scheduler::NativeAction) {
+    crate::scheduler::complete_native_action(
+        action.job_id(),
+        crate::ffi::NativeActionResult {
+            kind: crate::ffi::NativeActionResultKind::Success,
+            native_status: 0,
+            native_detail: String::new(),
+        },
+    );
+}
 
-    runtime.block_on(async {
-        let mut client = acadctl_rpc::connect_execution(
-            acadctl_rpc::InstanceId::new(std::process::id()).unwrap(),
-        )
-        .await
-        .unwrap();
-        execute_and_cancel(
+#[test]
+fn accepts_source_at_the_size_limit() {
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, "/tmp/house.dwg", false, false));
+
+    test.block_on(async {
+        let mut client = execution_client().await;
+        let acknowledgements = accept_and_cancel(
             &mut client,
             drawing_id,
             Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES]),
+            1,
         )
         .await;
+        assert_eq!(acknowledgements, 1);
+    });
+}
 
-        let mut with_bom = Vec::with_capacity(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3);
-        with_bom.extend_from_slice(&[0xef, 0xbb, 0xbf]);
-        with_bom.resize(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3, b'x');
-        execute_and_cancel(&mut client, drawing_id, Bytes::from(with_bom)).await;
+#[test]
+fn accepts_the_size_limit_after_a_utf8_bom() {
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, "/tmp/house.dwg", false, false));
+    let mut source = Vec::with_capacity(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3);
+    source.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    source.resize(acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 3, b'x');
 
+    test.block_on(async {
+        let mut client = execution_client().await;
+        let acknowledgements =
+            accept_and_cancel(&mut client, drawing_id, Bytes::from(source), 1).await;
+        assert_eq!(acknowledgements, 1);
+    });
+}
+
+#[test]
+fn rejects_an_oversized_source_before_acceptance() {
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, "/tmp/house.dwg", false, false));
+
+    test.block_on(async {
+        let mut client = execution_client().await;
         let request = execution_request(
             drawing_id,
             Bytes::from(vec![b'x'; acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES + 1]),
@@ -307,7 +400,6 @@ fn execute_transport_preserves_the_four_mib_source_boundary() {
         let Some(exec_server_event::Event::Finished(finished)) = event.event else {
             panic!("oversized source must fail before acceptance");
         };
-
         let Some(exec_outcome::Outcome::Failure(failure)) = finished.outcome.unwrap().outcome
         else {
             panic!("oversized source must produce a structured failure");
@@ -320,8 +412,19 @@ fn execute_transport_preserves_the_four_mib_source_boundary() {
         );
         assert!(response.message().await.unwrap().is_none());
     });
+}
 
-    stop();
+#[test]
+fn duplicate_cancellation_produces_one_acknowledgement() {
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, "/tmp/house.dwg", false, false));
+
+    test.block_on(async {
+        let mut client = execution_client().await;
+        let acknowledgements =
+            accept_and_cancel(&mut client, drawing_id, Bytes::from_static(b"form"), 2).await;
+        assert_eq!(acknowledgements, 1);
+    });
 }
 
 #[test]
@@ -352,28 +455,11 @@ fn terminal_execution_response_holds_capacity_until_observed() {
 
 #[test]
 fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
-    let _test = crate::scheduler::TEST_LOCK.blocking_lock();
-    crate::scheduler::replace_drawing_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
-        document_token: 1,
-        database_token: 101,
-        name: "/tmp/house.dwg".into(),
-        named: true,
-        modified: false,
-        read_only: false,
-    }]);
-    let drawing_id = crate::scheduler::list().unwrap()[0].id;
-    start().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, "/tmp/house.dwg", false, false));
 
-    runtime.block_on(async {
-        let mut client = acadctl_rpc::connect_execution(
-            acadctl_rpc::InstanceId::new(std::process::id()).unwrap(),
-        )
-        .await
-        .unwrap();
+    test.block_on(async {
+        let mut client = execution_client().await;
         let (sender, receiver) = mpsc::channel(1);
         sender
             .send(execution_request(drawing_id, Bytes::from_static(b"form")))
@@ -409,41 +495,17 @@ fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
             crate::scheduler::cancel_execution(action.job_id()),
             CancelResult::Accepted
         );
-        assert!(crate::scheduler::complete_execution_step(
-            action.job_id(),
-            successful_step()
-        ));
-        assert_eq!(
-            crate::scheduler::take_execution_step(action.job_id()).kind(),
-            crate::exec::ExecStepKind::RollbackUndoGroup
-        );
-        assert!(crate::scheduler::complete_execution_step(
-            action.job_id(),
-            successful_step()
-        ));
-        assert_eq!(
-            crate::scheduler::take_execution_step(action.job_id()).kind(),
-            crate::exec::ExecStepKind::Done
-        );
-        crate::scheduler::complete_native_action(
-            action.job_id(),
-            crate::ffi::NativeActionResult {
-                kind: crate::ffi::NativeActionResultKind::Success,
-                native_status: 0,
-                native_detail: String::new(),
-            },
-        );
+        finish_cancelled_execution(&action);
     });
-
-    stop();
 }
 
-async fn execute_and_cancel(
+async fn accept_and_cancel(
     client: &mut acadctl_rpc::ExecServiceClient<tonic::transport::Channel>,
     drawing_id: DrawingId,
     source: Bytes,
-) {
-    let (sender, receiver) = mpsc::channel(2);
+    cancellation_requests: usize,
+) -> usize {
+    let (sender, receiver) = mpsc::channel(cancellation_requests.max(1));
     sender
         .send(execution_request(drawing_id, source))
         .await
@@ -458,7 +520,7 @@ async fn execute_and_cancel(
         Some(exec_server_event::Event::Accepted(_))
     ));
 
-    for _ in 0..2 {
+    for _ in 0..cancellation_requests {
         sender
             .send(ExecClientMessage {
                 message: Some(exec_client_message::Message::Cancel(
@@ -469,7 +531,7 @@ async fn execute_and_cancel(
             .unwrap();
     }
 
-    let mut cancel_acknowledgement_count = 0;
+    let mut acknowledgements = 0;
     loop {
         let event = response
             .message()
@@ -483,7 +545,7 @@ async fn execute_and_cancel(
                     acknowledgement.disposition,
                     ExecCancelDisposition::Accepted as i32
                 );
-                cancel_acknowledgement_count += 1;
+                acknowledgements += 1;
             }
             Some(exec_server_event::Event::Finished(finished)) => {
                 assert!(matches!(
@@ -492,14 +554,12 @@ async fn execute_and_cancel(
                 ));
                 break;
             }
-
             Some(exec_server_event::Event::Accepted(_))
             | Some(exec_server_event::Event::Output(_))
             | None => panic!("unexpected execution event"),
         }
     }
 
-    assert_eq!(cancel_acknowledgement_count, 1);
     assert!(
         response
             .message()
@@ -507,6 +567,27 @@ async fn execute_and_cancel(
             .expect("execution stream read failed after its terminal event")
             .is_none()
     );
+    acknowledgements
+}
+
+fn finish_cancelled_execution(action: &crate::scheduler::NativeAction) {
+    assert!(crate::scheduler::complete_execution_step(
+        action.job_id(),
+        successful_step()
+    ));
+    assert_eq!(
+        crate::scheduler::take_execution_step(action.job_id()).kind(),
+        crate::exec::ExecStepKind::RollbackUndoGroup
+    );
+    assert!(crate::scheduler::complete_execution_step(
+        action.job_id(),
+        successful_step()
+    ));
+    assert_eq!(
+        crate::scheduler::take_execution_step(action.job_id()).kind(),
+        crate::exec::ExecStepKind::Done
+    );
+    complete_native_action_success(action);
 }
 
 fn execution_request(drawing_id: DrawingId, source: Bytes) -> ExecClientMessage {
