@@ -21,6 +21,7 @@ futures-util.workspace = true
 nanoid.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+unicode-width.workspace = true
 
 [build-dependencies]
 cxx-build.workspace = true

@@ -1,5 +1,10 @@
 use super::super::output::{EmitResult, OUTPUT_CHUNK_BYTES, OutputSink};
 
+#[path = "printer_layout.rs"]
+mod layout;
+
+use layout::Layout;
+
 pub const MAX_VALUE_DEPTH: usize = 64 * 1024;
 pub const MAX_VALUE_TEXT_BYTES: usize = OUTPUT_CHUNK_BYTES;
 
@@ -14,7 +19,7 @@ pub enum PrintError {
 }
 
 pub struct ValuePrinter {
-    sink: OutputSink,
+    layout: Layout,
     lists: Vec<ListState>,
     atom: AtomState,
     skipped_lists: usize,
@@ -79,7 +84,7 @@ enum OpaqueKind {
 impl ValuePrinter {
     pub fn new(sink: OutputSink) -> Self {
         Self {
-            sink,
+            layout: Layout::new(sink),
             lists: Vec::new(),
             atom: AtomState::None,
             skipped_lists: 0,
@@ -112,6 +117,7 @@ impl ValuePrinter {
         }
 
         self.before_value()?;
+        self.layout.begin_group(self.lists.len())?;
         self.write("(")?;
         self.lists
             .try_reserve(1)
@@ -137,8 +143,12 @@ impl ValuePrinter {
             return Err(PrintError::InvalidSequence);
         }
 
-        self.lists.pop();
-        self.write(")")
+        let state = self.lists.pop().expect("checked list exists");
+        if state != ListState::Empty {
+            self.layout.line("", self.lists.len())?;
+        }
+        self.write(")")?;
+        self.layout.end_group()
     }
 
     pub fn dot(&mut self) -> Result<(), PrintError> {
@@ -156,7 +166,8 @@ impl ValuePrinter {
         }
 
         *state = ListState::AwaitingTail;
-        self.write(" . ")
+        self.layout.line(" ", self.lists.len())?;
+        self.write(".")
     }
 
     pub fn nil(&mut self) -> Result<(), PrintError> {
@@ -244,7 +255,7 @@ impl ValuePrinter {
         Ok(())
     }
 
-    pub fn string_chunk(&self, text: &str) -> Result<(), PrintError> {
+    pub fn string_chunk(&mut self, text: &str) -> Result<(), PrintError> {
         if text.len() > MAX_VALUE_TEXT_BYTES {
             return Err(PrintError::InvalidSequence);
         }
@@ -371,17 +382,10 @@ impl ValuePrinter {
 
     pub fn finish(self) -> Result<(), PrintError> {
         if self.atom != AtomState::None || !self.lists.is_empty() || self.skipped_lists != 0 {
-            let _ = self.sink.flush();
-
             return Err(PrintError::InvalidSequence);
         }
 
-        self.write("\n")?;
-
-        match self.sink.flush() {
-            EmitResult::Continue => Ok(()),
-            result => Err(PrintError::Output(result)),
-        }
+        self.layout.finish()
     }
 
     fn scalar(&mut self, text: &str) -> Result<(), PrintError> {
@@ -422,24 +426,20 @@ impl ValuePrinter {
             return Ok(());
         };
 
-        let write_space = match *state {
+        let separator = match *state {
             ListState::Empty => {
                 *state = ListState::Values;
-                false
+                ""
             }
-            ListState::Values => true,
+            ListState::Values => " ",
             ListState::AwaitingTail => {
                 *state = ListState::Complete;
-                false
+                " "
             }
             ListState::Complete => return Err(PrintError::InvalidSequence),
         };
 
-        if write_space {
-            self.write(" ")?;
-        }
-
-        Ok(())
+        self.layout.line(separator, self.lists.len())
     }
 
     fn require_no_atom(&self) -> Result<(), PrintError> {
@@ -450,18 +450,15 @@ impl ValuePrinter {
         }
     }
 
-    fn write(&self, text: &str) -> Result<(), PrintError> {
-        match self.sink.emit(text) {
-            EmitResult::Continue => Ok(()),
-            result => Err(PrintError::Output(result)),
-        }
+    fn write(&mut self, text: &str) -> Result<(), PrintError> {
+        self.layout.text(text)
     }
 
     fn poll_output(&self) -> Result<(), PrintError> {
-        self.write("")
+        self.layout.poll()
     }
 
-    fn append_bounded(&self, buffer: &mut String, text: &str) -> Result<(), PrintError> {
+    fn append_bounded(&mut self, buffer: &mut String, text: &str) -> Result<(), PrintError> {
         if buffer.len() + text.len() > OUTPUT_CHUNK_BYTES {
             self.write(buffer)?;
             buffer.clear();
@@ -471,7 +468,7 @@ impl ValuePrinter {
         Ok(())
     }
 
-    fn write_symbol_chunk(&self, text: &str) -> Result<(), PrintError> {
+    fn write_symbol_chunk(&mut self, text: &str) -> Result<(), PrintError> {
         if !text.contains('\\') {
             return self.write(text);
         }
@@ -787,6 +784,33 @@ mod tests {
             printer.integer(1),
             Err(PrintError::Output(EmitResult::Cancelled))
         );
+    }
+
+    #[test]
+    fn observes_cancellation_during_layout_lookahead() {
+        let (sink, _stream) = channel();
+        let terminal = sink.clone();
+        let mut printer = ValuePrinter::new(sink);
+        printer.begin_list().unwrap();
+
+        terminal.request_cancel();
+
+        assert_eq!(
+            printer.integer(1),
+            Err(PrintError::Output(EmitResult::Cancelled))
+        );
+    }
+
+    #[test]
+    fn streams_a_broken_group_before_it_closes() {
+        let (sink, _stream) = channel();
+        let observer = sink.clone();
+        let mut printer = ValuePrinter::new(sink);
+        printer.begin_list().unwrap();
+        printer.begin_symbol().unwrap();
+        printer.symbol_chunk(&"A".repeat(101)).unwrap();
+
+        assert_ne!(observer.queued_bytes(), 0);
     }
 
     #[tokio::test]

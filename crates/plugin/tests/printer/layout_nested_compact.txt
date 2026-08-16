@@ -1,0 +1,7 @@
+(
+  (NAME . "Layer zero")
+  (COLOR . 7)
+  (FLAGS (LOCKED T) (FROZEN nil))
+  (ENTITY . (handent "5A2"))
+  (OWNER . "Architecture")
+)

@@ -1035,3 +1035,11 @@ Rust owns the private bridge protocol and renders all three execution-bridge Aut
 ### 2026-08-15 — I-081: `eval` and `exec` accept inline source
 
 `eval` accepts one positional `<FORM>`, while `exec` accepts positional `<FORMS>`. `-f <FILE>` and `--file <FILE>` select a source file instead; omitting both source forms reads stdin. Inline source and a file cannot be combined, and `-` has no special stdin meaning. Inline input passes through the same size, UTF-8, U+0000, scanner, and mode-specific form-count validation as file and stdin input, and uses `<command-line>` as its diagnostic source name.
+
+### 2026-08-16 — I-082: readable values use deterministic bounded group layout
+
+The value printer uses a fixed 100-display-column, two-space layout. A list remains on one line when its complete flat form fits the space left on the current line. Otherwise its values, dotted-tail marker, and closing parenthesis receive separate indented lines. Nested lists make their own fit decision, so a broken outer list can retain compact inner records. Atoms are never split, and Unicode display width rather than UTF-8 byte length controls the fit decision.
+
+Layout lookahead retains only the unresolved group prefix: once its flat width cannot fit, the group breaks and output resumes incrementally. One incoming atom fragment remains bounded by the existing 16 KiB bridge limit. At nesting whose indentation reaches the print width, deeper groups stay flat; this prevents adversarial 65,536-level input from turning indentation into quadratic output while preserving the existing traversal-depth boundary and cancellable streaming.
+
+Terminal width detection, caller-selected widths, AutoLISP form-specific indentation, and whole-value buffering were rejected. Eval output is deterministic across terminals and remains a value data format rather than a source-code formatter.

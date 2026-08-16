@@ -38,6 +38,7 @@ dependencies = [
  "nanoid",
  "tokio",
  "tonic",
+ "unicode-width",
 ]
 
 [[package]]

@@ -62,4 +62,5 @@ tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = { version = "0.5.2", features = ["util"] }
+unicode-width = "0.2.2"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
