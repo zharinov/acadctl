@@ -68,7 +68,7 @@ mod ffi {
 
     #[derive(Debug)]
     #[repr(u8)]
-    enum NativeValueWriteResult {
+    enum NativeOutputWriteResult {
         Continue,
         Inactive,
         Disconnected,
@@ -113,7 +113,7 @@ mod ffi {
         bridge_symbols_clear_status: i32,
     }
 
-    struct NativeLispValueEvent {
+    struct NativeLispOutputEvent {
         code: i32,
         payload_kind: NativeLispPayloadKind,
         integer: i64,
@@ -124,7 +124,8 @@ mod ffi {
     struct NativeBridgeProtocol {
         execution_driver_expression: String,
         execution_driver_invocation: String,
-        value_event_function: String,
+        output_event_function: String,
+        eval_value_emitter_expression: String,
         advance_execution_function: String,
         source_symbol: String,
         staged_form_symbol: String,
@@ -163,14 +164,14 @@ mod ffi {
         undo_group_may_be_open: bool,
         bridge_symbols_may_be_retained: bool,
         staged_form_may_be_retained: bool,
-        value_writer_active: bool,
+        output_port_active: bool,
         terminal_cleanup_failed: bool,
     }
 
     extern "Rust" {
         type NativeAction;
         type NativeExecStep;
-        type NativeValueWriter;
+        type NativeOutputPort;
 
         fn start_rpc_server() -> String;
 
@@ -214,8 +215,6 @@ mod ffi {
 
         fn form_evaluator_source() -> &'static str;
 
-        fn eval_value_visitor_source() -> &'static str;
-
         fn native_diagnostic_capture_units() -> usize;
 
         fn complete_execution_step(job_id: u64, result: NativeExecStepResult) -> bool;
@@ -240,23 +239,29 @@ mod ffi {
             fallback_cleanup_status: i32,
         ) -> NativeBridgeStepResult;
 
-        fn begin_eval_value(
+        fn begin_eval_output(
             job_id: u64,
             document_token: usize,
             database_token: usize,
-        ) -> Box<NativeValueWriter>;
+        ) -> Box<NativeOutputPort>;
 
-        fn value_writer_active(writer: &NativeValueWriter) -> bool;
+        fn begin_form_output(
+            job_id: u64,
+            document_token: usize,
+            database_token: usize,
+        ) -> Box<NativeOutputPort>;
 
-        fn invalidate_value_writer(writer: &mut NativeValueWriter);
+        fn output_port_claimed(port: &NativeOutputPort) -> bool;
 
-        fn write_lisp_value_event(
-            writer: &mut NativeValueWriter,
-            event: NativeLispValueEvent,
+        fn invalidate_output_port(port: &mut NativeOutputPort);
+
+        fn write_lisp_output_event(
+            port: &mut NativeOutputPort,
+            event: NativeLispOutputEvent,
             text: &str,
-        ) -> NativeValueWriteResult;
+        ) -> NativeOutputWriteResult;
 
-        fn finish_value_writer(writer: Box<NativeValueWriter>) -> NativeValueWriteResult;
+        fn finish_output_port(port: Box<NativeOutputPort>) -> NativeOutputWriteResult;
 
         fn stop_rpc_server();
     }
@@ -269,7 +274,7 @@ mod scheduler;
 
 use exec::NativeExecStep;
 use exec::lisp::{LispObservation, LispStatus, NativeDiagnostic};
-use exec::value::writer::{NativeValueWriter, ValueEvent};
+use exec::value::port::NativeOutputPort;
 use scheduler::NativeAction;
 
 fn start_rpc_server() -> String {
@@ -328,10 +333,6 @@ fn form_evaluator_source() -> &'static str {
     exec::form_evaluator_source()
 }
 
-fn eval_value_visitor_source() -> &'static str {
-    exec::value::visitor::source()
-}
-
 fn native_diagnostic_capture_units() -> usize {
     acadctl_rpc::MAX_DIAGNOSTIC_BYTES + 1
 }
@@ -340,7 +341,8 @@ fn native_bridge_protocol() -> ffi::NativeBridgeProtocol {
     ffi::NativeBridgeProtocol {
         execution_driver_expression: exec::protocol::execution_driver_expression(),
         execution_driver_invocation: exec::protocol::execution_driver_invocation(),
-        value_event_function: exec::protocol::VALUE_EVENT_FUNCTION.into(),
+        output_event_function: exec::protocol::OUTPUT_EVENT_FUNCTION.into(),
+        eval_value_emitter_expression: exec::protocol::eval_value_emitter_expression(),
         advance_execution_function: exec::protocol::ADVANCE_EXECUTION_FUNCTION.into(),
         source_symbol: exec::protocol::SOURCE_SYMBOL.into(),
         staged_form_symbol: exec::protocol::STAGED_FORM_SYMBOL.into(),
@@ -405,52 +407,63 @@ fn abandon_execution(job_id: u64, result: ffi::NativeExecStepResult) -> bool {
     scheduler::abandon_execution(job_id, result)
 }
 
-fn begin_eval_value(
+fn begin_eval_output(
     job_id: u64,
     document_token: usize,
     database_token: usize,
-) -> Box<NativeValueWriter> {
-    Box::new(scheduler::begin_eval_value(
+) -> Box<NativeOutputPort> {
+    Box::new(scheduler::begin_eval_output(
         job_id,
         document_token,
         database_token,
     ))
 }
 
-fn value_writer_active(writer: &NativeValueWriter) -> bool {
-    writer.active()
+fn begin_form_output(
+    job_id: u64,
+    document_token: usize,
+    database_token: usize,
+) -> Box<NativeOutputPort> {
+    Box::new(scheduler::begin_form_output(
+        job_id,
+        document_token,
+        database_token,
+    ))
 }
 
-fn invalidate_value_writer(writer: &mut NativeValueWriter) {
-    writer.write(ValueEvent::Invalid);
+fn output_port_claimed(port: &NativeOutputPort) -> bool {
+    port.claimed()
 }
 
-fn write_lisp_value_event(
-    writer: &mut NativeValueWriter,
-    event: ffi::NativeLispValueEvent,
+fn invalidate_output_port(port: &mut NativeOutputPort) {
+    port.invalidate();
+}
+
+fn write_lisp_output_event(
+    port: &mut NativeOutputPort,
+    event: ffi::NativeLispOutputEvent,
     text: &str,
-) -> ffi::NativeValueWriteResult {
-    use exec::value::visitor::Payload;
+) -> ffi::NativeOutputWriteResult {
+    use exec::value::event::{Payload, ProtocolViolation};
 
     let payload = match event.payload_kind {
-        ffi::NativeLispPayloadKind::Nil => Payload::Nil,
-        ffi::NativeLispPayloadKind::Integer => Payload::Integer(event.integer),
-        ffi::NativeLispPayloadKind::Real => Payload::Real(event.real),
-        ffi::NativeLispPayloadKind::String => Payload::String(text),
-        ffi::NativeLispPayloadKind::Entity => Payload::Entity(event.has_text.then_some(text)),
-        _ => Payload::Invalid,
+        ffi::NativeLispPayloadKind::Nil => Ok(Payload::Nil),
+        ffi::NativeLispPayloadKind::Integer => Ok(Payload::Integer(event.integer)),
+        ffi::NativeLispPayloadKind::Real => Ok(Payload::Real(event.real)),
+        ffi::NativeLispPayloadKind::String => Ok(Payload::String(text)),
+        ffi::NativeLispPayloadKind::Entity => Ok(Payload::Entity(event.has_text.then_some(text))),
+        _ => Err(ProtocolViolation),
     };
 
-    let value = exec::value::visitor::value_event(event.code, payload);
-    writer.write(value)
+    port.write(payload.and_then(|payload| exec::value::event::output_event(event.code, payload)))
 }
 
 #[allow(
     clippy::boxed_local,
-    reason = "CXX transfers exclusive ownership so finish can validate and close the writer"
+    reason = "CXX transfers exclusive ownership so finish can validate and close the port"
 )]
-fn finish_value_writer(writer: Box<NativeValueWriter>) -> ffi::NativeValueWriteResult {
-    (*writer).finish()
+fn finish_output_port(port: Box<NativeOutputPort>) -> ffi::NativeOutputWriteResult {
+    (*port).finish()
 }
 
 fn stop_rpc_server() {

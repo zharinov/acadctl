@@ -1,29 +1,24 @@
-(progn
-  ((lambda (/ acadctl:value
-              acadctl:outcome
-              acadctl:continue
-              acadctl:stack
-              acadctl:task
-              acadctl:task-kind
-              acadctl:current
-              acadctl:current-type
-              acadctl:depth
-              acadctl:tail
-              acadctl:slow
-              acadctl:fast
-              acadctl:next-slow
-              acadctl:next-fast
-              acadctl:atom-text
-              acadctl:text
-              acadctl:text-offset)
-     (setq acadctl:value {{VALUE_SYMBOL}})
-     (setq {{VALUE_SYMBOL}} nil)
-
-     (setq acadctl:outcome
-       (vl-catch-all-apply
-         '(lambda ()
-            (setq acadctl:continue T)
-            (setq acadctl:stack (list (list 0 acadctl:value 0)))
+(defun {{EMIT_VALUE_FUNCTION}} (acadctl:value /
+                                 acadctl:continue
+                                 acadctl:stack
+                                 acadctl:task
+                                 acadctl:task-kind
+                                 acadctl:current
+                                 acadctl:current-type
+                                 acadctl:depth
+                                 acadctl:tail
+                                 acadctl:slow
+                                 acadctl:fast
+                                 acadctl:next-slow
+                                 acadctl:next-fast
+                                 acadctl:atom-text
+                                 acadctl:text
+                                 acadctl:text-offset)
+  (setq acadctl:continue
+    ({{CALLBACK}} {{BEGIN_VALUE}} nil))
+  (setq acadctl:stack
+    (if acadctl:continue
+      (list (list 0 acadctl:value 0))))
 
             (while (and acadctl:continue acadctl:stack)
               (setq acadctl:task (car acadctl:stack))
@@ -207,19 +202,7 @@
                     ({{CALLBACK}} {{CYCLE}} nil)))
                 (T
                   (acadctl:_invalid-value-task)))
-            T))
-         '()))
+            )
 
-     (setq {{ERRNO_SYMBOL}} (getvar "ERRNO"))
-
-     (if (vl-catch-all-error-p acadctl:outcome)
-       (progn
-         (setq {{STATUS_SYMBOL}} nil)
-         (setq {{ERROR_SYMBOL}}
-           (vl-catch-all-error-message acadctl:outcome)))
-       (progn
-         (setq {{STATUS_SYMBOL}} T)
-         (setq {{ERROR_SYMBOL}} nil)))))
-
-  (setq {{VALUE_SYMBOL}} nil)
-  (princ))
+  ({{CALLBACK}} {{END_VALUE}} nil)
+  nil)

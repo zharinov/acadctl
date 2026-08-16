@@ -213,6 +213,18 @@ impl MutationScheduler {
             .acquire_eval_value_output()
     }
 
+    pub(super) fn acquire_form_output(
+        &self,
+        job_id: MutationJobId,
+        target: NativeDocumentKey,
+    ) -> Option<ValueOutputLease> {
+        self.active
+            .as_ref()
+            .filter(|job| job.job_id == job_id && job.native_target == Some(target))?
+            .operation
+            .acquire_form_output()
+    }
+
     pub(super) fn complete_execution_step(
         &mut self,
         job_id: MutationJobId,

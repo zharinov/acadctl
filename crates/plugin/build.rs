@@ -30,6 +30,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/exec/protocol.rs");
     println!("cargo:rerun-if-changed=lisp/exec/driver.lsp");
     println!("cargo:rerun-if-changed=lisp/exec/evaluator.lsp");
+    println!("cargo:rerun-if-changed=lisp/exec/emitter.lsp");
 }
 
 fn generate_printer_fixture_tests(out_dir: &Path) {

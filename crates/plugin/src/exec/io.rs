@@ -10,16 +10,23 @@ pub(crate) struct ExecIo {
 #[derive(Default)]
 pub(crate) struct ValueBridgeState {
     generation: u64,
-    open: bool,
-    writer_active: bool,
-    writer_claimed: bool,
+    open_kind: Option<ValueOutputKind>,
+    port_active: bool,
+    port_claimed: bool,
     failure: Option<ValueBridgeFailure>,
 }
 
 pub(crate) struct ValueOutputLease {
     io: Arc<ExecIo>,
     generation: u64,
+    kind: ValueOutputKind,
     released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValueOutputKind {
+    Form,
+    EvalValue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,62 +44,70 @@ impl ExecIo {
         self.output.clone()
     }
 
-    pub(super) fn begin_value_output(&self) {
+    pub(super) fn begin_value_output(&self, kind: ValueOutputKind) {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if state.open || state.writer_active {
+        if state.open_kind.is_some() || state.port_active {
             state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
         }
 
         state.generation = state.generation.wrapping_add(1).max(1);
-        state.open = true;
-        state.writer_active = false;
-        state.writer_claimed = false;
+        state.open_kind = Some(kind);
+        state.port_active = false;
+        state.port_claimed = false;
     }
 
-    pub(super) fn acquire_value_output(self: &Arc<Self>) -> Option<ValueOutputLease> {
+    pub(super) fn acquire_value_output(
+        self: &Arc<Self>,
+        kind: ValueOutputKind,
+    ) -> Option<ValueOutputLease> {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if !state.open || state.failure.is_some() || state.writer_active || state.writer_claimed {
+        if state.open_kind != Some(kind)
+            || state.failure.is_some()
+            || state.port_active
+            || state.port_claimed
+        {
             return None;
         }
 
-        state.writer_active = true;
-        state.writer_claimed = true;
+        state.port_active = true;
+        state.port_claimed = true;
         Some(ValueOutputLease {
             io: Arc::clone(self),
             generation: state.generation,
+            kind,
             released: false,
         })
     }
 
-    pub(super) fn close_value_output(&self) -> Option<ValueBridgeFailure> {
+    pub(super) fn close_value_output(&self, kind: ValueOutputKind) -> Option<ValueBridgeFailure> {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if !state.open {
+        if state.open_kind != Some(kind) {
             state
                 .failure
                 .get_or_insert(ValueBridgeFailure::InvalidSequence);
         }
 
-        state.open = false;
+        state.open_kind = None;
 
-        if state.writer_active {
+        if state.port_active {
             state.failure.get_or_insert(ValueBridgeFailure::Abandoned);
         }
 
-        state.writer_active = false;
+        state.port_active = false;
 
-        if !state.writer_claimed {
+        if kind == ValueOutputKind::EvalValue && !state.port_claimed {
             state
                 .failure
                 .get_or_insert(ValueBridgeFailure::MissingValue);
@@ -101,24 +116,29 @@ impl ExecIo {
         state.failure.take()
     }
 
-    fn value_output_is_open(&self, generation: u64) -> bool {
+    fn value_output_is_open(&self, generation: u64, kind: ValueOutputKind) -> bool {
         let state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.open
+        state.open_kind == Some(kind)
             && state.generation == generation
-            && state.writer_active
+            && state.port_active
             && state.failure.is_none()
     }
 
-    fn release_value_output(&self, generation: u64, failure: Option<ValueBridgeFailure>) {
+    fn release_value_output(
+        &self,
+        generation: u64,
+        kind: ValueOutputKind,
+        failure: Option<ValueBridgeFailure>,
+    ) {
         let mut state = self
             .bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if state.generation != generation || !state.open {
+        if state.generation != generation || state.open_kind != Some(kind) {
             return;
         }
 
@@ -126,7 +146,7 @@ impl ExecIo {
             state.failure.get_or_insert(failure);
         }
 
-        state.writer_active = false;
+        state.port_active = false;
     }
 }
 
@@ -136,11 +156,12 @@ impl ValueOutputLease {
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        self.io.value_output_is_open(self.generation)
+        self.io.value_output_is_open(self.generation, self.kind)
     }
 
     pub(crate) fn release(mut self, failure: Option<ValueBridgeFailure>) {
-        self.io.release_value_output(self.generation, failure);
+        self.io
+            .release_value_output(self.generation, self.kind, failure);
         self.released = true;
     }
 }
@@ -148,8 +169,11 @@ impl ValueOutputLease {
 impl Drop for ValueOutputLease {
     fn drop(&mut self) {
         if !self.released {
-            self.io
-                .release_value_output(self.generation, Some(ValueBridgeFailure::Abandoned));
+            self.io.release_value_output(
+                self.generation,
+                self.kind,
+                Some(ValueBridgeFailure::Abandoned),
+            );
         }
     }
 }

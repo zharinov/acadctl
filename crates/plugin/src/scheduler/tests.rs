@@ -1,8 +1,11 @@
-use super::super::bridge::{begin_eval_value, complete_execution_step, take_execution_step};
+use super::super::bridge::{
+    begin_eval_output, begin_form_output, complete_execution_step, take_execution_step,
+};
 use super::super::native::{classify_execution_finalization, interpret};
 use super::super::timer::{BUSY_RETRY_MAX, EXECUTION_START_TIMEOUT, process_due_timers};
 use super::*;
-use crate::exec::value::writer::{ValueEvent, WriteResult};
+use crate::exec::value::event::OutputEvent;
+use crate::exec::value::port::{ValueEvent, WriteResult};
 use crate::exec::{ExecMode, ExecStepResult};
 use crate::ffi::{
     NativeActionKind, NativeExecFinalizationObservation as ExecFinalizationObservation,
@@ -35,7 +38,7 @@ fn execution_finalization_classification_uses_native_facts_in_rust() {
             ..ExecFinalizationObservation::default()
         },
         ExecFinalizationObservation {
-            value_writer_active: true,
+            output_port_active: true,
             ..ExecFinalizationObservation::default()
         },
         ExecFinalizationObservation {
@@ -296,15 +299,23 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
         crate::exec::ExecStepKind::EmitEvalValue
     );
 
-    assert!(!begin_eval_value(action.job_id() + 1, 1, 101).active());
-    assert!(!begin_eval_value(action.job_id(), 2, 101).active());
-    assert!(!begin_eval_value(action.job_id(), 1, 202).active());
-    let mut writer = begin_eval_value(action.job_id(), 1, 101);
-    assert!(writer.active());
-    assert!(!begin_eval_value(action.job_id(), 1, 101).active());
-    assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
-    assert_eq!(writer.finish(), WriteResult::Continue);
-    assert!(!begin_eval_value(action.job_id(), 1, 101).active());
+    assert!(!begin_eval_output(action.job_id() + 1, 1, 101).claimed());
+    assert!(!begin_eval_output(action.job_id(), 2, 101).claimed());
+    assert!(!begin_eval_output(action.job_id(), 1, 202).claimed());
+    let mut port = begin_eval_output(action.job_id(), 1, 101);
+    assert!(port.claimed());
+    assert!(!begin_eval_output(action.job_id(), 1, 101).claimed());
+    assert_eq!(
+        port.write(Ok(OutputEvent::BeginValue)),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::Value(ValueEvent::Integer(12)))),
+        WriteResult::Continue
+    );
+    assert_eq!(port.write(Ok(OutputEvent::EndValue)), WriteResult::Continue);
+    assert_eq!(port.finish(), WriteResult::Continue);
+    assert!(!begin_eval_output(action.job_id(), 1, 101).claimed());
 
     assert!(complete_execution_step(action.job_id(), step_success()));
     assert_eq!(
@@ -321,6 +332,68 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
     }
 
     assert_eq!(rendered, "12\n");
+    stop();
+}
+
+#[tokio::test]
+async fn routes_print_and_label_only_to_the_active_form() {
+    let _test = TEST_LOCK.lock().await;
+    reset(vec![drawing(1, 101, false)]);
+    let id = list().unwrap()[0].id;
+    let (execution, output) =
+        Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
+    let (output, pending) = spawn_test_execution(id, execution, output);
+    tokio::task::yield_now().await;
+
+    let action = take_native_action();
+    assert_eq!(
+        take_execution_step(action.job_id()).kind(),
+        crate::exec::ExecStepKind::BeginUndoGroup
+    );
+    assert!(complete_execution_step(action.job_id(), step_success()));
+    assert_eq!(
+        take_execution_step(action.job_id()).kind(),
+        crate::exec::ExecStepKind::EvaluateForm
+    );
+
+    assert!(!begin_form_output(action.job_id() + 1, 1, 101).claimed());
+    assert!(!begin_form_output(action.job_id(), 2, 101).claimed());
+    let mut port = begin_form_output(action.job_id(), 1, 101);
+    assert!(port.claimed());
+    assert_eq!(
+        port.write(Ok(OutputEvent::Label("layers"))),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::BeginValue)),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::Value(ValueEvent::Integer(12)))),
+        WriteResult::Continue
+    );
+    assert_eq!(port.write(Ok(OutputEvent::EndValue)), WriteResult::Continue);
+    assert_eq!(port.finish(), WriteResult::Continue);
+
+    assert!(complete_execution_step(action.job_id(), step_success()));
+    assert!(!begin_form_output(action.job_id(), 1, 101).claimed());
+    assert_eq!(
+        take_execution_step(action.job_id()).kind(),
+        crate::exec::ExecStepKind::CommitUndoGroup
+    );
+    assert!(complete_execution_step(action.job_id(), step_success()));
+    assert_eq!(
+        take_execution_step(action.job_id()).kind(),
+        crate::exec::ExecStepKind::Done
+    );
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
+
+    assert_eq!(pending.await.unwrap().unwrap(), ExecOutcome::Success);
+    let mut rendered = String::new();
+    while let Some(chunk) = output.next_chunk().await {
+        rendered.push_str(&chunk);
+    }
+    assert_eq!(rendered, "--- layers ---\n12\n");
     stop();
 }
 
@@ -747,9 +820,17 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
         crate::exec::ExecStepKind::EmitEvalValue
     );
 
-    let mut writer = begin_eval_value(action.job_id(), 1, 101);
-    assert_eq!(writer.write(ValueEvent::Integer(12)), WriteResult::Continue);
-    assert_eq!(writer.finish(), WriteResult::Continue);
+    let mut port = begin_eval_output(action.job_id(), 1, 101);
+    assert_eq!(
+        port.write(Ok(OutputEvent::BeginValue)),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::Value(ValueEvent::Integer(12)))),
+        WriteResult::Continue
+    );
+    assert_eq!(port.write(Ok(OutputEvent::EndValue)), WriteResult::Continue);
+    assert_eq!(port.finish(), WriteResult::Continue);
     assert!(complete_execution_step(
         action.job_id(),
         ExecStepResult {

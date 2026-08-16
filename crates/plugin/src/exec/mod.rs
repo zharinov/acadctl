@@ -7,6 +7,7 @@ pub(crate) use crate::ffi::{
 
 mod diagnostic;
 mod io;
+pub(crate) mod label;
 pub(crate) mod lisp;
 mod outcome;
 pub mod output;
@@ -16,7 +17,7 @@ pub mod value;
 
 pub(crate) use diagnostic::{bound_diagnostic, bounded_diagnostic, bounded_native_diagnostic};
 #[cfg(test)]
-pub(crate) use io::{ExecIo, ValueBridgeState};
+pub(crate) use io::{ExecIo, ValueBridgeState, ValueOutputKind};
 pub(crate) use io::{ValueBridgeFailure, ValueOutputLease};
 pub use outcome::{
     DrawingOutcome, ExecFailure, ExecMode, ExecOutcome, SourceLocation, SourceValidationError,

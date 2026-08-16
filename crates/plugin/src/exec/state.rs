@@ -5,7 +5,7 @@ use acadctl_rpc::SourceName;
 use bytes::Bytes;
 
 use super::diagnostic::{append_diagnostic, bounded_diagnostic};
-use super::io::{ExecIo, ValueBridgeState, ValueOutputLease};
+use super::io::{ExecIo, ValueBridgeState, ValueOutputKind, ValueOutputLease};
 use super::outcome::{
     DrawingOutcome, ExecFailure, ExecMode, ExecOutcome, SourceLocation, SourceValidationError,
 };
@@ -160,9 +160,15 @@ impl Exec {
             && self.unwind.is_none()
     }
 
+    pub(crate) fn acquire_form_output(&self) -> Option<ValueOutputLease> {
+        matches!(self.phase, Phase::AwaitingEvaluateForm { .. })
+            .then(|| self.io.acquire_value_output(ValueOutputKind::Form))
+            .flatten()
+    }
+
     pub(crate) fn acquire_eval_value_output(&self) -> Option<ValueOutputLease> {
         matches!(self.phase, Phase::AwaitingEmitEvalValue)
-            .then(|| self.io.acquire_value_output())
+            .then(|| self.io.acquire_value_output(ValueOutputKind::EvalValue))
             .flatten()
     }
 
@@ -293,6 +299,7 @@ impl Exec {
                             }
 
                             self.form_handed_off = true;
+                            self.io.begin_value_output(ValueOutputKind::Form);
 
                             return NativeExecStep::form(
                                 self.source.clone(),
@@ -320,7 +327,7 @@ impl Exec {
                     }
                 }
                 Phase::EmitEvalValue => {
-                    self.io.begin_value_output();
+                    self.io.begin_value_output(ValueOutputKind::EvalValue);
                     self.phase = Phase::AwaitingEmitEvalValue;
 
                     return NativeExecStep::new(ExecStepKind::EmitEvalValue);
@@ -393,11 +400,35 @@ impl Exec {
                 line,
                 column,
             } => {
+                let bridge_failure = self.io.close_value_output(ValueOutputKind::Form);
+
                 if self.mode == ExecMode::Eval && result.succeeded() {
                     self.value_retained = true;
                 }
 
-                if !result.succeeded() {
+                if result.primary_failed() {
+                    self.begin_unwind(UnwindCause::Failure(ExecFailure {
+                        message: result.into_message("form evaluation failed"),
+                        form_index: Some(index),
+                        location: Some(SourceLocation::new(self.source_name.clone(), line, column)),
+                        drawing_outcome: DrawingOutcome::Unknown,
+                        drawing_error: None,
+                    }));
+                } else if let Some(bridge_failure) = bridge_failure {
+                    let mut message = bridge_failure.message().to_owned();
+
+                    if let Some(cleanup) = result.bridge_symbols_clear_message() {
+                        append_diagnostic(&mut message, &cleanup);
+                    }
+
+                    self.begin_unwind(UnwindCause::Failure(ExecFailure {
+                        message,
+                        form_index: Some(index),
+                        location: Some(SourceLocation::new(self.source_name.clone(), line, column)),
+                        drawing_outcome: DrawingOutcome::Unknown,
+                        drawing_error: None,
+                    }));
+                } else if !result.succeeded() {
                     self.begin_unwind(UnwindCause::Failure(ExecFailure {
                         message: result.into_message("form evaluation failed"),
                         form_index: Some(index),
@@ -434,7 +465,7 @@ impl Exec {
                 }
             }
             Phase::AwaitingEmitEvalValue => {
-                let bridge_failure = self.io.close_value_output();
+                let bridge_failure = self.io.close_value_output(ValueOutputKind::EvalValue);
                 let failure = if result.primary_failed() {
                     Some(result.into_message("could not emit the eval result"))
                 } else if let Some(bridge_failure) = bridge_failure {
@@ -587,8 +618,10 @@ impl Exec {
         let message = result.into_message("execution could not continue safely");
         let phase = self.phase;
 
-        if phase == Phase::AwaitingEmitEvalValue {
-            let _ = self.io.close_value_output();
+        if matches!(phase, Phase::AwaitingEvaluateForm { .. }) {
+            let _ = self.io.close_value_output(ValueOutputKind::Form);
+        } else if phase == Phase::AwaitingEmitEvalValue {
+            let _ = self.io.close_value_output(ValueOutputKind::EvalValue);
         }
 
         let existing = self.outcome.take().or_else(|| {

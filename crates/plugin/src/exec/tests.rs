@@ -1,7 +1,8 @@
 use bytes::Bytes;
 
 use super::diagnostic::append_diagnostic;
-use super::value::writer::{NativeValueWriter, ValueEvent, WriteResult};
+use super::value::event::OutputEvent;
+use super::value::port::{NativeOutputPort, ValueEvent, WriteResult};
 use super::*;
 
 fn source_name(value: &str) -> acadctl_rpc::SourceName {
@@ -111,6 +112,18 @@ fn embedded_execution_driver_is_one_complete_definition() {
 }
 
 #[test]
+fn embedded_driver_defines_the_public_output_contract() {
+    let source = protocol::execution_driver_source();
+
+    assert!(source.contains("(defun acadctl:print (acadctl:value"));
+    assert!(source.contains("(defun acadctl:label (acadctl:text)"));
+    assert!(source.contains("(defun acadctl:_emit-value (acadctl:value"));
+    assert!(source.contains("acadctl:_output-event"));
+    assert!(source.contains("acadctl:value)"));
+    assert!(source.contains("nil)"));
+}
+
+#[test]
 fn yields_exact_forms_then_commits() {
     let mut execution = Exec::new(
         ExecMode::Exec,
@@ -157,9 +170,17 @@ fn eval_retains_its_form_value_and_emits_it_only_after_commit() {
     let lease = execution
         .acquire_eval_value_output()
         .expect("the post-commit value epoch is open");
-    let mut writer = NativeValueWriter::eval_value(lease);
-    assert_eq!(writer.write(ValueEvent::Integer(3)), WriteResult::Continue);
-    assert_eq!(writer.finish(), WriteResult::Continue);
+    let mut port = NativeOutputPort::eval_value(lease);
+    assert_eq!(
+        port.write(Ok(OutputEvent::BeginValue)),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::Value(ValueEvent::Integer(3)))),
+        WriteResult::Continue
+    );
+    assert_eq!(port.write(Ok(OutputEvent::EndValue)), WriteResult::Continue);
+    assert_eq!(port.finish(), WriteResult::Continue);
     assert!(execution.complete_step(success()));
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::Done);
@@ -179,7 +200,58 @@ fn exec_forms_never_request_value_retention() {
 }
 
 #[test]
-fn a_missing_post_commit_writer_is_a_committed_failure() {
+fn a_private_output_protocol_violation_rolls_back_its_form() {
+    let (mut execution, _output) = Exec::new(
+        ExecMode::Exec,
+        source_name("batch.lsp"),
+        "(acadctl:print value)".into(),
+    )
+    .unwrap();
+    begin(&mut execution);
+    assert_eq!(execution.take_step().kind(), ExecStepKind::EvaluateForm);
+
+    let lease = execution
+        .acquire_form_output()
+        .expect("form output is open while AutoLISP runs");
+    let mut port = NativeOutputPort::form(lease);
+    assert_eq!(
+        port.write(Ok(OutputEvent::BeginValue)),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::Value(ValueEvent::Integer(1)))),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::Value(ValueEvent::Integer(2)))),
+        WriteResult::Continue
+    );
+    assert_eq!(
+        port.write(Ok(OutputEvent::EndValue)),
+        WriteResult::InvalidSequence
+    );
+    assert_eq!(port.finish(), WriteResult::InvalidSequence);
+
+    assert!(execution.complete_step(success()));
+    assert_eq!(
+        execution.take_step().kind(),
+        ExecStepKind::RollbackUndoGroup
+    );
+    assert!(execution.complete_step(success()));
+    assert_eq!(execution.take_step().kind(), ExecStepKind::Done);
+
+    let Some(ExecOutcome::Failure(failure)) = execution.outcome() else {
+        panic!("expected explicit output failure");
+    };
+    assert_eq!(
+        failure.message,
+        "the AutoLISP output bridge emitted an invalid value sequence"
+    );
+    assert_eq!(failure.drawing_outcome, DrawingOutcome::RolledBack);
+}
+
+#[test]
+fn a_missing_post_commit_output_port_is_a_committed_failure() {
     let mut execution = eval_through_commit();
     assert_eq!(execution.take_step().kind(), ExecStepKind::EmitEvalValue);
     assert!(execution.complete_step(success()));
@@ -205,23 +277,23 @@ fn a_missing_post_commit_writer_is_a_committed_failure() {
 fn a_post_commit_native_failure_never_requests_rollback() {
     let mut execution = eval_through_commit();
     assert_eq!(execution.take_step().kind(), ExecStepKind::EmitEvalValue);
-    assert!(execution.complete_step(native_error("value visitor failed", -5001)));
+    assert!(execution.complete_step(native_error("value emitter failed", -5001)));
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::Done);
     let Some(ExecOutcome::Failure(failure)) = execution.outcome() else {
         panic!("expected committed serialization failure");
     };
 
-    assert_eq!(failure.message, "value visitor failed");
+    assert_eq!(failure.message, "value emitter failed");
     assert_eq!(failure.form_index, Some(1));
     assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
 }
 
 #[test]
-fn post_commit_failure_keeps_visitor_and_cleanup_evidence() {
+fn post_commit_failure_keeps_emitter_and_cleanup_evidence() {
     let mut execution = eval_through_commit();
     assert_eq!(execution.take_step().kind(), ExecStepKind::EmitEvalValue);
-    assert!(execution.complete_step(with_cleanup(lisp_error("value visitor failed", 7), -5001,)));
+    assert!(execution.complete_step(with_cleanup(lisp_error("value emitter failed", 7), -5001,)));
 
     assert_eq!(execution.take_step().kind(), ExecStepKind::Done);
     let Some(ExecOutcome::Failure(failure)) = execution.outcome() else {
@@ -230,7 +302,7 @@ fn post_commit_failure_keeps_visitor_and_cleanup_evidence() {
 
     assert_eq!(
         failure.message,
-        "value visitor failed; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
+        "value emitter failed; could not clear the reserved AutoLISP execution bridge symbols (native status -5001)"
     );
     assert_eq!(failure.drawing_outcome, DrawingOutcome::Committed);
 }

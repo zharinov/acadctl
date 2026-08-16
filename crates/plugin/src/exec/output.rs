@@ -8,7 +8,7 @@ use std::{
 
 use tokio::sync::Notify;
 
-pub use crate::ffi::NativeValueWriteResult as EmitResult;
+pub use crate::ffi::NativeOutputWriteResult as EmitResult;
 
 pub const OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
 pub const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;

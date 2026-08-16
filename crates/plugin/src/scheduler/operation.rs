@@ -218,6 +218,10 @@ impl Operation {
         self.execution().and_then(Exec::acquire_eval_value_output)
     }
 
+    pub(super) fn acquire_form_output(&self) -> Option<ValueOutputLease> {
+        self.execution().and_then(Exec::acquire_form_output)
+    }
+
     pub(super) fn complete_execution_step(&mut self, result: ExecStepResult) -> bool {
         self.execution_mut()
             .is_some_and(|execution| execution.complete_step(result))

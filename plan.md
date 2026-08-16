@@ -30,7 +30,7 @@ AutoLISP remains fully capable code. `acadctl` is not a sandbox. Agent instructi
 | Command | Meaning | Successful stdout |
 | --- | --- | --- |
 | `acadctl eval <id> [FORM \| -f FILE]` | Evaluate exactly one top-level AutoLISP form. | The form's readable value, followed by a newline. |
-| `acadctl exec <id> [FORMS \| -f FILE]` | Execute zero or more top-level AutoLISP forms as one batch. | Nothing. |
+| `acadctl exec <id> [FORMS \| -f FILE]` | Execute zero or more top-level AutoLISP forms as one batch. | Nothing unless the source calls `acadctl:print` or `acadctl:label`. |
 | `acadctl undo <id>` | Undo the drawing's last AutoCAD history step. | Nothing. |
 | `acadctl redo <id>` | Redo the drawing's next AutoCAD history step. | Nothing. |
 | `acadctl kill [pid] [--force]` | Terminate an AutoCAD instance, not an execution request. | Nothing. |
@@ -139,7 +139,18 @@ Exact form spans are necessary for three reasons: sequential execution, cancella
 
 ## Output
 
-There is no public request-routed AutoLISP output primitive. `exec` is silent on success. A future data-output primitive requires a separate design.
+`acadctl:print` and `acadctl:label` explicitly write to the CLI request that is executing the current form:
+
+```lisp
+(acadctl:label "layers before")
+(acadctl:print layers)
+```
+
+`acadctl:print` accepts one value, renders it through the same readable deterministic value path as `eval`, appends the value printer's newline, and returns the original value. Calls are ordered and multiple calls may occur in one form or batch.
+
+`acadctl:label` accepts one nonempty UTF-8 string of at most 4 KiB with no control characters, renders it as `--- text ---` followed by a newline, and returns `nil`. It is a bounded separator, not a general text stream.
+
+Both functions are active only inside the current `eval` or `exec` request. Their output can become visible before the execution commits; a later failure still rolls the drawing back but does not retract already observed output. `exec` remains silent when neither function is called. Ordinary AutoLISP `print`, `prin1`, `princ`, `prompt`, and file output retain their normal AutoCAD destinations.
 
 ### Value printer
 
@@ -962,7 +973,7 @@ The post-commit naming sweep keeps `MutationScheduler`, `MutationJob`, `Mutation
 
 C++ uses `PendingDocumentDispatch` for the one queued or finalizing document-context handoff. Its registered ARX command and callbacks name `HistoryCommand`; execution names `ExecutionDriver`, `advance`, and `StagedFormKind`. The reserved symbol is `acadctl:*staged-form*`, not a generic program. `acadctl:_drive-execution` owns only the Lisp loop, while `acadctl:_advance-execution` requests the next Rust-selected stage. These names expose the boundary: C++ and Lisp move bounded physical data and lifecycle facts, while Rust selects steps and outcomes.
 
-Failure names state which safety proof failed: `DocumentContextFailed`, `DocumentContextRestoreFailed`, `ExecutionBridgeFinalizationFailed`, `EvaluatorSymbolsClearFailed`, and `NativeMutationStateUnknown`. Document publication is `publish_document_snapshot` at FFI, `replace_document_snapshot` in the scheduler, and `replace_snapshot` in `DocumentRegistry`; none suggests that Rust replaces live AutoCAD documents. The embedded files are `form-evaluator.lsp` and `eval-value-visitor.lsp`, avoiding a future collision between the private evaluator and a public `acadctl.lsp` standard library.
+Failure names state which safety proof failed: `DocumentContextFailed`, `DocumentContextRestoreFailed`, `ExecutionBridgeFinalizationFailed`, `EvaluatorSymbolsClearFailed`, and `NativeMutationStateUnknown`. Document publication is `publish_document_snapshot` at FFI, `replace_document_snapshot` in the scheduler, and `replace_snapshot` in `DocumentRegistry`; none suggests that Rust replaces live AutoCAD documents. The embedded files are `evaluator.lsp` and `emitter.lsp`, avoiding a future collision between the private execution bridge and a public `acadctl.lsp` standard library.
 
 The sweep retains `CommitUndoGroup`, `AwaitingCommitUndoGroup`, `PostCommitCancelled`, and `DrawingOutcome::Committed`. In Rust these names mark the semantic cancellation and outcome boundary reached when `_UNDO End` succeeds; renaming them to the literal command would obscure that role. It also retains the concise `HistoryRequest`, `HistoryResponse`, `Operation::History`, and `HistoryDirection`: each public invocation already means exactly one fixed drawing-wide step, so adding `Step` everywhere would not resolve an ambiguity. This entry supersedes the implementation names listed in I-054 and any remaining provenance-oriented naming rationale in I-003 and I-004; I-068 already supersedes that product architecture.
 
@@ -1006,7 +1017,7 @@ The shared AutoLISP slots are execution-bridge symbols, not evaluator-only state
 
 Rust's mutating wake transition is `try_claim_native_action_wake`, not a predicate. Poisoned scheduler access is `SchedulerStateUnavailable`. The first-form boundary is represented by `form_handed_off`, `has_handed_off_form`, and `execution_has_not_handed_off_form`, because Rust can prove that it yielded `EvaluateForm` but cannot claim native evaluation already began. The associated five-second timer is consequently the execution-start deadline, beginning at accepted admission and ending at that handoff.
 
-Message-scoped request fields remain `id`, and `NativeExecutionStep` and `NativeValueWriter` retain `Native` because they are opaque work objects crossing the CXX boundary. Renaming those objects or every request field was rejected as churn that would erase useful boundary context without changing ownership.
+Message-scoped request fields remain `id`, and `NativeExecutionStep` retains `Native` because it is an opaque work object crossing the CXX boundary. Renaming that object or every request field was rejected as churn that would erase useful boundary context without changing ownership. I-083 replaces the output-object naming and ownership recorded at this checkpoint.
 
 ### 2026-08-15 — I-078: final macOS evidence is scoped to the implemented bridge and measured bounds
 
@@ -1043,3 +1054,15 @@ The value printer uses a fixed 100-display-column, two-space layout. A list rema
 Layout lookahead retains only the unresolved group prefix: once its flat width cannot fit, the group breaks and output resumes incrementally. One incoming atom fragment remains bounded by the existing 16 KiB bridge limit. At nesting whose indentation reaches the print width, deeper groups stay flat; this prevents adversarial 65,536-level input from turning indentation into quadratic output while preserving the existing traversal-depth boundary and cancellable streaming.
 
 Terminal width detection, caller-selected widths, AutoLISP form-specific indentation, and whole-value buffering were rejected. Eval output is deterministic across terminals and remains a value data format rather than a source-code formatter.
+
+### 2026-08-16 — I-083: explicit output separates values from labels
+
+This entry supersedes the explicit-output and active-writer ownership details in I-041, I-070, I-073, I-077, and I-080.
+
+`acadctl:print` is the sole explicit value-output function. It accepts exactly one value, reuses the same Lisp emitter and Rust pretty-printer as implicit `eval` output, and returns its argument like AutoLISP `print`. It does not add a display-format mode or cross a general value through the native argument ABI.
+
+`acadctl:label` accepts exactly one bounded single-line string, renders a stable `--- text ---` separator, and returns `nil`. Each executing form owns one Rust output port that permits ordered repeated print and label calls; post-commit eval output uses a separate port that requires exactly one value. Both public functions use one loaded iterative emitter and the single private `acadctl:_output-event` callback. C++ owns the port only for the dynamic extent of the staged form and forwards bounded event facts, while Rust owns event validation, formatting, output state, and failure meaning.
+
+The port is claimed once when the form starts, so public calls do not re-enter scheduler routing or stage and evaluate another program. Form completion consumes the port through the ordinary execution-step path. Invalid private event sequences are internal bridge violations rather than malformed public output; they fail an otherwise successful form so the existing execution unwind decides drawing rollback.
+
+Mirroring the complete AutoLISP printing family, variadic output, arbitrary raw lines, optional file descriptors, and treating visible pre-commit output as commit evidence were rejected. The public functions select the requesting CLI as their destination, while ordinary AutoLISP printing keeps its AutoCAD and file behavior.

@@ -172,7 +172,7 @@ impl NativeExecFinalizationObservation {
         self.undo_group_may_be_open
             || self.bridge_symbols_may_be_retained
             || self.staged_form_may_be_retained
-            || self.value_writer_active
+            || self.output_port_active
             || self.terminal_cleanup_failed
     }
 
@@ -180,7 +180,7 @@ impl NativeExecFinalizationObservation {
         (self.bridge_symbols_may_be_retained || self.terminal_cleanup_failed)
             && !self.undo_group_may_be_open
             && !self.staged_form_may_be_retained
-            && !self.value_writer_active
+            && !self.output_port_active
     }
 }
 

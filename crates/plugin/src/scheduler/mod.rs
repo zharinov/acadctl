@@ -6,7 +6,8 @@ mod queue;
 mod timer;
 
 pub(crate) use bridge::{
-    abandon_execution, begin_eval_value, complete_execution_step, take_execution_step,
+    abandon_execution, begin_eval_output, begin_form_output, complete_execution_step,
+    take_execution_step,
 };
 pub(crate) use error::Error;
 pub(crate) use native::NativeAction;

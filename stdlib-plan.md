@@ -19,13 +19,13 @@ This promise does not include screenshots, rendered pixels, application chrome, 
 The repository state on 2026-08-14 provides the execution substrate, not the proposed library:
 
 - The CLI exposes `ps`, `open`, `save`, `undo`, `redo`, `close`, `eval`, and `exec` in [main.rs](crates/cli/src/main.rs).
-- `eval` evaluates one top-level form and prints its value. `exec` runs zero or more forms without implicit value output. Each nonempty request is one ordinary AutoCAD undo group.
+- `eval` evaluates one top-level form and prints its value. `exec` runs zero or more forms without implicit value output. Source may explicitly emit values with `acadctl:print` and separators with `acadctl:label`. Each nonempty request is one ordinary AutoCAD undo group.
 - `save` is the durable checkpoint. `undo` and `redo` perform one ordinary drawing-history action without acadctl-owned provenance.
-- There are no public `acadctl:*` Lisp functions. `acadctl:_value-event` is private `eval` result plumbing in [host.cpp](crates/plugin/native/host.cpp).
+- `acadctl:print` emits one readable value through the requesting CLI and returns that value. `acadctl:label` emits one bounded single-line separator and returns `nil`. Both use the form-scoped Rust output port through the private `acadctl:_output-event` bridge in [host.cpp](crates/plugin/native/host.cpp).
 - The existing value bridge carries lists, dotted pairs, symbols, strings, integers, reals, points, entity names, selection sets, VLA objects, files, functions, error objects, and unsupported native values. See [printer.rs](crates/plugin/src/exec/value/printer.rs).
 - The four-character nonzero hexadecimal public document ID is process-local and remains stable while the same native document token stays open. The internal target also includes a database token in [doc.rs](crates/plugin/src/doc.rs). A database replacement can preserve the document ID while invalidating every object handle.
 
-This plan proposes every `acadctl:*` function below unless it identifies the function as existing.
+This plan proposes every other `acadctl:*` function below unless it identifies the function as existing.
 
 ## Agent interaction model
 
