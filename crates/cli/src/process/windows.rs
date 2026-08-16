@@ -211,3 +211,35 @@ pub(super) fn discover() -> Vec<AutoCadInstance> {
     processes.sort_unstable_by_key(AutoCadInstance::instance_id);
     processes
 }
+
+pub(super) fn launch() -> Result<Option<InstanceId>, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::{ffi::OsStr, ptr};
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    let operation = wide("open");
+    let executable = wide("acad.exe");
+    // SAFETY: all strings are terminated UTF-16 buffers that remain live for the call, and no
+    // window or working-directory pointers are supplied.
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            executable.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+
+    if result as isize > 32 {
+        Ok(None)
+    } else {
+        Err("Could not start AutoCAD".into())
+    }
+}

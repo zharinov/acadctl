@@ -19,3 +19,7 @@ impl AutoCadInstance {
 pub(super) fn discover() -> Vec<AutoCadInstance> {
     Vec::new()
 }
+
+pub(super) fn launch() -> Result<Option<InstanceId>, String> {
+    Err("Starting AutoCAD is unsupported on this platform".into())
+}

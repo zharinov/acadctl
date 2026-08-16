@@ -53,6 +53,10 @@ impl InstanceSnapshot {
         self.instances.iter()
     }
 
+    pub fn launch() -> Result<Option<InstanceId>, String> {
+        process::launch()
+    }
+
     pub fn select(
         &self,
         requested_instance_id: Option<InstanceId>,

@@ -1,11 +1,18 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use acadctl_rpc::{DrawingPath, InstanceId, OpenRequest};
+use acadctl_rpc::{DrawingPath, InstanceId, OpenRequest, OpenResponse};
+use tokio::time::{Instant, sleep, timeout};
+use tonic::{Code, Status};
 
 use crate::instance::{Instance, InstanceSnapshot};
 
 use super::{fail, parse_drawing_id, query_error_message, request_error_message};
+
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STARTUP_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     let path = match DrawingPath::canonicalize(&path) {
@@ -13,17 +20,9 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
         Err(error) => return fail(error.to_string()),
     };
 
-    let instance_id = match instance_id {
-        Some(instance_id) => instance_id,
-        None => {
-            let snapshot = InstanceSnapshot::discover();
-            let instances = snapshot.query_instances().await;
-
-            match select_instance(&instances) {
-                Ok(instance_id) => instance_id,
-                Err(error) => return fail(error),
-            }
-        }
+    let (instance_id, launched_by_open) = match resolve_instance(instance_id).await {
+        Ok(instance) => instance,
+        Err(error) => return fail(error),
     };
 
     let mut client = match super::connect_drawings(instance_id).await {
@@ -31,8 +30,9 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
         Err(error) => return fail(error),
     };
 
-    let opened = match client.open(OpenRequest::from(path)).await {
-        Ok(response) => response.into_inner(),
+    let request = OpenRequest::from(path);
+    let opened = match open_when_ready(&mut client, request, launched_by_open).await {
+        Ok(response) => response,
         Err(status) => return fail(request_error_message("open the DWG file", None, status)),
     };
 
@@ -49,40 +49,138 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn select_instance(instances: &[Instance]) -> Result<InstanceId, String> {
-    if instances.is_empty() {
-        return Err("AutoCAD is not running".into());
+async fn resolve_instance(instance_id: Option<InstanceId>) -> Result<(InstanceId, bool), String> {
+    if let Some(instance_id) = instance_id {
+        return Ok((instance_id, false));
     }
 
+    let snapshot = InstanceSnapshot::discover();
+    let running = snapshot
+        .iter()
+        .map(|instance| instance.instance_id())
+        .collect::<Vec<_>>();
+
+    if running.is_empty() {
+        let launched = InstanceSnapshot::launch()?;
+
+        return wait_for_launched_instance(launched)
+            .await
+            .map(|instance_id| (instance_id, true));
+    }
+
+    let instances = snapshot.query_instances().await;
+    select_instance(&instances, &running).map(|instance_id| (instance_id, false))
+}
+
+async fn open_when_ready(
+    client: &mut super::DrawingClient,
+    request: OpenRequest,
+    launched_by_open: bool,
+) -> Result<OpenResponse, Status> {
+    let retry_until = launched_by_open.then(|| Instant::now() + STARTUP_OPEN_TIMEOUT);
+
+    loop {
+        match client.open(request.clone()).await {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status)
+                if retry_until.is_some_and(|deadline| Instant::now() < deadline)
+                    && startup_open_retryable(&status) =>
+            {
+                sleep(STARTUP_POLL_INTERVAL).await;
+            }
+            Err(status) => return Err(status),
+        }
+    }
+}
+
+fn startup_open_retryable(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unknown
+            | Code::DeadlineExceeded
+            | Code::FailedPrecondition
+            | Code::Internal
+            | Code::Unavailable
+    )
+}
+
+async fn wait_for_launched_instance(launched: Option<InstanceId>) -> Result<InstanceId, String> {
+    timeout(STARTUP_TIMEOUT, async {
+        loop {
+            let instances = InstanceSnapshot::discover().query_instances().await;
+
+            match select_launched_instance(&instances, launched)? {
+                Some(instance_id) => return Ok(instance_id),
+                None => sleep(STARTUP_POLL_INTERVAL).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "AutoCAD did not become ready within {} seconds",
+            STARTUP_TIMEOUT.as_secs()
+        ))
+    })
+}
+
+fn select_launched_instance(
+    instances: &[Instance],
+    launched: Option<InstanceId>,
+) -> Result<Option<InstanceId>, String> {
+    let Some(launched) = launched else {
+        return select_available_instance(instances);
+    };
+
+    Ok(instances
+        .iter()
+        .find(|instance| instance.instance_id == launched && instance.drawings.is_ok())
+        .map(|instance| instance.instance_id))
+}
+
+fn select_instance(instances: &[Instance], running: &[InstanceId]) -> Result<InstanceId, String> {
+    if let Some(instance_id) = select_available_instance(instances)? {
+        return Ok(instance_id);
+    }
+
+    if let Some((instance, error)) = instances.iter().find_map(|instance| {
+        instance
+            .drawings
+            .as_ref()
+            .err()
+            .map(|error| (instance.instance_id, error))
+    }) {
+        return Err(query_error_message(instance, error));
+    }
+
+    match running {
+        [instance_id] => Ok(*instance_id),
+        [] => Err("AutoCAD is not running".into()),
+        instances => Err(ambiguous_instances(instances)),
+    }
+}
+
+fn select_available_instance(instances: &[Instance]) -> Result<Option<InstanceId>, String> {
     let available = instances
         .iter()
         .filter(|instance| instance.drawings.is_ok())
+        .map(|instance| instance.instance_id)
         .collect::<Vec<_>>();
 
     match available.as_slice() {
-        [instance] => Ok(instance.instance_id),
-        [] => Err(instances
-            .iter()
-            .find_map(|instance| {
-                instance
-                    .drawings
-                    .as_ref()
-                    .err()
-                    .map(|error| (instance.instance_id, error))
-            })
-            .map(|(instance, error)| query_error_message(instance, error))
-            .unwrap_or_else(|| "No AutoCAD instance is available".into())),
-        instances => {
-            let instance_ids = instances
-                .iter()
-                .map(|instance| instance.instance_id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(format!(
-                "More than one AutoCAD instance is running ({instance_ids})"
-            ))
-        }
+        [instance_id] => Ok(Some(*instance_id)),
+        [] => Ok(None),
+        instances => Err(ambiguous_instances(instances)),
     }
+}
+
+fn ambiguous_instances(instances: &[InstanceId]) -> String {
+    let instance_ids = instances
+        .iter()
+        .map(InstanceId::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("More than one AutoCAD instance is running ({instance_ids})")
 }
 
 #[cfg(test)]
@@ -104,7 +202,11 @@ mod tests {
         ];
 
         assert_eq!(
-            select_instance(&instances).unwrap(),
+            select_instance(
+                &instances,
+                &[InstanceId::new(123).unwrap(), InstanceId::new(456).unwrap()]
+            )
+            .unwrap(),
             InstanceId::new(456).unwrap()
         );
     }
@@ -123,8 +225,46 @@ mod tests {
         ];
 
         assert_eq!(
-            select_instance(&instances).unwrap_err(),
+            select_instance(
+                &instances,
+                &[InstanceId::new(123).unwrap(), InstanceId::new(456).unwrap()]
+            )
+            .unwrap_err(),
             "More than one AutoCAD instance is running (007B, 01C8)"
+        );
+    }
+
+    #[test]
+    fn selects_a_running_instance_while_its_plugin_is_starting() {
+        let instance_id = InstanceId::new(123).unwrap();
+
+        assert_eq!(select_instance(&[], &[instance_id]).unwrap(), instance_id);
+    }
+
+    #[test]
+    fn waits_for_the_instance_returned_by_the_launcher() {
+        let launched = InstanceId::new(456).unwrap();
+        let mut instances = vec![
+            Instance {
+                instance_id: InstanceId::new(123).unwrap(),
+                drawings: Ok(vec![]),
+            },
+            Instance {
+                instance_id: launched,
+                drawings: Err(QueryError::CannotConnect),
+            },
+        ];
+
+        assert_eq!(
+            select_launched_instance(&instances, Some(launched)),
+            Ok(None)
+        );
+
+        instances[1].drawings = Ok(vec![]);
+
+        assert_eq!(
+            select_launched_instance(&instances, Some(launched)),
+            Ok(Some(launched))
         );
     }
 }

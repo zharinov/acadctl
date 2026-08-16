@@ -18,9 +18,11 @@ tokio = { workspace = true, features = ["signal"] }
 tonic.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
 libc.workspace = true
 objc2.workspace = true
-objc2-app-kit.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSWorkspace", "block2"] }
+objc2-foundation = { workspace = true, features = ["NSDate", "NSRunLoop"] }
 sysinfo.workspace = true
 
 [target.'cfg(windows)'.dependencies]
