@@ -6,6 +6,7 @@ targets = [
 all-features = true
 
 [advisories]
+db-path = "target/cargo-deny/advisory-dbs"
 ignore = []
 
 [licenses]

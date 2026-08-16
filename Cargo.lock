@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "acadctl"
-version = "0.7.2"
+version = "0.1.0"
 dependencies = [
  "acadctl-lisp",
  "acadctl-rpc",
@@ -24,11 +24,11 @@ dependencies = [
 
 [[package]]
 name = "acadctl-lisp"
-version = "0.7.2"
+version = "0.1.0"
 
 [[package]]
 name = "acadctl-plugin"
-version = "0.7.2"
+version = "0.1.0"
 dependencies = [
  "acadctl-lisp",
  "acadctl-rpc",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "acadctl-rpc"
-version = "0.7.2"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "camino",

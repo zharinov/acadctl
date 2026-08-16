@@ -1,0 +1,113 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+if test "$#" -gt 1; then
+    echo "usage: $0 [dev|release]" >&2
+    exit 2
+fi
+
+# shellcheck source=bin/config-macos
+. "$repo_root/bin/config-macos"
+acadctl_configure_mac "$repo_root"
+
+rust_target="$repo_root/target/rust-objectarx"
+configuration=${1:-dev}
+
+case "$configuration" in
+    dev)
+        cargo_profile=debug
+        cargo_args=
+        ;;
+    release)
+        cargo_profile=release
+        cargo_args=--release
+        ;;
+    *)
+        echo "usage: $0 [dev|release]" >&2
+        exit 2
+        ;;
+esac
+
+build_root="$repo_root/target/objectarx/build/mac-$acadctl_arch/$configuration"
+build_bundle="$build_root/acadctl.bundle"
+build_cli="$build_root/acadctl"
+build_plugin="$build_bundle/Contents/acadctl-plugin.bundle"
+build_executable="$build_plugin/Contents/MacOS/acadctl-plugin"
+out_root="$repo_root/out"
+bundle="$out_root/acadctl.bundle"
+cli="$out_root/acadctl"
+lock_dir="$repo_root/target/objectarx/.build-macos.lock"
+
+package_version=$(acadctl_workspace_version)
+test -n "$package_version" || {
+    echo "could not read the acadctl workspace version" >&2
+    exit 1
+}
+autocad_series=$(acadctl_autocad_series)
+
+mkdir -p "$(dirname -- "$lock_dir")"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+    echo "another macOS build is already running" >&2
+    exit 1
+fi
+
+cleanup() {
+    rmdir "$lock_dir" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+cd "$repo_root"
+MACOSX_DEPLOYMENT_TARGET="$acadctl_deployment_target" \
+    CARGO_TARGET_DIR="$rust_target" \
+    cargo build --workspace --locked --target "$acadctl_rust_target" $cargo_args
+
+rm -rf "$build_bundle"
+mkdir -p "$build_plugin/Contents/MacOS"
+cp "$repo_root/crates/plugin/native/Info.plist" "$build_plugin/Contents/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$package_version" \
+    "$build_plugin/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$package_version" \
+    "$build_plugin/Contents/Info.plist"
+sed \
+    -e "s/AppVersion=\"[^\"]*\"/AppVersion=\"$package_version\"/" \
+    -e "s/SeriesMin=\"[^\"]*\"/SeriesMin=\"$autocad_series\"/" \
+    -e "s/SeriesMax=\"[^\"]*\"/SeriesMax=\"$autocad_series\"/" \
+    "$repo_root/crates/plugin/native/PackageContents.xml" \
+    >"$build_bundle/PackageContents.xml"
+cp "$repo_root/crates/plugin/native/loader.lsp" "$build_bundle/Contents/loader.lsp"
+cp "$rust_target/acadctl-generated/$cargo_profile/driver.lsp" "$build_bundle/Contents/driver.lsp"
+
+clang++ \
+    -std=c++17 \
+    -arch "$acadctl_arch" \
+    -mmacosx-version-min="$acadctl_deployment_target" \
+    -bundle \
+    -isystem "$acadctl_sdk_root/inc" \
+    -isystem "$rust_target/cxxbridge" \
+    -L"$acadctl_autocad_root/Contents/Frameworks" \
+    -F"$acadctl_autocad_root/Contents/Frameworks" \
+    "$repo_root/crates/plugin/native/entry.cpp" \
+    "$repo_root/crates/plugin/native/host.cpp" \
+    "$rust_target/$acadctl_rust_target/$cargo_profile/libacadctl_plugin.a" \
+    -lacfirst \
+    -lacdb \
+    -laccore \
+    -lAcPal \
+    -framework Foundation \
+    -lobjc \
+    -o "$build_executable"
+
+cp "$rust_target/$acadctl_rust_target/$cargo_profile/acadctl" "$build_cli"
+
+codesign --force --sign - "$build_plugin"
+codesign --force --sign - "$build_cli"
+
+mkdir -p "$out_root"
+rm -rf "$bundle"
+mv "$build_bundle" "$bundle"
+mv -f "$build_cli" "$cli"
+
+echo "$bundle"
+echo "$cli"

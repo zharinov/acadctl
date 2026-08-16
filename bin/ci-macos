@@ -1,0 +1,111 @@
+#!/bin/sh
+set -eu
+
+if test "$#" -ne 0; then
+    echo "usage: $0" >&2
+    exit 2
+fi
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+# shellcheck source=bin/config-macos
+. "$repo_root/bin/config-macos"
+acadctl_configure_mac "$repo_root"
+
+fail() {
+    echo "$1" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        fail "$1 not found"
+}
+
+for command_name in clang-tidy codesign lipo nm plutil xmllint; do
+    require_command "$command_name"
+done
+
+rust_target="$repo_root/target/rust-objectarx"
+bundle="$repo_root/out/acadctl.bundle"
+plugin="$bundle/Contents/acadctl-plugin.bundle"
+executable="$plugin/Contents/MacOS/acadctl-plugin"
+cli="$repo_root/out/acadctl"
+log_root=$(mktemp -d "${TMPDIR:-/tmp}/acadctl-ci-macos.XXXXXX")
+step_number=0
+
+cleanup() {
+    rm -rf -- "$log_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+run_step() {
+    label=$1
+    shift
+    step_number=$((step_number + 1))
+    log="$log_root/$step_number.log"
+
+    printf '%s... ' "$label"
+
+    if "$@" >"$log" 2>&1; then
+        echo "ok"
+    else
+        status=$?
+        echo "failed"
+        cat "$log"
+        exit "$status"
+    fi
+}
+
+check_entry_point() {
+    nm -gU "$executable" | grep -q ' _acrxEntryPoint$'
+}
+
+cd "$repo_root"
+
+test -f "$acadctl_sdk_root/inc/rxregsvc.h" ||
+    fail "ObjectARX SDK not found at $acadctl_sdk_root"
+test -d "$acadctl_autocad_root/Contents/Frameworks" ||
+    fail "AutoCAD not found at $acadctl_autocad_root"
+
+run_step "AutoCAD architecture" lipo \
+    "$acadctl_autocad_root/Contents/Frameworks/libacdb.dylib" \
+    -verify_arch "$acadctl_arch"
+run_step "native build (macOS)" bin/build-macos release
+run_step "plugin plist" plutil -lint "$plugin/Contents/Info.plist"
+run_step "package XML" xmllint --noout "$bundle/PackageContents.xml"
+run_step "plugin architecture" lipo "$executable" -verify_arch "$acadctl_arch"
+run_step "plugin entry point" check_entry_point
+run_step "plugin signature" codesign --verify --strict "$plugin"
+run_step "CLI signature" codesign --verify --strict "$cli"
+run_step "CLI executable" test -x "$cli"
+run_step "native analysis (macOS)" clang-tidy --quiet \
+    crates/plugin/native/entry.cpp \
+    crates/plugin/native/host.cpp \
+    -- \
+    -std=c++17 \
+    -arch "$acadctl_arch" \
+    -mmacosx-version-min="$acadctl_deployment_target" \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Wconversion \
+    -Wsign-conversion \
+    -Wshadow-all \
+    -Wnon-virtual-dtor \
+    -Wold-style-cast \
+    -Wcast-align \
+    -Woverloaded-virtual \
+    -Wnull-dereference \
+    -Wdouble-promotion \
+    -Wformat=2 \
+    -Wimplicit-fallthrough \
+    -Wextra-semi \
+    -Wundef \
+    -Wmissing-declarations \
+    -Wunreachable-code \
+    -Wcomma \
+    -Wconditional-uninitialized \
+    -Werror \
+    -isystem "$acadctl_sdk_root/inc" \
+    -isystem "$rust_target/cxxbridge"

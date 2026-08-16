@@ -2,37 +2,46 @@
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-llvm_root=${LLVM_ROOT:-}
 
-if test -z "$llvm_root"; then
-    llvm_root=$(brew --prefix llvm@22)
-fi
-
-clang_format="$llvm_root/bin/clang-format"
-
-test -x "$clang_format" || {
-    echo "clang-format not found under $llvm_root" >&2
+command -v clang-format >/dev/null 2>&1 || {
+    echo "clang-format not found" >&2
     exit 1
 }
 
 case "${1:-}" in
     "")
         cargo fmt --all --manifest-path "$repo_root/Cargo.toml"
-        "$clang_format" -i \
+        clang-format -i \
             "$repo_root/crates/plugin/native/entry.cpp" \
             "$repo_root/crates/plugin/native/host.cpp" \
             "$repo_root/crates/plugin/native/host.hpp" \
             "$repo_root/crates/rpc/proto/acadctl.proto"
-        shfmt -w -i 4 -ci "$repo_root/bin"
+        shfmt -w -i 4 -ci \
+            "$repo_root/bin/build" \
+            "$repo_root/bin/build-macos" \
+            "$repo_root/bin/ci" \
+            "$repo_root/bin/ci-macos" \
+            "$repo_root/bin/config-macos" \
+            "$repo_root/bin/fmt" \
+            "$repo_root/bin/install-plugin" \
+            "$repo_root/bin/install-plugin-macos"
         ;;
     --check)
         cargo fmt --all --manifest-path "$repo_root/Cargo.toml" -- --check
-        "$clang_format" --dry-run --Werror \
+        clang-format --dry-run --Werror \
             "$repo_root/crates/plugin/native/entry.cpp" \
             "$repo_root/crates/plugin/native/host.cpp" \
             "$repo_root/crates/plugin/native/host.hpp" \
             "$repo_root/crates/rpc/proto/acadctl.proto"
-        shfmt -d -i 4 -ci "$repo_root/bin"
+        shfmt -d -i 4 -ci \
+            "$repo_root/bin/build" \
+            "$repo_root/bin/build-macos" \
+            "$repo_root/bin/ci" \
+            "$repo_root/bin/ci-macos" \
+            "$repo_root/bin/config-macos" \
+            "$repo_root/bin/fmt" \
+            "$repo_root/bin/install-plugin" \
+            "$repo_root/bin/install-plugin-macos"
         ;;
     *)
         echo "usage: $0 [--check]" >&2

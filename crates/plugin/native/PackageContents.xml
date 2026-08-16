@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ApplicationPackage
     SchemaVersion="1.0"
-    AppVersion="0.7.2"
+    AppVersion="0.1.0"
     ProductCode="{23755882-652A-4205-B162-71188F97D5B2}"
     UpgradeCode="{A3B921D1-5EE8-48C4-9442-5BC02C80EB83}"
     Name="acadctl">
@@ -10,6 +10,7 @@
         OS="Mac"
         Platform="AutoCAD"
         SeriesMin="R26.0"
+        SeriesMax="R26.0"
         SupportPath="./Contents" />
     <ComponentEntry
         AppName="acadctl-loader"

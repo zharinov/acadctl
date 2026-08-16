@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+case "$(uname -s)" in
+    Darwin)
+        exec "$repo_root/bin/install-plugin-macos" "$@"
+        ;;
+    *)
+        echo "acadctl has no plugin installer for this platform; add one beside bin/install-plugin-macos" >&2
+        exit 1
+        ;;
+esac

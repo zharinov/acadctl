@@ -2,112 +2,13 @@
 set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-sdk_root=${OBJECTARX_SDK_ROOT:-/Library/Developer/Autodesk/ObjectARX 2027}
-autocad_root=${AUTOCAD_ROOT:-/Applications/Autodesk/AutoCAD 2027/AutoCAD 2027.app}
-deployment_target=${MACOSX_DEPLOYMENT_TARGET:-14.0}
-rust_target="$repo_root/target/rust-objectarx"
-configuration=${1:-dev}
 
-case "$configuration" in
-    dev)
-        cargo_profile=debug
-        cargo_args=
-        ;;
-    release)
-        cargo_profile=release
-        cargo_args=--release
+case "$(uname -s)" in
+    Darwin)
+        exec "$repo_root/bin/build-macos" "$@"
         ;;
     *)
-        echo "usage: $0 [dev|release]" >&2
-        exit 2
+        echo "acadctl has no build for this platform; add a platform build beside bin/build-macos" >&2
+        exit 1
         ;;
 esac
-
-build_bundle="$repo_root/target/objectarx/build/$configuration/acadctl.bundle"
-build_cli="$repo_root/target/objectarx/build/$configuration/acadctl"
-build_plugin="$build_bundle/Contents/acadctl-plugin.bundle"
-build_executable="$build_plugin/Contents/MacOS/acadctl-plugin"
-bundle="$repo_root/dist/acadctl.bundle"
-cli="$repo_root/dist/acadctl"
-
-test -f "$sdk_root/inc/rxregsvc.h" || {
-    echo "ObjectARX SDK not found at $sdk_root" >&2
-    exit 1
-}
-
-test -d "$autocad_root/Contents/Frameworks" || {
-    echo "AutoCAD not found at $autocad_root" >&2
-    exit 1
-}
-
-cd "$repo_root"
-MACOSX_DEPLOYMENT_TARGET="$deployment_target" \
-    CARGO_TARGET_DIR="$rust_target" \
-    cargo build --workspace $cargo_args
-
-rm -rf "$build_bundle"
-mkdir -p "$build_plugin/Contents/MacOS"
-cp "$repo_root/crates/plugin/native/Info.plist" "$build_plugin/Contents/Info.plist"
-cp "$repo_root/crates/plugin/native/PackageContents.xml" "$build_bundle/PackageContents.xml"
-cp "$repo_root/crates/plugin/native/loader.lsp" "$build_bundle/Contents/loader.lsp"
-cp "$rust_target/acadctl-generated/$cargo_profile/driver.lsp" "$build_bundle/Contents/driver.lsp"
-
-clang++ \
-    -std=c++17 \
-    -arch arm64 \
-    -mmacosx-version-min="$deployment_target" \
-    -Wall \
-    -Wextra \
-    -Wpedantic \
-    -Wconversion \
-    -Wsign-conversion \
-    -Wshadow-all \
-    -Wnon-virtual-dtor \
-    -Wold-style-cast \
-    -Wcast-align \
-    -Woverloaded-virtual \
-    -Wnull-dereference \
-    -Wdouble-promotion \
-    -Wformat=2 \
-    -Wimplicit-fallthrough \
-    -Wextra-semi \
-    -Wundef \
-    -Wmissing-declarations \
-    -Wunreachable-code \
-    -Wcomma \
-    -Wconditional-uninitialized \
-    -Werror \
-    -bundle \
-    -isystem "$sdk_root/inc" \
-    -isystem "$rust_target/cxxbridge" \
-    -L"$autocad_root/Contents/Frameworks" \
-    -F"$autocad_root/Contents/Frameworks" \
-    "$repo_root/crates/plugin/native/entry.cpp" \
-    "$repo_root/crates/plugin/native/host.cpp" \
-    "$rust_target/$cargo_profile/libacadctl_plugin.a" \
-    -lacfirst \
-    -lacdb \
-    -laccore \
-    -lAcPal \
-    -framework Foundation \
-    -lobjc \
-    -o "$build_executable"
-
-cp "$rust_target/$cargo_profile/acadctl" "$build_cli"
-
-plutil -lint "$build_plugin/Contents/Info.plist" >/dev/null
-xmllint --noout "$build_bundle/PackageContents.xml"
-file "$build_executable" | grep -q 'Mach-O 64-bit bundle arm64'
-nm -gU "$build_executable" | grep -q ' _acrxEntryPoint$'
-codesign --force --sign - "$build_plugin"
-codesign --verify --strict "$build_plugin"
-test -x "$build_cli"
-
-mkdir -p "$(dirname "$bundle")"
-rm -rf "$bundle"
-mv "$build_bundle" "$bundle"
-mv -f "$build_cli" "$cli"
-codesign --verify --strict "$bundle/Contents/acadctl-plugin.bundle"
-
-echo "$bundle"
-echo "$cli"
