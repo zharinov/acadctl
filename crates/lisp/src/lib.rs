@@ -54,6 +54,9 @@ pub struct ScanPosition {
     finished: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidScanPosition;
+
 pub struct Scanner<'a> {
     cursor: Cursor<'a>,
     finished: bool,
@@ -76,8 +79,12 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    pub const fn resume(source: &'a str, position: ScanPosition) -> Self {
-        Self {
+    pub fn resume(source: &'a str, position: ScanPosition) -> Result<Self, InvalidScanPosition> {
+        if position.byte > source.len() || !source.is_char_boundary(position.byte) {
+            return Err(InvalidScanPosition);
+        }
+
+        Ok(Self {
             cursor: Cursor {
                 source,
                 byte: position.byte,
@@ -85,7 +92,7 @@ impl<'a> Scanner<'a> {
                 column: position.column,
             },
             finished: position.finished,
-        }
+        })
     }
 }
 
@@ -484,11 +491,32 @@ mod tests {
         let mut scanner = scan(source);
         assert_eq!(scanner.next().unwrap().unwrap().byte_end, 5);
         let position = scanner.position();
-        let mut resumed = Scanner::resume(source, position);
+        let mut resumed = Scanner::resume(source, position).unwrap();
 
         let second = resumed.next().unwrap().unwrap();
         assert_eq!(&source[second.byte_start..second.byte_end], "(second)");
         assert_eq!(validate(source).unwrap(), 3);
+    }
+
+    #[test]
+    fn rejects_a_position_that_cannot_index_the_new_source() {
+        let mut scanner = scan("ab");
+        scanner.next().unwrap().unwrap();
+        let past_end = scanner.position();
+
+        assert_eq!(
+            Scanner::resume("a", past_end).err(),
+            Some(InvalidScanPosition)
+        );
+
+        let mut scanner = scan("a b");
+        scanner.next().unwrap().unwrap();
+        let inside_unicode_scalar = scanner.position();
+
+        assert_eq!(
+            Scanner::resume("é", inside_unicode_scalar).err(),
+            Some(InvalidScanPosition)
+        );
     }
 
     fn assert_error(

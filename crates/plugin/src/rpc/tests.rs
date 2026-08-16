@@ -453,9 +453,13 @@ async fn execute_and_cancel(
     }
 
     let mut cancel_acknowledgement_count = 0;
-    let mut finished_seen = false;
+    loop {
+        let event = response
+            .message()
+            .await
+            .expect("execution stream read failed")
+            .expect("execution stream ended before its terminal event");
 
-    while let Some(event) = response.message().await.unwrap() {
         match event.event {
             Some(exec_server_event::Event::CancelAcknowledgement(acknowledgement)) => {
                 assert_eq!(
@@ -469,7 +473,7 @@ async fn execute_and_cancel(
                     finished.outcome.unwrap().outcome,
                     Some(exec_outcome::Outcome::Cancelled(_))
                 ));
-                finished_seen = true;
+                break;
             }
 
             Some(exec_server_event::Event::Accepted(_))
@@ -479,7 +483,13 @@ async fn execute_and_cancel(
     }
 
     assert_eq!(cancel_acknowledgement_count, 1);
-    assert!(finished_seen);
+    assert!(
+        response
+            .message()
+            .await
+            .expect("execution stream read failed after its terminal event")
+            .is_none()
+    );
 }
 
 fn execution_request(drawing_id: DrawingId, source: Bytes) -> ExecClientMessage {

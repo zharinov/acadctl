@@ -2,9 +2,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use acadctl_rpc::{DrawingPath, InstanceId, OpenRequest, OpenResponse};
+use acadctl_rpc::{
+    DrawingError, DrawingErrorKind, DrawingPath, InstanceId, OpenRequest, OpenResponse,
+};
 use tokio::time::{Instant, sleep, timeout};
-use tonic::{Code, Status};
+use tonic::Status;
 
 use crate::instance::{Instance, InstanceSnapshot};
 
@@ -94,14 +96,8 @@ async fn open_when_ready(
 }
 
 fn startup_open_retryable(status: &Status) -> bool {
-    matches!(
-        status.code(),
-        Code::Unknown
-            | Code::DeadlineExceeded
-            | Code::FailedPrecondition
-            | Code::Internal
-            | Code::Unavailable
-    )
+    DrawingError::from_status(status).and_then(|error| DrawingErrorKind::try_from(error.kind).ok())
+        == Some(DrawingErrorKind::Busy)
 }
 
 async fn wait_for_launched_instance(launched: Option<InstanceId>) -> Result<InstanceId, String> {
@@ -266,5 +262,26 @@ mod tests {
             select_launched_instance(&instances, Some(launched)),
             Ok(Some(launched))
         );
+    }
+
+    #[test]
+    fn retries_open_only_after_an_explicit_busy_rejection() {
+        let busy = DrawingError {
+            kind: DrawingErrorKind::Busy as i32,
+            drawing_id: None,
+        }
+        .status(tonic::Code::FailedPrecondition);
+
+        assert!(startup_open_retryable(&busy));
+
+        for status in [
+            Status::unknown("connection closed"),
+            Status::deadline_exceeded("request timed out"),
+            Status::failed_precondition("not ready"),
+            Status::internal("server stopped"),
+            Status::unavailable("connection lost"),
+        ] {
+            assert!(!startup_open_retryable(&status));
+        }
     }
 }

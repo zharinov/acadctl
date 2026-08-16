@@ -76,7 +76,10 @@ impl Server {
     fn start() -> Result<Self, String> {
         let (stop, stop_receiver) = oneshot::channel();
         let (startup_sender, startup_receiver) = std_mpsc::sync_channel(1);
-        let thread = thread::spawn(move || run(stop_receiver, startup_sender));
+        let thread = thread::Builder::new()
+            .name("acadctl-rpc".to_owned())
+            .spawn(move || run(stop_receiver, startup_sender))
+            .map_err(|error| format!("could not start the RPC server thread: {error}"))?;
 
         match startup_receiver.recv() {
             Ok(Ok(())) => Ok(Self { stop, thread }),

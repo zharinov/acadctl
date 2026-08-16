@@ -278,7 +278,16 @@ impl Exec {
 
                     let source = std::str::from_utf8(&self.source)
                         .expect("validated execution source remains UTF-8");
-                    let mut scanner = acadctl_lisp::Scanner::resume(source, self.next_scan);
+                    let Ok(mut scanner) = acadctl_lisp::Scanner::resume(source, self.next_scan)
+                    else {
+                        self.begin_unwind(UnwindCause::Failure(
+                            ExecFailure::unknown_drawing_outcome(
+                                "the execution source cursor became invalid".to_owned(),
+                            ),
+                        ));
+
+                        continue;
+                    };
 
                     match scanner.next() {
                         Some(Ok(span)) => {
