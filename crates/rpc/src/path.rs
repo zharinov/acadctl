@@ -11,6 +11,9 @@ use crate::MAX_DRAWING_PATH_BYTES;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DrawingPath(Utf8PathBuf);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavePath(Utf8PathBuf);
+
 #[derive(Debug)]
 pub enum DrawingPathError {
     NotDwg,
@@ -19,6 +22,7 @@ pub enum DrawingPathError {
     TooLong,
     Resolve { path: PathBuf, source: io::Error },
     InvalidUtf8(OsString),
+    AlreadyExists(PathBuf),
 }
 
 impl DrawingPath {
@@ -84,6 +88,59 @@ impl DrawingPath {
     }
 }
 
+impl SavePath {
+    pub fn prepare(path: impl AsRef<Path>) -> Result<Self, DrawingPathError> {
+        let path = Self::normalize(path.as_ref())?;
+        path.ensure_available()?;
+        Ok(path)
+    }
+
+    fn normalize(path: &Path) -> Result<Self, DrawingPathError> {
+        if !DrawingPath::has_dwg_extension(path) {
+            return Err(DrawingPathError::NotDwg);
+        }
+
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent = std::fs::canonicalize(parent).map_err(|source| DrawingPathError::Resolve {
+            path: path.to_owned(),
+            source,
+        })?;
+        let file_name = path.file_name().ok_or(DrawingPathError::NotAbsolute)?;
+        let path = Utf8PathBuf::from_path_buf(parent.join(file_name))
+            .map_err(|path| DrawingPathError::InvalidUtf8(path.into_os_string()))?;
+
+        if path.as_str().len() > MAX_DRAWING_PATH_BYTES {
+            return Err(DrawingPathError::TooLong);
+        }
+
+        Ok(Self(path))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn ensure_available(&self) -> Result<(), DrawingPathError> {
+        match std::fs::symlink_metadata(self.0.as_std_path()) {
+            Ok(_) => Err(DrawingPathError::AlreadyExists(
+                self.0.as_std_path().to_owned(),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(DrawingPathError::Resolve {
+                path: self.0.as_std_path().to_owned(),
+                source,
+            }),
+        }
+    }
+
+    pub fn into_string(self) -> String {
+        self.0.into_string()
+    }
+}
+
 impl fmt::Display for DrawingPath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
@@ -103,6 +160,18 @@ impl FromStr for DrawingPath {
         }
 
         Self::canonicalize(value)
+    }
+}
+
+impl FromStr for SavePath {
+    type Err = DrawingPathError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if !Utf8Path::new(value).is_absolute() {
+            return Err(DrawingPathError::NotAbsolute);
+        }
+
+        Self::normalize(Path::new(value))
     }
 }
 
@@ -128,6 +197,11 @@ impl fmt::Display for DrawingPathError {
                 "Drawing path '{}' is not valid UTF-8",
                 path.to_string_lossy()
             ),
+            Self::AlreadyExists(path) => write!(
+                formatter,
+                "File '{}' already exists; use another path or omit --as",
+                path.display()
+            ),
         }
     }
 }
@@ -148,7 +222,8 @@ impl std::error::Error for DrawingPathError {
             | Self::NotFile(_)
             | Self::NotAbsolute
             | Self::TooLong
-            | Self::InvalidUtf8(_) => None,
+            | Self::InvalidUtf8(_)
+            | Self::AlreadyExists(_) => None,
         }
     }
 }
@@ -208,6 +283,31 @@ mod tests {
             drawing.as_path().as_std_path(),
             std::fs::canonicalize(&path).unwrap()
         );
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn prepares_a_new_save_destination_from_a_relative_path() {
+        let file_name = format!("acadctl-save-path-{}.dwg", std::process::id());
+        let destination = SavePath::prepare(&file_name).unwrap();
+        let expected = std::env::current_dir().unwrap().join(file_name);
+
+        assert_eq!(destination.as_str(), expected.to_str().unwrap());
+    }
+
+    #[test]
+    fn refuses_an_existing_save_destination() {
+        let path = std::env::temp_dir().join(format!(
+            "acadctl-existing-save-path-{}.dwg",
+            std::process::id()
+        ));
+        std::fs::write(&path, []).unwrap();
+
+        assert!(matches!(
+            SavePath::prepare(&path),
+            Err(DrawingPathError::AlreadyExists(_))
+        ));
 
         std::fs::remove_file(path).unwrap();
     }

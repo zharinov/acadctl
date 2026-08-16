@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -195,7 +196,7 @@ private:
 
   acadctl::NativeActionResult open(rust::Str path);
 
-  acadctl::NativeActionResult save(AcApDocument* document);
+  acadctl::NativeActionResult save(AcApDocument* document, rust::Str path);
 
   acadctl::NativeActionResult close(AcApDocument* document, bool discard);
 
@@ -1176,7 +1177,7 @@ void ObjectArxBridge::processNextAction() {
     if (AcApDocument* target = document(action->document_token())) {
       actionResult =
           matchesDatabase(target, action->database_token())
-              ? save(target)
+              ? save(target, action->save_path())
               : result(
                     acadctl::NativeActionResultKind::DrawingGenerationChanged);
     } else {
@@ -1280,14 +1281,40 @@ acadctl::NativeActionResult ObjectArxBridge::open(rust::Str path) {
                              status);
 }
 
-acadctl::NativeActionResult ObjectArxBridge::save(AcApDocument* document) {
-  if (!document->isNamedDrawing()) {
+acadctl::NativeActionResult ObjectArxBridge::save(AcApDocument* document,
+                                                  rust::Str path) {
+  const bool saveAs = !path.empty();
+
+  if (!saveAs && !document->isNamedDrawing()) {
     return result(acadctl::NativeActionResultKind::Unnamed);
   }
 
   if (document->isReadOnly()) {
     return result(acadctl::NativeActionResultKind::ReadOnly);
   }
+
+  if (saveAs) {
+    std::error_code filesystemError;
+    const std::filesystem::path filesystemPath =
+        std::filesystem::u8path(path.data(), path.data() + path.size());
+    const std::filesystem::file_status destinationStatus =
+        std::filesystem::symlink_status(filesystemPath, filesystemError);
+
+    if (destinationStatus.type() != std::filesystem::file_type::not_found) {
+      return result(acadctl::NativeActionResultKind::DestinationExists);
+    }
+
+    if (filesystemError &&
+        filesystemError != std::errc::no_such_file_or_directory) {
+      return nativeFailure(acadctl::NativeActionResultKind::SaveFailed,
+                           Acad::eFileSystemErr);
+    }
+  }
+
+  const AcString destination =
+      saveAs ? AcString(path.data(), AcString::Utf8,
+                        static_cast<Adesk::UInt32>(path.size()))
+             : AcString(document->fileName());
 
   const Acad::ErrorStatus lockStatus = acDocManager->lockDocument(
       document, AcAp::kXWrite, nullptr, nullptr, false);
@@ -1313,7 +1340,7 @@ acadctl::NativeActionResult ObjectArxBridge::save(AcApDocument* document) {
 
     if (status == Acad::eOk) {
       status =
-          document->database()->saveAs(document->fileName(), true, version);
+          document->database()->saveAs(destination.constPtr(), true, version);
     }
   }
 

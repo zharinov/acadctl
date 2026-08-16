@@ -105,6 +105,7 @@ fn preserves_native_guard_outcomes_as_types() {
             result(NativeActionResultKind::DrawingGone),
             &Operation::Save {
                 id: "D0C0".parse().unwrap(),
+                path: None,
             },
         ),
         Err(Error::DrawingGone)
@@ -114,6 +115,7 @@ fn preserves_native_guard_outcomes_as_types() {
             result(NativeActionResultKind::DrawingGenerationChanged),
             &Operation::Save {
                 id: "D0C0".parse().unwrap(),
+                path: None,
             },
         ),
         Err(Error::DrawingGenerationChanged)
@@ -123,6 +125,7 @@ fn preserves_native_guard_outcomes_as_types() {
             result(NativeActionResultKind::ReadOnly),
             &Operation::Save {
                 id: "D0C0".parse().unwrap(),
+                path: None,
             },
         ),
         Err(Error::ReadOnly("D0C0".parse().unwrap()))
@@ -135,7 +138,7 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
     reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
-    let first = tokio::spawn(save(id));
+    let first = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
     assert_eq!(save_action.kind(), NativeActionKind::Save);
@@ -162,6 +165,52 @@ async fn dropped_waiter_does_not_cancel_or_release_an_operation() {
         result(NativeActionResultKind::Success),
     );
     assert!(second.await.unwrap().is_ok());
+    stop();
+}
+
+#[tokio::test]
+async fn save_to_a_new_path_requires_the_published_path_and_clean_state() {
+    let _test = TEST_LOCK.lock().await;
+    reset(vec![drawing(1, 101, false)]);
+    let id = list().unwrap()[0].id;
+    let path = save_path("new-house");
+
+    let saving = tokio::spawn(save(id, Some(path.clone())));
+    tokio::task::yield_now().await;
+    let action = take_native_action();
+    assert_eq!(action.kind(), NativeActionKind::Save);
+    assert_eq!(action.save_path(), path.as_str());
+
+    replace_drawing_snapshot(vec![crate::ffi::NativeDocumentSnapshot {
+        document_token: 1,
+        database_token: 101,
+        name: path.as_str().into(),
+        named: true,
+        modified: false,
+        read_only: false,
+    }]);
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
+
+    let saved = saving.await.unwrap().unwrap();
+    assert_eq!(saved.file_path().unwrap().as_str(), path.as_str());
+    stop();
+}
+
+#[tokio::test]
+async fn save_to_a_path_that_appeared_does_not_reach_native_code() {
+    let _test = TEST_LOCK.lock().await;
+    reset(vec![drawing(1, 101, true)]);
+    let id = list().unwrap()[0].id;
+    let path = save_path("occupied");
+    std::fs::write(path.as_str(), []).unwrap();
+
+    assert_eq!(
+        save(id, Some(path.clone())).await,
+        Err(Error::DestinationExists(id))
+    );
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
+
+    std::fs::remove_file(path.as_str()).unwrap();
     stop();
 }
 
@@ -249,7 +298,7 @@ async fn shutdown_rejects_pending_work_but_preserves_the_active_operation() {
     reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
-    let active = tokio::spawn(save(id));
+    let active = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
     assert_eq!(save_action.kind(), NativeActionKind::Save);
@@ -403,7 +452,7 @@ async fn queued_cancellation_removes_only_that_execution() {
     reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
-    let active = tokio::spawn(save(id));
+    let active = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
     assert_eq!(save_action.kind(), NativeActionKind::Save);
@@ -440,7 +489,7 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
     reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
 
-    let active = tokio::spawn(save(id));
+    let active = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
     assert_eq!(save_action.kind(), NativeActionKind::Save);
@@ -733,7 +782,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
         crate::exec::ExecStepKind::Done
     );
 
-    let blocked = tokio::spawn(save(id));
+    let blocked = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
 
     complete_native_action(
@@ -759,7 +808,7 @@ async fn document_context_restore_failure_amends_a_terminal_execution_outcome() 
         blocked.await.unwrap(),
         Err(Error::NativeMutationStateUnknown)
     );
-    assert_eq!(save(id).await, Err(Error::NativeMutationStateUnknown));
+    assert_eq!(save(id, None).await, Err(Error::NativeMutationStateUnknown));
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
@@ -783,7 +832,7 @@ async fn start_does_not_clear_native_state_quarantine() {
         assert!(scheduler.quarantined);
     }
 
-    assert_eq!(save(id).await, Err(Error::NativeMutationStateUnknown));
+    assert_eq!(save(id, None).await, Err(Error::NativeMutationStateUnknown));
     reset(Vec::new());
     stop();
 }
@@ -846,7 +895,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
         crate::exec::ExecStepKind::Done
     );
 
-    let blocked = tokio::spawn(save(id));
+    let blocked = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     complete_execution_native_action(
         action.job_id(),
@@ -880,7 +929,7 @@ async fn retained_execution_state_quarantines_without_erasing_commit_evidence() 
         blocked.await.unwrap(),
         Err(Error::NativeMutationStateUnknown)
     );
-    assert_eq!(save(id).await, Err(Error::NativeMutationStateUnknown));
+    assert_eq!(save(id, None).await, Err(Error::NativeMutationStateUnknown));
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
 }
@@ -890,7 +939,7 @@ async fn queued_execution_expires_without_starting_a_form() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
-    let saving = tokio::spawn(save(id));
+    let saving = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     let save_action = take_native_action();
     assert_eq!(save_action.kind(), NativeActionKind::Save);
@@ -1196,7 +1245,7 @@ async fn mutation_job_capacity_bounds_disconnected_waiters() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, true)]);
     let id = list().unwrap()[0].id;
-    let active = tokio::spawn(save(id));
+    let active = tokio::spawn(save(id, None));
     tokio::task::yield_now().await;
     let action = take_native_action();
     assert_eq!(action.kind(), NativeActionKind::Save);
@@ -1204,11 +1253,11 @@ async fn mutation_job_capacity_bounds_disconnected_waiters() {
     let mut queued = Vec::new();
 
     for _ in 1..MAX_MUTATION_JOBS {
-        queued.push(tokio::spawn(save(id)));
+        queued.push(tokio::spawn(save(id, None)));
         tokio::task::yield_now().await;
     }
 
-    assert_eq!(save(id).await, Err(Error::MutationCapacity));
+    assert_eq!(save(id, None).await, Err(Error::MutationCapacity));
 
     stop();
     complete_native_action(action.job_id(), result(NativeActionResultKind::SaveFailed));
@@ -1283,6 +1332,15 @@ fn drawing_path(name: &str) -> DrawingPath {
     let drawing = DrawingPath::canonicalize(&path).unwrap();
     std::fs::remove_file(path).unwrap();
     drawing
+}
+
+fn save_path(name: &str) -> acadctl_rpc::SavePath {
+    let path = std::env::temp_dir().join(format!(
+        "acadctl-scheduler-{}-{name}.dwg",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    acadctl_rpc::SavePath::prepare(path).unwrap()
 }
 
 fn reset(drawings: Vec<crate::ffi::NativeDocumentSnapshot>) {

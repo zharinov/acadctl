@@ -572,8 +572,8 @@ pub async fn open(path: DrawingPath) -> Result<Drawing, Error> {
     }
 }
 
-pub async fn save(id: DrawingId) -> Result<Drawing, Error> {
-    match submit_operation(Operation::Save { id }).await? {
+pub async fn save(id: DrawingId, path: Option<acadctl_rpc::SavePath>) -> Result<Drawing, Error> {
+    match submit_operation(Operation::Save { id, path }).await? {
         OperationOutcome::Drawing(drawing) => Ok(drawing),
         OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::SaveNotPublished),
     }

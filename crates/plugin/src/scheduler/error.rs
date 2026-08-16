@@ -17,6 +17,8 @@ pub enum Error {
     DrawingGenerationChanged,
     Unnamed(DrawingId),
     ReadOnly(DrawingId),
+    DestinationExists(DrawingId),
+    SavePathUnavailable,
     Dirty(DrawingId),
     NotDwg,
     OpenFailed(NativeFailure),
@@ -68,9 +70,13 @@ impl fmt::Display for Error {
                 .write_str("The drawing was replaced before AutoCAD could perform the operation"),
             Self::Unnamed(id) => write!(
                 formatter,
-                "Drawing '{id}' has no file name. Save As is not supported yet."
+                "Drawing '{id}' has no file name; use --as FILE."
             ),
             Self::ReadOnly(id) => write!(formatter, "Drawing '{id}' is read-only."),
+            Self::DestinationExists(_) => formatter.write_str(
+                "Destination already exists; use another path or omit --as",
+            ),
+            Self::SavePathUnavailable => formatter.write_str("The save destination is unavailable"),
             Self::Dirty(id) => write!(
                 formatter,
                 "Drawing '{id}' has unsaved changes."
@@ -166,6 +172,7 @@ impl Error {
             Self::DrawingGenerationChanged => Some(DrawingErrorKind::Replaced),
             Self::Unnamed(_) => Some(DrawingErrorKind::NoFileName),
             Self::ReadOnly(_) => Some(DrawingErrorKind::ReadOnly),
+            Self::DestinationExists(_) => Some(DrawingErrorKind::DestinationExists),
             Self::Dirty(_) => Some(DrawingErrorKind::UnsavedChanges),
             Self::NotQuiescent => Some(DrawingErrorKind::Busy),
             Self::UndoDisabled => Some(DrawingErrorKind::UndoDisabled),
@@ -178,6 +185,7 @@ impl Error {
             Self::DrawingNotFound(id)
             | Self::Unnamed(id)
             | Self::ReadOnly(id)
+            | Self::DestinationExists(id)
             | Self::Dirty(id) => Some(*id),
             _ => None,
         }
@@ -190,6 +198,7 @@ impl Error {
                 | Self::Stopped
                 | Self::OpenNotPublished
                 | Self::SaveNotPublished
+                | Self::SavePathUnavailable
                 | Self::CloseNotPublished
                 | Self::DocumentContextFailed(_)
                 | Self::DocumentContextRestoreFailed(_)

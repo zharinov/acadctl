@@ -58,6 +58,10 @@ enum Command {
         /// INSTANCE:DRAWING target shown by `acadctl ps`.
         #[arg(value_name = "TARGET")]
         target: Target,
+
+        /// Save to a new DWG file and make it the drawing's current path.
+        #[arg(long = "as", value_name = "FILE")]
+        path: Option<PathBuf>,
     },
     /// Undo the previous action.
     Undo {
@@ -170,7 +174,7 @@ async fn main() -> ExitCode {
     match cli.command {
         Command::Ps { long } => commands::ps::run(long).await,
         Command::Open { path, instance } => commands::open::run(path, instance).await,
-        Command::Save { target } => commands::save::run(target).await,
+        Command::Save { target, path } => commands::save::run(target, path).await,
         Command::Undo { target } => {
             commands::history::run(target, commands::history::Direction::Undo).await
         }
@@ -341,6 +345,12 @@ mod tests {
         assert!(exec_help.contains("<TARGET> [SCRIPT]"));
         assert!(eval_help.contains("-f, --file <FILE>"));
         assert!(exec_help.contains("-f, --file <FILE>"));
+        let save_help = command
+            .find_subcommand_mut("save")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert!(save_help.contains("--as <FILE>"));
     }
 
     #[test]

@@ -23,7 +23,10 @@ message OpenRequest { string path = 1; }
 
 message OpenResponse { Drawing drawing = 1; }
 
-message SaveRequest { uint32 drawing_id = 1; }
+message SaveRequest {
+  uint32 drawing_id = 1;
+  optional string path = 2;
+}
 
 message SaveResponse { Drawing drawing = 1; }
 
@@ -131,6 +134,7 @@ enum DrawingErrorKind {
   DRAWING_ERROR_KIND_NO_FILE_NAME = 5;
   DRAWING_ERROR_KIND_BUSY = 6;
   DRAWING_ERROR_KIND_UNDO_DISABLED = 7;
+  DRAWING_ERROR_KIND_DESTINATION_EXISTS = 8;
 }
 
 message Drawing {

@@ -1,4 +1,4 @@
-use acadctl_rpc::{DrawingId, DrawingPath};
+use acadctl_rpc::{DrawingId, DrawingPath, SavePath};
 
 use crate::drawing::{Drawing, DrawingRegistry, DrawingTarget, NativeDocumentKey};
 use crate::exec::output::OutputSink;
@@ -13,6 +13,7 @@ pub(super) enum Operation {
     },
     Save {
         id: DrawingId,
+        path: Option<SavePath>,
     },
     Close {
         id: DrawingId,
@@ -52,8 +53,8 @@ impl Operation {
                 || Prepared::Native(NativeCommand::open(path.clone())),
                 |target| Prepared::Immediate(Ok(OperationOutcome::Drawing(target.drawing))),
             ),
-            Operation::Save { id } => match drawings.find_by_id(*id) {
-                Some(target) => Self::prepare_save(*id, target),
+            Operation::Save { id, path } => match drawings.find_by_id(*id) {
+                Some(target) => Self::prepare_save(*id, path.as_ref(), target),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
             Operation::Close { id, discard } => match drawings.find_by_id(*id) {
@@ -87,24 +88,34 @@ impl Operation {
         }
     }
 
-    fn prepare_save(id: DrawingId, target: DrawingTarget) -> Prepared {
+    fn prepare_save(id: DrawingId, path: Option<&SavePath>, target: DrawingTarget) -> Prepared {
         if target.drawing.read_only {
             return Prepared::Immediate(Err(Error::ReadOnly(id)));
         }
 
-        let Some(file_path) = target.drawing.file_path() else {
-            return Prepared::Immediate(Err(Error::Unnamed(id)));
-        };
+        if let Some(path) = path {
+            match path.ensure_available() {
+                Ok(()) => {}
+                Err(acadctl_rpc::DrawingPathError::AlreadyExists(_)) => {
+                    return Prepared::Immediate(Err(Error::DestinationExists(id)));
+                }
+                Err(_) => return Prepared::Immediate(Err(Error::SavePathUnavailable)),
+            }
+        } else {
+            let Some(file_path) = target.drawing.file_path() else {
+                return Prepared::Immediate(Err(Error::Unnamed(id)));
+            };
 
-        if !DrawingPath::has_dwg_extension(file_path) {
-            return Prepared::Immediate(Err(Error::NotDwg));
+            if !DrawingPath::has_dwg_extension(file_path) {
+                return Prepared::Immediate(Err(Error::NotDwg));
+            }
         }
 
-        if !target.drawing.modified {
+        if path.is_none() && !target.drawing.modified {
             return Prepared::Immediate(Ok(OperationOutcome::Drawing(target.drawing)));
         }
 
-        Prepared::Native(NativeCommand::save(target.native_key))
+        Prepared::Native(NativeCommand::save(target.native_key, path.cloned()))
     }
 
     pub(super) fn complete(
@@ -117,13 +128,25 @@ impl Operation {
                 .find_by_path(path)
                 .map(|target| OperationOutcome::Drawing(target.drawing))
                 .ok_or(Error::OpenNotPublished),
-            Operation::Save { id } => {
+            Operation::Save { id, path } => {
                 let target = drawings
                     .find_by_id(*id)
                     .ok_or(Error::DrawingNotFound(*id))?;
 
+                if target.native_key != native_target.ok_or(Error::DrawingGone)? {
+                    return Err(Error::DrawingGenerationChanged);
+                }
+
                 if target.drawing.modified {
                     return Err(Error::SaveNotPublished);
+                }
+
+                if let Some(expected_path) = path {
+                    let published_path = target.drawing.file_path().map(|path| path.as_str());
+
+                    if published_path != Some(expected_path.as_str()) {
+                        return Err(Error::SaveNotPublished);
+                    }
                 }
 
                 Ok(OperationOutcome::Drawing(target.drawing))
@@ -159,7 +182,7 @@ impl Operation {
     pub(super) fn drawing_id(&self) -> Option<DrawingId> {
         match self {
             Self::Open { .. } => None,
-            Self::Save { id }
+            Self::Save { id, .. }
             | Self::Close { id, .. }
             | Self::History { id, .. }
             | Self::Execute { id, .. } => Some(*id),

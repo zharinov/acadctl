@@ -82,6 +82,7 @@ fn reports_drawings_and_stops_promptly() {
         let saved = client
             .save(SaveRequest {
                 drawing_id: opened.id,
+                path: None,
             })
             .await
             .unwrap()

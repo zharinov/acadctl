@@ -1,4 +1,4 @@
-use acadctl_rpc::DrawingPath;
+use acadctl_rpc::{DrawingPath, SavePath};
 
 use crate::drawing::{DrawingRegistry, NativeDocumentKey};
 use crate::exec::{ExecOutcome, ExecStepResult};
@@ -18,7 +18,7 @@ pub(super) enum NativeCommand {
 }
 
 pub(super) enum NativeDrawingOperation {
-    Save,
+    Save { path: Option<SavePath> },
     Close { discard: bool },
     Undo,
     Redo,
@@ -39,8 +39,8 @@ impl NativeCommand {
         Self::Open(path)
     }
 
-    pub(super) fn save(target: NativeDocumentKey) -> Self {
-        Self::drawing(target, NativeDrawingOperation::Save)
+    pub(super) fn save(target: NativeDocumentKey, path: Option<SavePath>) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Save { path })
     }
 
     pub(super) fn close(target: NativeDocumentKey, discard: bool) -> Self {
@@ -81,7 +81,7 @@ impl NativeCommand {
 impl NativeDrawingOperation {
     fn kind(&self) -> NativeActionKind {
         match self {
-            Self::Save => NativeActionKind::Save,
+            Self::Save { .. } => NativeActionKind::Save,
             Self::Close { .. } => NativeActionKind::Close,
             Self::Undo => NativeActionKind::Undo,
             Self::Redo => NativeActionKind::Redo,
@@ -150,6 +150,22 @@ impl NativeAction {
             } => *discard,
             NativeActionState::Idle | NativeActionState::Issued { .. } => {
                 panic!("native action is not close")
+            }
+        }
+    }
+
+    pub(crate) fn save_path(&self) -> &str {
+        match &self.state {
+            NativeActionState::Issued {
+                command:
+                    NativeCommand::Drawing {
+                        operation: NativeDrawingOperation::Save { path },
+                        ..
+                    },
+                ..
+            } => path.as_ref().map_or("", SavePath::as_str),
+            NativeActionState::Idle | NativeActionState::Issued { .. } => {
+                panic!("native action is not save")
             }
         }
     }
@@ -256,6 +272,10 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
         NativeActionResultKind::Dirty => Err(operation
             .drawing_id()
             .map(Error::Dirty)
+            .unwrap_or(Error::UnknownResult(result.kind.repr))),
+        NativeActionResultKind::DestinationExists => Err(operation
+            .drawing_id()
+            .map(Error::DestinationExists)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::OpenFailed => Err(Error::OpenFailed(failure)),
         NativeActionResultKind::LockFailed => Err(Error::LockFailed(failure)),

@@ -30,6 +30,7 @@ mod ffi {
         Unnamed,
         ReadOnly,
         Dirty,
+        DestinationExists,
         OpenFailed,
         LockFailed,
         SaveFailed,
@@ -188,6 +189,8 @@ mod ffi {
         fn database_token(self: &NativeAction) -> usize;
 
         fn open_path(self: &NativeAction) -> &str;
+
+        fn save_path(self: &NativeAction) -> &str;
 
         fn close_discard(self: &NativeAction) -> bool;
 

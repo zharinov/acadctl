@@ -13,7 +13,7 @@ use tower::service_fn;
 
 pub use drawing::{DrawingId, ParseDrawingIdError};
 pub use instance::{InstanceId, ParseInstanceIdError};
-pub use path::{DrawingPath, DrawingPathError};
+pub use path::{DrawingPath, DrawingPathError, SavePath};
 pub use protocol::drawing_service_client::DrawingServiceClient;
 pub use protocol::drawing_service_server::{DrawingService, DrawingServiceServer};
 pub use protocol::exec_service_client::ExecServiceClient;

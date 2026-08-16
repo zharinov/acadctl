@@ -1,7 +1,7 @@
 use acadctl_rpc::{
     CloseRequest, CloseResponse, Drawing as RpcDrawing, DrawingPathError, DrawingService,
     HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-    SaveRequest, SaveResponse,
+    SavePath, SaveRequest, SaveResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -32,8 +32,14 @@ impl DrawingService for DrawingRpc {
     }
 
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
-        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
-        let drawing = crate::scheduler::save(drawing_id)
+        let request = request.into_inner();
+        let drawing_id = parse_drawing_id(request.drawing_id)?;
+        let path = request
+            .path
+            .map(|path| path.parse::<SavePath>())
+            .transpose()
+            .map_err(drawing_path_status)?;
+        let drawing = crate::scheduler::save(drawing_id, path)
             .await
             .map_err(scheduler_error)?;
         Ok(Response::new(SaveResponse {
@@ -99,7 +105,8 @@ fn drawing_path_status(error: DrawingPathError) -> Status {
         DrawingPathError::TooLong => "The drawing path exceeds the 32 KiB limit",
         DrawingPathError::NotFile(_)
         | DrawingPathError::Resolve { .. }
-        | DrawingPathError::InvalidUtf8(_) => "The drawing path is invalid",
+        | DrawingPathError::InvalidUtf8(_)
+        | DrawingPathError::AlreadyExists(_) => "The drawing path is invalid",
     };
     Status::invalid_argument(message)
 }

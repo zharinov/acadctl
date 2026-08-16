@@ -73,10 +73,13 @@ fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) ->
         DrawingErrorKind::ReadOnly => format!("Drawing {target} is read-only"),
         DrawingErrorKind::UnsavedChanges => format!("Drawing {target} has unsaved changes"),
         DrawingErrorKind::NoFileName => {
-            format!("Drawing {target} has no file name (Save As is not supported)")
+            format!("Drawing {target} has no file name; use --as FILE")
         }
         DrawingErrorKind::Busy => format!("Drawing {target} is busy"),
         DrawingErrorKind::UndoDisabled => format!("Undo is disabled for drawing {target}"),
+        DrawingErrorKind::DestinationExists => {
+            "Destination already exists; use another path or omit --as".into()
+        }
         DrawingErrorKind::Unspecified => {
             unreachable!("unspecified drawing errors are not rendered")
         }
