@@ -1,0 +1,127 @@
+#!/bin/sh
+set -eu
+
+if test "$#" -ne 0; then
+    echo "usage: $0" >&2
+    exit 2
+fi
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+sdk_root=${OBJECTARX_SDK_ROOT:-/Library/Developer/Autodesk/ObjectARX 2027}
+deployment_target=${MACOSX_DEPLOYMENT_TARGET:-14.0}
+rust_target="$repo_root/target/rust-objectarx"
+llvm_root=${LLVM_ROOT:-}
+
+fail() {
+    echo "$1" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 ||
+        fail "$1 not found; install the development tools with 'brew bundle'"
+}
+
+for command_name in cargo git shellcheck shfmt; do
+    require_command "$command_name"
+done
+
+if test -z "$llvm_root"; then
+    require_command brew
+    llvm_root=$(brew --prefix llvm@22 2>/dev/null) ||
+        fail "llvm@22 not found; install the development tools with 'brew bundle'"
+fi
+
+clang_tidy="$llvm_root/bin/clang-tidy"
+clang_format="$llvm_root/bin/clang-format"
+
+test -x "$clang_tidy" || fail "clang-tidy not found under $llvm_root"
+test -x "$clang_format" || fail "clang-format not found under $llvm_root"
+cargo deny --version >/dev/null 2>&1 ||
+    fail "cargo-deny not found; install the development tools with 'brew bundle'"
+cargo shear --version >/dev/null 2>&1 ||
+    fail "cargo-shear not found; install the development tools with 'brew bundle'"
+
+LLVM_ROOT=$llvm_root
+export LLVM_ROOT
+
+log_root=$(mktemp -d "${TMPDIR:-/tmp}/acadctl-ci.XXXXXX")
+step_number=0
+
+cleanup() {
+    rm -rf -- "$log_root"
+}
+
+interrupt() {
+    status=$1
+    trap - EXIT HUP INT TERM
+    cleanup
+    echo >&2
+    echo "interrupted" >&2
+    exit "$status"
+}
+
+trap cleanup EXIT
+trap 'interrupt 129' HUP
+trap 'interrupt 130' INT
+trap 'interrupt 143' TERM
+
+run_step() {
+    label=$1
+    shift
+    step_number=$((step_number + 1))
+    log="$log_root/$step_number.log"
+
+    printf '%s... ' "$label"
+
+    if "$@" >"$log" 2>&1; then
+        echo "ok"
+    else
+        status=$?
+        echo "failed"
+        cat "$log"
+        exit "$status"
+    fi
+}
+
+cd "$repo_root"
+
+run_step "diff (worktree)" git diff --check
+run_step "diff (index)" git diff --cached --check
+run_step "format" bin/fmt --check
+run_step "shell" shellcheck bin/*
+run_step "clippy (host)" cargo clippy --quiet \
+    --workspace \
+    --all-targets \
+    --all-features \
+    --locked \
+    -- \
+    -D warnings
+run_step "clippy (Windows)" cargo clippy --quiet \
+    -p acadctl \
+    -p acadctl-lisp \
+    -p acadctl-rpc \
+    --target x86_64-pc-windows-msvc \
+    --all-targets \
+    --all-features \
+    --locked \
+    -- \
+    -D warnings
+run_step "test" cargo test --quiet --workspace --all-targets --all-features --locked
+run_step "documentation" env RUSTDOCFLAGS='-D warnings' cargo doc --quiet \
+    --workspace \
+    --all-features \
+    --no-deps \
+    --locked
+run_step "unused dependencies" cargo shear --locked --deny-warnings
+run_step "dependency policy" cargo deny --log-level error check
+run_step "native build" bin/build release
+run_step "native analysis" "$clang_tidy" --quiet \
+    crates/plugin/native/entry.cpp \
+    crates/plugin/native/host.cpp \
+    -- \
+    -std=c++17 \
+    -arch arm64 \
+    -mmacosx-version-min="$deployment_target" \
+    -isystem "$sdk_root/inc" \
+    -isystem "$rust_target/cxxbridge"
