@@ -3,7 +3,7 @@ mod exec;
 mod server;
 mod status;
 
-pub use server::{start, stop};
+pub(crate) use server::{start, stop};
 
 #[cfg(test)]
 mod tests;

@@ -27,7 +27,7 @@ pub use protocol::{
     exec_server_event,
 };
 pub use source::{SourceName, SourceNameError};
-pub use transport::{Incoming, discover, incoming};
+pub use transport::{Incoming, incoming};
 
 mod protocol {
     tonic::include_proto!("acadctl");

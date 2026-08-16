@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use acadctl_rpc::{DrawingOutcome as RpcDrawingOutcome, ExecMode as RpcExecMode, *};
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use tokio::sync::mpsc;
 
 use super::{start, stop};
@@ -36,11 +36,6 @@ fn reports_documents_and_stops_promptly() {
         },
     ]);
     start().unwrap();
-    assert!(
-        acadctl_rpc::discover()
-            .unwrap()
-            .contains(&acadctl_rpc::ProcessId::new(std::process::id()).unwrap())
-    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -292,6 +287,32 @@ fn execute_transport_preserves_the_four_mib_source_boundary() {
     });
 
     stop();
+}
+
+#[test]
+fn terminal_execution_response_holds_capacity_until_observed() {
+    let _test = crate::scheduler::TEST_LOCK.blocking_lock();
+    let mut reservations =
+        std::iter::from_fn(crate::scheduler::try_reserve_execution).collect::<Vec<_>>();
+    assert!(!reservations.is_empty());
+    let reservation = reservations.pop().unwrap();
+
+    let mut response = super::exec::terminal_response(
+        reservation,
+        crate::exec::ExecFailure::not_started("invalid request".to_owned()),
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        assert!(crate::scheduler::try_reserve_execution().is_none());
+        assert!(response.next().await.unwrap().is_ok());
+        assert!(crate::scheduler::try_reserve_execution().is_some());
+        assert!(response.next().await.is_none());
+    });
 }
 
 #[test]

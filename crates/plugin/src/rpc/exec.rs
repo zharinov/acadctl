@@ -38,7 +38,6 @@ struct ExecuteResponseState {
     control: Option<mpsc::Receiver<Result<ExecCancelDisposition, Status>>>,
     control_task: TokioJoinHandle<()>,
     phase: ExecuteResponsePhase,
-    _reservation: crate::scheduler::ExecReservation,
 }
 
 enum ExecuteResponsePhase {
@@ -58,21 +57,19 @@ impl ExecService for ExecRpc {
     ) -> Result<Response<Self::ExecuteStream>, Status> {
         let reservation = crate::scheduler::try_reserve_execution()
             .ok_or_else(|| Status::resource_exhausted("Too many live execution streams"))?;
+
         let mut inbound = request.into_inner();
         let first = tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, inbound.message())
             .await
             .map_err(|_| Status::deadline_exceeded("The execution request was not received"))??
             .ok_or_else(|| Status::invalid_argument("The first execution message is required"))?;
-        let request = match first.message {
-            Some(exec_client_message::Message::Request(request)) => request,
-            Some(exec_client_message::Message::Cancel(_)) | None => {
-                return Err(Status::invalid_argument(
-                    "The first execution message must be a request",
-                ));
-            }
+        let Some(exec_client_message::Message::Request(request)) = first.message else {
+            return Err(Status::invalid_argument(
+                "The first execution message must be a request",
+            ));
         };
 
-        let request = match validate_execution_request(request) {
+        let request = match ValidatedExecRequest::try_from(request) {
             Ok(request) => request,
             Err(failure) => return Ok(Response::new(terminal_response(reservation, failure))),
         };
@@ -83,16 +80,6 @@ impl ExecService for ExecRpc {
             source_name,
             source,
         } = request;
-        let mode = match RpcExecMode::try_from(mode) {
-            Ok(RpcExecMode::Eval) => ExecMode::Eval,
-            Ok(RpcExecMode::Exec) => ExecMode::Exec,
-            Ok(RpcExecMode::Unspecified) | Err(_) => {
-                return Ok(Response::new(terminal_response(
-                    reservation,
-                    failure("The execution mode must be eval or exec"),
-                )));
-            }
-        };
 
         let validation_source_name = source_name.clone();
         let validated = tokio::task::spawn_blocking(move || {
@@ -128,6 +115,8 @@ impl ExecService for ExecRpc {
         };
 
         let (job_id, output, completion) = admission.into_parts();
+        drop(reservation);
+
         let (control, control_task) = spawn_control_reader(inbound, job_id);
         let state = ExecuteResponseState {
             output,
@@ -135,7 +124,6 @@ impl ExecService for ExecRpc {
             control: Some(control),
             control_task,
             phase: ExecuteResponsePhase::SendAccepted,
-            _reservation: reservation,
         };
 
         Ok(Response::new(execution_response(state)))
@@ -163,24 +151,7 @@ impl ExecuteResponseState {
                     ))));
                 }
                 ExecuteResponsePhase::RelayOutput => {
-                    if let Some(control) = self.control.as_mut() {
-                        tokio::select! {
-                            biased;
-                            control = control.recv() => {
-                                if let Some(event) = self.handle_control(control)? {
-                                    return Ok(Some(event));
-                                }
-                            }
-                            output = self.output.next_chunk() => {
-                                match output {
-                                    Some(chunk) => return Ok(Some(server_event(
-                                        exec_server_event::Event::Output(ExecOutput { chunk }),
-                                    ))),
-                                    None => self.phase = ExecuteResponsePhase::AwaitCompletion,
-                                }
-                            }
-                        }
-                    } else {
+                    let Some(control) = self.control.as_mut() else {
                         match self.output.next_chunk().await {
                             Some(chunk) => {
                                 return Ok(Some(server_event(exec_server_event::Event::Output(
@@ -188,6 +159,25 @@ impl ExecuteResponseState {
                                 ))));
                             }
                             None => self.phase = ExecuteResponsePhase::AwaitCompletion,
+                        }
+
+                        continue;
+                    };
+
+                    tokio::select! {
+                        biased;
+                        control = control.recv() => {
+                            if let Some(event) = self.handle_control(control)? {
+                                return Ok(Some(event));
+                            }
+                        }
+                        output = self.output.next_chunk() => {
+                            match output {
+                                Some(chunk) => return Ok(Some(server_event(
+                                    exec_server_event::Event::Output(ExecOutput { chunk }),
+                                ))),
+                                None => self.phase = ExecuteResponsePhase::AwaitCompletion,
+                            }
                         }
                     }
                 }
@@ -225,17 +215,19 @@ impl ExecuteResponseState {
         &mut self,
         control: Option<Result<ExecCancelDisposition, Status>>,
     ) -> Result<Option<ExecServerEvent>, Status> {
+        let Some(control) = control else {
+            self.control = None;
+
+            return Ok(None);
+        };
+
         match control {
-            Some(Ok(result)) => Ok(Some(server_event(
+            Ok(result) => Ok(Some(server_event(
                 exec_server_event::Event::CancelAcknowledgement(ExecCancelAcknowledgement {
                     disposition: result as i32,
                 }),
             ))),
-            Some(Err(status)) => Err(status),
-            None => {
-                self.control = None;
-                Ok(None)
-            }
+            Err(status) => Err(status),
         }
     }
 }
@@ -309,38 +301,52 @@ fn spawn_control_reader(
     (receiver, task)
 }
 
-fn terminal_response(
+pub(super) fn terminal_response(
     reservation: crate::scheduler::ExecReservation,
     failure: ExecFailure,
 ) -> ExecuteResponse {
     let event = finished_event(ExecOutcome::Failure(failure));
-    Box::pin(stream::unfold(
-        (reservation, Some(event)),
-        |(reservation, event)| async move { event.map(|event| (Ok(event), (reservation, None))) },
-    ))
-}
 
-fn validate_execution_request(request: ExecRequest) -> Result<ValidatedExecRequest, ExecFailure> {
-    let document_id =
-        DocId::try_from(request.document_id).map_err(|_| failure("The document ID is invalid"))?;
-    let source_name = SourceName::new(request.source_name).map_err(|error| match error {
-        SourceNameError::Empty => failure("The source name is required"),
-        SourceNameError::TooLong => failure("The source name exceeds the 4 KiB limit"),
-    })?;
-
-    Ok(ValidatedExecRequest {
-        document_id,
-        mode: request.mode,
-        source_name,
-        source: request.source,
-    })
+    Box::pin(stream::once(async move {
+        let _reservation = reservation;
+        Ok(event)
+    }))
 }
 
 struct ValidatedExecRequest {
     document_id: DocId,
-    mode: i32,
+    mode: ExecMode,
     source_name: SourceName,
     source: bytes::Bytes,
+}
+
+impl TryFrom<ExecRequest> for ValidatedExecRequest {
+    type Error = ExecFailure;
+
+    fn try_from(request: ExecRequest) -> Result<Self, Self::Error> {
+        let document_id = DocId::try_from(request.document_id)
+            .map_err(|_| failure("The document ID is invalid"))?;
+
+        let source_name = SourceName::new(request.source_name).map_err(|error| match error {
+            SourceNameError::Empty => failure("The source name is required"),
+            SourceNameError::TooLong => failure("The source name exceeds the 4 KiB limit"),
+        })?;
+
+        let mode = match RpcExecMode::try_from(request.mode) {
+            Ok(RpcExecMode::Eval) => ExecMode::Eval,
+            Ok(RpcExecMode::Exec) => ExecMode::Exec,
+            Ok(RpcExecMode::Unspecified) | Err(_) => {
+                return Err(failure("The execution mode must be eval or exec"));
+            }
+        };
+
+        Ok(Self {
+            document_id,
+            mode,
+            source_name,
+            source: request.source,
+        })
+    }
 }
 
 fn validation_failure(error: SourceValidationError, source_name: SourceName) -> ExecFailure {

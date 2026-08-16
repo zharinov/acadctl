@@ -59,6 +59,7 @@ impl DocRegistry {
             .map(|tracked| tracked.document.id)
             .collect::<HashSet<_>>();
         let mut previous = std::mem::take(&mut self.documents);
+
         let mut seen_tokens = HashSet::with_capacity(native_documents.len());
 
         self.documents.reserve(native_documents.len());
@@ -70,13 +71,7 @@ impl DocRegistry {
 
             let id = take_document_id(&mut previous, native.document_token)
                 .unwrap_or_else(|| new_document_id(&mut reserved_ids));
-            self.documents.push(TrackedDoc {
-                native_key: NativeDocKey {
-                    document_token: native.document_token,
-                    database_token: native.database_token,
-                },
-                document: public_document(id, native),
-            });
+            self.documents.push(TrackedDoc::from_native(id, native));
         }
     }
 
@@ -91,7 +86,7 @@ impl DocRegistry {
         self.documents
             .iter()
             .find(|tracked| tracked.document.id == id)
-            .map(document_target)
+            .map(TrackedDoc::target)
     }
 
     pub fn find_by_path(&self, path: &DrawingPath) -> Option<DocTarget> {
@@ -103,7 +98,31 @@ impl DocRegistry {
                     .file_path()
                     .is_some_and(|file_path| path.matches(file_path.as_str()))
             })
-            .map(document_target)
+            .map(TrackedDoc::target)
+    }
+}
+
+impl TrackedDoc {
+    fn from_native(id: DocId, native: NativeDocSnapshot) -> Self {
+        Self {
+            native_key: NativeDocKey {
+                document_token: native.document_token,
+                database_token: native.database_token,
+            },
+            document: Doc {
+                id,
+                name: DocName::from_native(native.name, native.named),
+                modified: native.modified,
+                read_only: native.read_only,
+            },
+        }
+    }
+
+    fn target(&self) -> DocTarget {
+        DocTarget {
+            native_key: self.native_key,
+            document: self.document.clone(),
+        }
     }
 }
 
@@ -120,22 +139,6 @@ impl Doc {
             DocName::Named(path) => Some(path),
             DocName::Unnamed(_) => None,
         }
-    }
-}
-
-fn public_document(id: DocId, native: NativeDocSnapshot) -> Doc {
-    Doc {
-        id,
-        name: document_name(native.name, native.named),
-        modified: native.modified,
-        read_only: native.read_only,
-    }
-}
-
-fn document_target(tracked: &TrackedDoc) -> DocTarget {
-    DocTarget {
-        native_key: tracked.native_key,
-        document: tracked.document.clone(),
     }
 }
 
@@ -158,19 +161,21 @@ fn new_document_id(reserved_ids: &mut HashSet<DocId>) -> DocId {
     }
 }
 
-fn document_name(mut name: String, named: bool) -> DocName {
-    if named {
-        return DocName::Named(name.into());
-    }
+impl DocName {
+    fn from_native(mut name: String, named: bool) -> Self {
+        if named {
+            return Self::Named(name.into());
+        }
 
-    if name
-        .get(name.len().saturating_sub(4)..)
-        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dwg"))
-    {
-        name.truncate(name.len() - 4);
-    }
+        if name
+            .get(name.len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".dwg"))
+        {
+            name.truncate(name.len() - 4);
+        }
 
-    DocName::Unnamed(name)
+        Self::Unnamed(name)
+    }
 }
 
 #[cfg(test)]
@@ -241,15 +246,15 @@ mod tests {
     #[test]
     fn strips_drawing_suffix_only_from_unnamed_documents() {
         assert_eq!(
-            document_name("Drawing1.DWG".into(), false),
+            DocName::from_native("Drawing1.DWG".into(), false),
             DocName::Unnamed("Drawing1".into())
         );
         assert_eq!(
-            document_name("/tmp/house.DWG".into(), true),
+            DocName::from_native("/tmp/house.DWG".into(), true),
             DocName::Named("/tmp/house.DWG".into())
         );
         assert_eq!(
-            document_name("図面".into(), false),
+            DocName::from_native("図面".into(), false),
             DocName::Unnamed("図面".into())
         );
     }

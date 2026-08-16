@@ -7,7 +7,7 @@ use crate::ffi::{
 };
 
 use super::error::{Error, NativeFailure};
-use super::operation::{Operation, OperationOutcome, finalize};
+use super::operation::{Operation, OperationOutcome};
 
 pub(super) enum NativeCommand {
     Open(DrawingPath),
@@ -184,53 +184,55 @@ impl NativeExecFinalizationObservation {
     }
 }
 
-pub(super) fn complete_operation(
-    mut result: NativeActionResult,
-    operation: &mut Operation,
-    documents: &DocRegistry,
-    native_target: Option<NativeDocKey>,
-) -> Result<OperationOutcome, Error> {
-    if matches!(
-        operation,
-        Operation::Execute { execution, .. } if execution.outcome().is_some()
-    ) && !matches!(
-        result.kind,
-        NativeActionResultKind::DocContextRestoreFailed
-            | NativeActionResultKind::ExecBridgeFinalizationFailed
-            | NativeActionResultKind::ExecBridgeSymbolsClearFailed
-            | NativeActionResultKind::ExecBridgeFailed
-    ) {
-        return finalize(operation, documents, native_target);
+impl Operation {
+    pub(super) fn complete_native(
+        &mut self,
+        mut result: NativeActionResult,
+        documents: &DocRegistry,
+        native_target: Option<NativeDocKey>,
+    ) -> Result<OperationOutcome, Error> {
+        if matches!(
+            self,
+            Operation::Execute { execution, .. } if execution.outcome().is_some()
+        ) && !matches!(
+            result.kind,
+            NativeActionResultKind::DocContextRestoreFailed
+                | NativeActionResultKind::ExecBridgeFinalizationFailed
+                | NativeActionResultKind::ExecBridgeSymbolsClearFailed
+                | NativeActionResultKind::ExecBridgeFailed
+        ) {
+            return self.complete(documents, native_target);
+        }
+
+        if result.kind == NativeActionResultKind::ExecBridgeSymbolsClearFailed
+            && let Operation::Execute { execution, .. } = self
+            && matches!(execution.outcome(), Some(ExecOutcome::Failure(_)))
+        {
+            return self.complete(documents, native_target);
+        }
+
+        if matches!(
+            result.kind,
+            NativeActionResultKind::DocContextRestoreFailed
+                | NativeActionResultKind::ExecBridgeFinalizationFailed
+        ) && let Operation::Execute { execution, .. } = self
+            && execution.outcome().is_some()
+        {
+            let recorded = execution.record_bridge_finalization_failure(ExecStepResult {
+                kind: crate::exec::ExecStepResultKind::NativeError,
+                native_status: result.native_status,
+                lisp_errno: 0,
+                detail: std::mem::take(&mut result.native_detail),
+                bridge_symbols_clear_status: 0,
+            });
+            debug_assert!(recorded);
+
+            return self.complete(documents, native_target);
+        }
+
+        interpret(result, self)?;
+        self.complete(documents, native_target)
     }
-
-    if result.kind == NativeActionResultKind::ExecBridgeSymbolsClearFailed
-        && let Operation::Execute { execution, .. } = operation
-        && matches!(execution.outcome(), Some(ExecOutcome::Failure(_)))
-    {
-        return finalize(operation, documents, native_target);
-    }
-
-    if matches!(
-        result.kind,
-        NativeActionResultKind::DocContextRestoreFailed
-            | NativeActionResultKind::ExecBridgeFinalizationFailed
-    ) && let Operation::Execute { execution, .. } = operation
-        && execution.outcome().is_some()
-    {
-        let recorded = execution.record_bridge_finalization_failure(ExecStepResult {
-            kind: crate::exec::ExecStepResultKind::NativeError,
-            native_status: result.native_status,
-            lisp_errno: 0,
-            detail: std::mem::take(&mut result.native_detail),
-            bridge_symbols_clear_status: 0,
-        });
-        debug_assert!(recorded);
-
-        return finalize(operation, documents, native_target);
-    }
-
-    interpret(result, operation)?;
-    finalize(operation, documents, native_target)
 }
 
 pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Result<(), Error> {

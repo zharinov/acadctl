@@ -1,7 +1,9 @@
 use std::future::pending;
 use std::io;
 
-use acadctl_rpc::{ExecCancelRequest, ExecClientMessage, exec_client_message};
+use acadctl_rpc::{
+    ExecCancelDisposition, ExecCancelRequest, ExecClientMessage, exec_client_message,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -14,14 +16,14 @@ pub(super) enum Interrupt {
 }
 
 pub(super) struct Interrupts {
-    pub(super) receiver: Option<mpsc::Receiver<Interrupt>>,
-    pub(super) task: JoinHandle<()>,
-    pub(super) diagnostics: PipeWriter,
-    pub(super) phase: InterruptPhase,
+    receiver: Option<mpsc::Receiver<Interrupt>>,
+    task: JoinHandle<()>,
+    diagnostics: PipeWriter,
+    phase: InterruptPhase,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum InterruptPhase {
+enum InterruptPhase {
     Attached,
     CancelRequested(CancellationDisposition),
     DetachRequested(CancellationDisposition),
@@ -29,18 +31,31 @@ pub(super) enum InterruptPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CancellationDisposition {
+enum CancellationDisposition {
     NotQueued,
     Queued,
     Accepted,
     TooLate,
 }
 
-pub(super) enum AcknowledgementResult {
+enum AcknowledgementResult {
     Recorded,
     RecordedBeforeInterrupt,
     Duplicate,
     Invalid,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CancellationReceipt {
+    Continue,
+    Detach,
+    Duplicate,
+    Invalid,
+}
+
+pub(super) enum DiagnosticWait {
+    Complete,
+    Interrupted,
 }
 
 impl Interrupts {
@@ -49,10 +64,12 @@ impl Interrupts {
         diagnostics: PipeWriter,
     ) -> io::Result<(Self, mpsc::Receiver<ExecClientMessage>)> {
         let mut signals = interrupt_signal_stream()?;
+
         let (sender, outbound) = mpsc::channel(2);
         sender
             .try_send(request)
             .map_err(|_| io::Error::other("could not queue the execution request"))?;
+
         let (event_sender, receiver) = mpsc::channel(3);
         let task = tokio::spawn(async move {
             if signals.recv().await.is_none() {
@@ -77,6 +94,7 @@ impl Interrupts {
 
             let _ = event_sender.send(Interrupt::ForceDetach).await;
         });
+
         Ok((
             Self {
                 receiver: Some(receiver),
@@ -167,7 +185,7 @@ impl Interrupts {
         )
     }
 
-    pub(super) fn cancellation_disposition(&self) -> Option<CancellationDisposition> {
+    fn cancellation_disposition(&self) -> Option<CancellationDisposition> {
         match self.phase {
             InterruptPhase::Attached => None,
             InterruptPhase::CancelRequested(disposition)
@@ -176,7 +194,7 @@ impl Interrupts {
         }
     }
 
-    pub(super) fn acknowledge_cancellation(
+    fn acknowledge_cancellation(
         &mut self,
         disposition: CancellationDisposition,
     ) -> AcknowledgementResult {
@@ -204,7 +222,58 @@ impl Interrupts {
             }
             InterruptPhase::Attached => return AcknowledgementResult::Invalid,
         };
+
         AcknowledgementResult::Recorded
+    }
+
+    pub(super) fn record_cancellation_acknowledgement(
+        &mut self,
+        disposition: i32,
+    ) -> CancellationReceipt {
+        let disposition = match ExecCancelDisposition::try_from(disposition) {
+            Ok(ExecCancelDisposition::Accepted) => CancellationDisposition::Accepted,
+            Ok(ExecCancelDisposition::TooLate) => {
+                self.notice(
+                    "acadctl: cancellation was too late; execution will continue. Press Ctrl+C again to detach.",
+                );
+                CancellationDisposition::TooLate
+            }
+            Ok(ExecCancelDisposition::Unspecified) | Err(_) => {
+                return CancellationReceipt::Invalid;
+            }
+        };
+
+        match self.acknowledge_cancellation(disposition) {
+            AcknowledgementResult::Recorded => {}
+            AcknowledgementResult::RecordedBeforeInterrupt => {
+                if disposition == CancellationDisposition::Accepted {
+                    self.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
+                }
+            }
+            AcknowledgementResult::Duplicate => return CancellationReceipt::Duplicate,
+            AcknowledgementResult::Invalid => return CancellationReceipt::Invalid,
+        }
+
+        if self.detach_requested() {
+            return CancellationReceipt::Detach;
+        }
+
+        CancellationReceipt::Continue
+    }
+
+    pub(super) async fn write_diagnostic(&mut self, text: String) -> DiagnosticWait {
+        let diagnostics = self.diagnostics.clone();
+        let write = diagnostics.write(text);
+        tokio::pin!(write);
+
+        tokio::select! {
+            biased;
+            interrupt = self.next() => {
+                self.note(interrupt);
+                DiagnosticWait::Interrupted
+            }
+            _ = &mut write => DiagnosticWait::Complete,
+        }
     }
 
     pub(super) fn notice(&self, message: &str) {
@@ -217,9 +286,16 @@ impl Interrupts {
 
     #[cfg(test)]
     pub(super) fn test_pair() -> (Self, mpsc::Sender<Interrupt>) {
+        let diagnostics = PipeWriter::spawn(io::sink(), 8, "acadctl-test-stderr").unwrap();
+        Self::test_with_diagnostics(diagnostics)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_with_diagnostics(
+        diagnostics: PipeWriter,
+    ) -> (Self, mpsc::Sender<Interrupt>) {
         let (sender, receiver) = mpsc::channel(3);
         let task = tokio::spawn(pending::<()>());
-        let diagnostics = PipeWriter::spawn(io::sink(), 8, "acadctl-test-stderr").unwrap();
         (
             Self {
                 receiver: Some(receiver),
@@ -248,6 +324,7 @@ pub(super) async fn publish_cancel(
         })
         .await
         .is_ok();
+
     event_sender
         .send(Interrupt::Cancel { queued })
         .await

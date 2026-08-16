@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use tokio::sync::mpsc;
 
-use acadctl_rpc::{DrawingOutcome, SourceLocation};
+use acadctl_rpc::{DrawingOutcome, ExecCancelDisposition, SourceLocation};
 
 use super::*;
 
@@ -143,16 +143,17 @@ async fn acknowledged_or_forced_detach_stops_waiting() {
         .send(Interrupt::Cancel { queued: true })
         .await
         .unwrap();
+
     let interrupt = acknowledged.next().await;
     acknowledged.note(interrupt);
+
     assert_eq!(
-        record_cancellation_acknowledgement(
-            &mut acknowledged,
-            ExecCancelDisposition::Accepted as i32,
-        ),
+        acknowledged.record_cancellation_acknowledgement(ExecCancelDisposition::Accepted as i32),
         CancellationReceipt::Continue
     );
+
     acknowledged_sender.send(Interrupt::Detach).await.unwrap();
+
     assert!(matches!(
         wait_for_control(pending::<()>(), &mut acknowledged).await,
         ControlWait::ConfirmedDetach
@@ -165,6 +166,7 @@ async fn acknowledged_or_forced_detach_stops_waiting() {
         .unwrap();
     forced_sender.send(Interrupt::Detach).await.unwrap();
     forced_sender.send(Interrupt::ForceDetach).await.unwrap();
+
     assert!(matches!(
         wait_for_control(pending::<()>(), &mut forced).await,
         ControlWait::UnconfirmedDetach
@@ -178,17 +180,19 @@ async fn too_late_after_the_first_interrupt_remains_attached() {
         .send(Interrupt::Cancel { queued: true })
         .await
         .unwrap();
+
     let interrupt = interrupts.next().await;
     interrupts.note(interrupt);
 
     assert_eq!(
-        record_cancellation_acknowledgement(&mut interrupts, ExecCancelDisposition::TooLate as i32,),
+        interrupts.record_cancellation_acknowledgement(ExecCancelDisposition::TooLate as i32),
         CancellationReceipt::Continue
     );
     assert!(interrupts.cancellation_acknowledged());
     assert!(!interrupts.detach_requested());
 
     sender.send(Interrupt::Detach).await.unwrap();
+
     assert!(matches!(
         wait_for_control(pending::<()>(), &mut interrupts).await,
         ControlWait::ConfirmedDetach
@@ -198,11 +202,9 @@ async fn too_late_after_the_first_interrupt_remains_attached() {
 #[tokio::test]
 async fn acknowledgement_may_arrive_before_the_local_interrupt_event() {
     let (mut interrupts, sender) = Interrupts::test_pair();
+
     assert_eq!(
-        record_cancellation_acknowledgement(
-            &mut interrupts,
-            ExecCancelDisposition::Accepted as i32,
-        ),
+        interrupts.record_cancellation_acknowledgement(ExecCancelDisposition::Accepted as i32),
         CancellationReceipt::Continue
     );
 
@@ -210,6 +212,7 @@ async fn acknowledgement_may_arrive_before_the_local_interrupt_event() {
         .send(Interrupt::Cancel { queued: true })
         .await
         .unwrap();
+
     let interrupt = interrupts.next().await;
     interrupts.note(interrupt);
 
@@ -235,6 +238,7 @@ async fn pre_accept_timeout_stops_after_cancellation() {
         .send(Interrupt::Cancel { queued: true })
         .await
         .unwrap();
+
     assert!(matches!(
         wait_for_response_start_with_timeout(
             async {
@@ -262,21 +266,20 @@ async fn closed_outbound_cancel_still_interrupts_a_blocked_diagnostic() {
         "acadctl-test-closed-outbound-stderr",
     )
     .unwrap();
-    let (event_sender, receiver) = mpsc::channel(3);
-    let mut interrupts = Interrupts {
-        receiver: Some(receiver),
-        task: tokio::spawn(pending::<()>()),
-        diagnostics,
-        phase: InterruptPhase::Attached,
-    };
+
+    let (mut interrupts, event_sender) = Interrupts::test_with_diagnostics(diagnostics);
 
     let diagnostic = tokio::spawn(async move {
-        write_diagnostic(&mut interrupts, "blocked diagnostic".into()).await
+        interrupts
+            .write_diagnostic("blocked diagnostic".into())
+            .await
     });
+
     wait_until_started(&stderr_started).await;
 
     let (outbound_sender, outbound_receiver) = mpsc::channel(2);
     drop(outbound_receiver);
+
     assert!(publish_cancel(&outbound_sender, &event_sender).await);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), diagnostic)
@@ -304,10 +307,12 @@ async fn cancelling_stdout_wait_does_not_leave_tokio_blocking_work() {
         )
         .unwrap(),
     );
+
     let write = tokio::spawn({
         let writer = Arc::clone(&writer);
         async move { writer.write("blocked".into()).await }
     });
+
     wait_until_started(&started).await;
 
     write.abort();
@@ -332,6 +337,7 @@ async fn blocked_stdout_and_stderr_do_not_block_forced_detach() {
         )
         .unwrap(),
     );
+
     let diagnostics = PipeWriter::spawn(
         BlockingWriter {
             started: Arc::clone(&stderr_started),
@@ -341,6 +347,7 @@ async fn blocked_stdout_and_stderr_do_not_block_forced_detach() {
         "acadctl-test-combined-stderr",
     )
     .unwrap();
+
     let stdout_write = tokio::spawn({
         let stdout = Arc::clone(&stdout);
         async move { stdout.write("blocked stdout".into()).await }
@@ -349,14 +356,7 @@ async fn blocked_stdout_and_stderr_do_not_block_forced_detach() {
     wait_until_started(&stdout_started).await;
     wait_until_started(&stderr_started).await;
 
-    let (sender, receiver) = mpsc::channel(3);
-    let task = tokio::spawn(pending::<()>());
-    let mut interrupts = Interrupts {
-        receiver: Some(receiver),
-        task,
-        diagnostics,
-        phase: InterruptPhase::Attached,
-    };
+    let (mut interrupts, sender) = Interrupts::test_with_diagnostics(diagnostics);
 
     sender
         .send(Interrupt::Cancel { queued: true })

@@ -16,6 +16,6 @@ impl AutoCadProcess {
     }
 }
 
-pub fn autocad_processes() -> Vec<AutoCadProcess> {
+pub(super) fn discover() -> Vec<AutoCadProcess> {
     Vec::new()
 }

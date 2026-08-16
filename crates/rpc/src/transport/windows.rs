@@ -21,12 +21,14 @@ impl Listener {
     pub fn bind(process_id: ProcessId) -> io::Result<Self> {
         let name = endpoint(process_id);
         let next = server_options(true).create(&name)?;
+
         Ok(Self { name, next })
     }
 
     pub async fn accept(&mut self) -> io::Result<ServerStream> {
         self.next.connect().await?;
         let next = server_options(false).create(&self.name)?;
+
         Ok(std::mem::replace(&mut self.next, next))
     }
 }
@@ -43,13 +45,6 @@ pub async fn connect(process_id: ProcessId) -> io::Result<ClientStream> {
             Err(error) => return Err(error),
         }
     }
-}
-
-pub fn discover() -> io::Result<Vec<ProcessId>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Windows named-pipe discovery is not implemented",
-    ))
 }
 
 fn endpoint(process_id: ProcessId) -> String {

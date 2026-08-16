@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::{DrawingPath, OpenRequest, ProcessId};
 
-use crate::instance::Instance;
+use crate::instance::{Instance, ProcessSnapshot};
 
 use super::{fail, parse_document_id, query_error_message, request_error_message};
 
@@ -16,10 +16,8 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
     let process_id = match process_id {
         Some(process_id) => process_id,
         None => {
-            let instances = match crate::instance::list().await {
-                Ok(instances) => instances,
-                Err(_) => return fail("Could not inspect running AutoCAD instances.".into()),
-            };
+            let processes = ProcessSnapshot::discover();
+            let instances = processes.query_instances().await;
 
             match select_instance(&instances) {
                 Ok(process_id) => process_id,
@@ -41,6 +39,7 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
     let Some(document) = opened.document else {
         return fail("AutoCAD did not identify the opened document.".into());
     };
+
     let document_id = match parse_document_id(document.id) {
         Ok(id) => id,
         Err(error) => return fail(error),
@@ -51,6 +50,10 @@ pub async fn run(path: PathBuf, process_id: Option<ProcessId>) -> ExitCode {
 }
 
 fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {
+    if instances.is_empty() {
+        return Err("AutoCAD is not running.".into());
+    }
+
     let available = instances
         .iter()
         .filter(|instance| instance.documents.is_ok())
@@ -58,7 +61,6 @@ fn select_instance(instances: &[Instance]) -> Result<ProcessId, String> {
 
     match available.as_slice() {
         [instance] => Ok(instance.process_id),
-        [] if instances.is_empty() => Err("AutoCAD is not running.".into()),
         [] => Err(instances
             .iter()
             .find_map(|instance| instance.documents.as_ref().err())

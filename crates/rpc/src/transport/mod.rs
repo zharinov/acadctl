@@ -28,6 +28,7 @@ pub fn incoming(process_id: ProcessId) -> io::Result<Incoming> {
                 .await
                 .map_err(io::Error::other)?;
             let stream = listener.accept().await?;
+
             Ok(Some((
                 ServerStream {
                     inner: stream,
@@ -37,11 +38,8 @@ pub fn incoming(process_id: ProcessId) -> io::Result<Incoming> {
             )))
         },
     );
-    Ok(Box::pin(connections))
-}
 
-pub fn discover() -> io::Result<Vec<ProcessId>> {
-    platform::discover()
+    Ok(Box::pin(connections))
 }
 
 pub struct ServerStream {

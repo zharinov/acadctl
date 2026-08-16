@@ -10,7 +10,62 @@ use super::exec::ExecRpc;
 
 const RESTART_BACKOFF: Duration = Duration::from_millis(100);
 
-static SERVER: Mutex<Option<Server>> = Mutex::new(None);
+static SERVER_MANAGER: ServerManager = ServerManager::new();
+
+struct ServerManager {
+    active: Mutex<Option<Server>>,
+}
+
+impl ServerManager {
+    const fn new() -> Self {
+        Self {
+            active: Mutex::new(None),
+        }
+    }
+
+    fn start(&self) -> Result<(), String> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| "RPC server state is unavailable".to_owned())?;
+
+        if active.as_ref().is_some_and(Server::is_running) {
+            return Ok(());
+        }
+
+        if let Some(stale) = active.take() {
+            stale.shutdown();
+        }
+
+        crate::scheduler::start();
+
+        let server = match Server::start() {
+            Ok(server) => server,
+            Err(error) => {
+                crate::scheduler::stop();
+
+                return Err(error);
+            }
+        };
+
+        *active = Some(server);
+        Ok(())
+    }
+
+    fn stop(&self) {
+        crate::scheduler::stop();
+
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+
+        let Some(server) = active.take() else {
+            return;
+        };
+
+        server.shutdown();
+    }
+}
 
 struct Server {
     stop: oneshot::Sender<()>,
@@ -18,6 +73,24 @@ struct Server {
 }
 
 impl Server {
+    fn start() -> Result<Self, String> {
+        let (stop, stop_receiver) = oneshot::channel();
+        let (startup_sender, startup_receiver) = std_mpsc::sync_channel(1);
+        let thread = thread::spawn(move || run(stop_receiver, startup_sender));
+
+        match startup_receiver.recv() {
+            Ok(Ok(())) => Ok(Self { stop, thread }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err("server thread stopped during startup".to_owned())
+            }
+        }
+    }
+
     fn is_running(&self) -> bool {
         !self.thread.is_finished()
     }
@@ -28,52 +101,18 @@ impl Server {
     }
 }
 
-pub fn start() -> Result<(), String> {
-    crate::scheduler::start();
-    let mut active = SERVER
-        .lock()
-        .map_err(|_| "server state is unavailable".to_owned())?;
-
-    if active.as_ref().is_some_and(Server::is_running) {
-        return Ok(());
-    }
-
-    if let Some(server) = active.take() {
-        server.shutdown();
-    }
-
-    let (stop, stop_receiver) = oneshot::channel();
-    let (startup_sender, startup_receiver) = std_mpsc::sync_channel(1);
-    let thread = thread::spawn(move || run(stop_receiver, startup_sender));
-
-    match startup_receiver.recv() {
-        Ok(Ok(())) => {
-            *active = Some(Server { stop, thread });
-            Ok(())
-        }
-        Ok(Err(error)) => {
-            let _ = thread.join();
-            Err(error)
-        }
-        Err(_) => {
-            let _ = thread.join();
-            Err("server thread stopped during startup".to_owned())
-        }
-    }
+pub(crate) fn start() -> Result<(), String> {
+    SERVER_MANAGER.start()
 }
 
-pub fn stop() {
-    crate::scheduler::stop();
-    let server = SERVER.lock().ok().and_then(|mut active| active.take());
-
-    if let Some(server) = server {
-        server.shutdown();
-    }
+pub(crate) fn stop() {
+    SERVER_MANAGER.stop();
 }
 
 fn run(stop: oneshot::Receiver<()>, startup: std_mpsc::SyncSender<Result<(), String>>) {
     let process_id =
         acadctl_rpc::ProcessId::new(std::process::id()).expect("the current process ID is nonzero");
+
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -96,7 +135,9 @@ async fn serve(
     startup: std_mpsc::SyncSender<Result<(), String>>,
 ) {
     let timer_driver = tokio::spawn(crate::scheduler::drive_timers());
+
     serve_until_stopped(process_id, stop, startup).await;
+
     timer_driver.abort();
 }
 
@@ -148,6 +189,7 @@ async fn serve_until_stopped(
             )
             .serve_with_incoming(connections);
         tokio::pin!(serving);
+
         tokio::select! {
             _ = &mut serving => {}
             _ = &mut stop => return,

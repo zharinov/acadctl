@@ -45,7 +45,7 @@ impl AutoCadProcess {
     }
 }
 
-pub fn autocad_processes() -> Vec<AutoCadProcess> {
+pub(super) fn discover() -> Vec<AutoCadProcess> {
     use objc2_app_kit::NSRunningApplication;
 
     let system = sysinfo::System::new_all();
@@ -86,11 +86,11 @@ pub fn autocad_processes() -> Vec<AutoCadProcess> {
 }
 
 fn is_autocad_bundle_identifier(identifier: &str) -> bool {
-    identifier
-        .strip_prefix("com.autodesk.AutoCAD")
-        .is_some_and(|version| {
-            !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
-        })
+    let Some(version) = identifier.strip_prefix("com.autodesk.AutoCAD") else {
+        return false;
+    };
+
+    !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]

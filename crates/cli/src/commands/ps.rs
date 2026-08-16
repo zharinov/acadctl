@@ -2,26 +2,24 @@ use std::process::ExitCode;
 
 use acadctl_rpc::{Doc, ProcessId};
 
-use crate::instance::Instance;
+use crate::instance::{Instance, ProcessSnapshot};
 
 use super::{fail, parse_document_id, query_error_message};
 
 pub async fn run(long: bool) -> ExitCode {
-    let instances = match crate::instance::list().await {
-        Ok(instances) => instances,
-        Err(_) => return fail("Could not inspect registered AutoCAD endpoints.".into()),
+    let processes = ProcessSnapshot::discover();
+    let instances = processes.query_instances().await;
+
+    let lines = match render(&instances, long) {
+        Ok(lines) => lines,
+        Err(error) => return fail(error),
     };
 
-    match render(&instances, long) {
-        Ok(lines) => {
-            for line in lines {
-                println!("{line}");
-            }
-
-            ExitCode::SUCCESS
-        }
-        Err(error) => fail(error),
+    for line in lines {
+        println!("{line}");
     }
+
+    ExitCode::SUCCESS
 }
 
 fn render(instances: &[Instance], long: bool) -> Result<Vec<String>, String> {
@@ -55,6 +53,7 @@ fn document_line(
     long: bool,
 ) -> Result<String, String> {
     let document_id = parse_document_id(document.id)?;
+
     let modified = if document.modified { "*" } else { "." };
     let mode = if document.read_only { "ro" } else { "rw" };
     let name = if long {

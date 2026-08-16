@@ -80,8 +80,48 @@ impl EventCode {
         Self::TooDeep,
     ];
 
-    pub(crate) fn from_raw(code: i32) -> Option<Self> {
-        Self::ALL.into_iter().find(|event| *event as i32 == code)
+    fn decode<'a>(self, payload: Payload<'a>) -> ValueEvent<'a> {
+        match (self, payload) {
+            (Self::BeginList, Payload::Nil) => ValueEvent::BeginList,
+            (Self::EndList, Payload::Nil) => ValueEvent::EndList,
+            (Self::Dot, Payload::Nil) => ValueEvent::Dot,
+            (Self::Nil, Payload::Nil) => ValueEvent::Nil,
+            (Self::True, Payload::Nil) => ValueEvent::True,
+            (Self::Integer, Payload::Integer(value)) => ValueEvent::Integer(value),
+            (Self::Real, Payload::Real(value)) => ValueEvent::Real(value),
+
+            (Self::BeginString, Payload::Nil) => ValueEvent::BeginString,
+            (Self::StringChunk, Payload::String(text)) => ValueEvent::StringChunk(text),
+            (Self::EndString, Payload::Nil) => ValueEvent::EndString,
+
+            (Self::BeginSymbol, Payload::Nil) => ValueEvent::BeginSymbol,
+            (Self::SymbolChunk, Payload::String(text)) => ValueEvent::SymbolChunk(text),
+            (Self::EndSymbol, Payload::Nil) => ValueEvent::EndSymbol,
+
+            (Self::Entity, Payload::Entity(handle)) => ValueEvent::Entity(handle),
+            (Self::SelectionSet, Payload::Nil) => ValueEvent::SelectionSet,
+            (Self::VlaObject, Payload::Nil) => ValueEvent::VlaObject,
+            (Self::File, Payload::Nil) => ValueEvent::File,
+            (Self::Function, Payload::Nil) => ValueEvent::Function,
+            (Self::ErrorObject, Payload::Nil) => ValueEvent::ErrorObject,
+            (Self::Object, Payload::String(label)) => ValueEvent::Object(Some(label)),
+
+            (Self::Cycle, Payload::Nil) => ValueEvent::Cycle,
+            (Self::TooDeep, Payload::Nil) => ValueEvent::TooDeep,
+
+            _ => ValueEvent::Invalid,
+        }
+    }
+}
+
+impl TryFrom<i32> for EventCode {
+    type Error = ();
+
+    fn try_from(code: i32) -> Result<Self, Self::Error> {
+        Self::ALL
+            .into_iter()
+            .find(|event| *event as i32 == code)
+            .ok_or(())
     }
 }
 
@@ -90,31 +130,7 @@ pub(crate) fn source() -> &'static str {
 }
 
 pub(crate) fn value_event<'a>(code: i32, payload: Payload<'a>) -> ValueEvent<'a> {
-    match (EventCode::from_raw(code), payload) {
-        (Some(EventCode::BeginList), Payload::Nil) => ValueEvent::BeginList,
-        (Some(EventCode::EndList), Payload::Nil) => ValueEvent::EndList,
-        (Some(EventCode::Dot), Payload::Nil) => ValueEvent::Dot,
-        (Some(EventCode::Nil), Payload::Nil) => ValueEvent::Nil,
-        (Some(EventCode::True), Payload::Nil) => ValueEvent::True,
-        (Some(EventCode::Integer), Payload::Integer(value)) => ValueEvent::Integer(value),
-        (Some(EventCode::Real), Payload::Real(value)) => ValueEvent::Real(value),
-        (Some(EventCode::BeginString), Payload::Nil) => ValueEvent::BeginString,
-        (Some(EventCode::StringChunk), Payload::String(text)) => ValueEvent::StringChunk(text),
-        (Some(EventCode::EndString), Payload::Nil) => ValueEvent::EndString,
-        (Some(EventCode::BeginSymbol), Payload::Nil) => ValueEvent::BeginSymbol,
-        (Some(EventCode::SymbolChunk), Payload::String(text)) => ValueEvent::SymbolChunk(text),
-        (Some(EventCode::EndSymbol), Payload::Nil) => ValueEvent::EndSymbol,
-        (Some(EventCode::Entity), Payload::Entity(handle)) => ValueEvent::Entity(handle),
-        (Some(EventCode::SelectionSet), Payload::Nil) => ValueEvent::SelectionSet,
-        (Some(EventCode::VlaObject), Payload::Nil) => ValueEvent::VlaObject,
-        (Some(EventCode::File), Payload::Nil) => ValueEvent::File,
-        (Some(EventCode::Function), Payload::Nil) => ValueEvent::Function,
-        (Some(EventCode::ErrorObject), Payload::Nil) => ValueEvent::ErrorObject,
-        (Some(EventCode::Object), Payload::String(label)) => ValueEvent::Object(Some(label)),
-        (Some(EventCode::Cycle), Payload::Nil) => ValueEvent::Cycle,
-        (Some(EventCode::TooDeep), Payload::Nil) => ValueEvent::TooDeep,
-        _ => ValueEvent::Invalid,
-    }
+    EventCode::try_from(code).map_or(ValueEvent::Invalid, |event| event.decode(payload))
 }
 
 fn render() -> String {

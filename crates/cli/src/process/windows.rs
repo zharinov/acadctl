@@ -12,7 +12,7 @@ impl AutoCadProcess {
 
     pub fn request_termination(&self, force: bool) -> bool {
         if !force {
-            return request_windows_close(self.process_id, self.handle);
+            return self.request_windows_close();
         }
 
         use windows_sys::Win32::System::Threading::{
@@ -42,6 +42,66 @@ impl AutoCadProcess {
             windows_sys::Win32::System::Threading::WaitForSingleObject(self.handle, 0)
                 == windows_sys::Win32::Foundation::WAIT_OBJECT_0
         }
+    }
+
+    fn request_windows_close(&self) -> bool {
+        use windows_sys::Win32::Foundation::{HWND, LPARAM};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+        };
+
+        struct CloseRequest {
+            process_id: u32,
+            original: windows_sys::Win32::Foundation::HANDLE,
+            sent: bool,
+        }
+
+        unsafe extern "system" fn close_window(window: HWND, request: LPARAM) -> i32 {
+            let request = unsafe { &mut *(request as *mut CloseRequest) };
+            let mut process_id = 0;
+            unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+
+            if process_id != request.process_id {
+                return 1;
+            }
+
+            let current = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+
+            if current.is_null() {
+                return 1;
+            }
+
+            let same_process = same_windows_process(request.original, current);
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(current) };
+
+            if !same_process {
+                return 1;
+            }
+
+            if unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
+                request.sent = true;
+            }
+
+            1
+        }
+
+        let mut request = CloseRequest {
+            process_id: self.process_id.get(),
+            original: self.handle,
+            sent: false,
+        };
+
+        unsafe {
+            EnumWindows(
+                Some(close_window),
+                (&mut request as *mut CloseRequest) as LPARAM,
+            )
+        };
+
+        request.sent
     }
 }
 
@@ -78,7 +138,7 @@ impl Drop for AutoCadProcess {
     }
 }
 
-pub fn autocad_processes() -> Vec<AutoCadProcess> {
+pub(super) fn discover() -> Vec<AutoCadProcess> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::path::PathBuf;
@@ -127,61 +187,4 @@ pub fn autocad_processes() -> Vec<AutoCadProcess> {
 
     processes.sort_unstable_by_key(AutoCadProcess::process_id);
     processes
-}
-
-fn request_windows_close(
-    process_id: ProcessId,
-    original: windows_sys::Win32::Foundation::HANDLE,
-) -> bool {
-    use windows_sys::Win32::Foundation::{HWND, LPARAM};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
-    };
-
-    struct CloseRequest {
-        process_id: u32,
-        original: windows_sys::Win32::Foundation::HANDLE,
-        sent: bool,
-    }
-
-    unsafe extern "system" fn close_window(window: HWND, request: LPARAM) -> i32 {
-        let request = unsafe { &mut *(request as *mut CloseRequest) };
-        let mut process_id = 0;
-        unsafe { GetWindowThreadProcessId(window, &mut process_id) };
-
-        if process_id != request.process_id {
-            return 1;
-        }
-
-        let current = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-
-        if current.is_null() {
-            return 1;
-        }
-
-        let same_process = same_windows_process(request.original, current);
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(current) };
-
-        if same_process && unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
-            request.sent = true;
-        }
-
-        1
-    }
-
-    let mut request = CloseRequest {
-        process_id: process_id.get(),
-        original,
-        sent: false,
-    };
-
-    unsafe {
-        EnumWindows(
-            Some(close_window),
-            (&mut request as *mut CloseRequest) as LPARAM,
-        )
-    };
-
-    request.sent
 }

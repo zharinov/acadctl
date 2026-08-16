@@ -8,17 +8,17 @@ use tokio::sync::oneshot;
 
 use crate::doc::{Doc, DocRegistry, NativeDocKey};
 use crate::exec::output::{OutputSink, OutputStream};
-use crate::exec::{Exec, ExecOutcome, bound_diagnostic};
+use crate::exec::{
+    Exec, ExecOutcome, ExecStepResult, NativeExecStep, ValueOutputLease, bound_diagnostic,
+};
 use crate::ffi::{NativeActionResult, NativeActionResultKind, NativeExecFinalizationObservation};
 
 use super::error::Error;
 use super::native::{
-    NativeAction, classify_execution_finalization, complete_operation,
-    native_result_requires_quarantine, schedule_native_actions,
+    NativeAction, classify_execution_finalization, native_result_requires_quarantine,
+    schedule_native_actions,
 };
-use super::operation::{
-    HistoryDirection, Operation, OperationOutcome, Prepared, finalize, prepare,
-};
+use super::operation::{HistoryDirection, Operation, OperationOutcome, Prepared};
 use super::timer::{BUSY_RETRY_INITIAL, BUSY_RETRY_MAX, EXECUTION_START_TIMEOUT, notify_changed};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
@@ -36,24 +36,24 @@ pub const MAX_ADMITTED_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(super) struct MutationScheduler {
-    pub(super) documents: DocRegistry,
-    pub(super) pending: VecDeque<MutationJob>,
-    pub(super) active: Option<MutationJob>,
-    pub(super) wake_pending: bool,
-    pub(super) stopping: bool,
-    pub(super) quarantined: bool,
+    documents: DocRegistry,
+    pending: VecDeque<MutationJob>,
+    active: Option<MutationJob>,
+    wake_pending: bool,
+    stopping: bool,
+    quarantined: bool,
 }
 
-pub(super) struct MutationJob {
-    pub(super) job_id: MutationJobId,
-    pub(super) operation: Operation,
-    pub(super) native_target: Option<NativeDocKey>,
-    pub(super) start_deadline: Option<Instant>,
-    pub(super) waiting_for_readiness: bool,
-    pub(super) retry_at: Option<Instant>,
-    pub(super) retry_delay: Duration,
-    pub(super) _execution_reservation: Option<ExecReservation>,
-    pub(super) completion: oneshot::Sender<Result<OperationOutcome, Error>>,
+struct MutationJob {
+    job_id: MutationJobId,
+    operation: Operation,
+    native_target: Option<NativeDocKey>,
+    start_deadline: Option<Instant>,
+    waiting_for_readiness: bool,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
+    _execution_reservation: Option<ExecReservation>,
+    completion: oneshot::Sender<Result<OperationOutcome, Error>>,
 }
 
 #[derive(Clone)]
@@ -70,13 +70,44 @@ impl Drop for ExecReservationInner {
     }
 }
 
+pub(super) type Completion = (
+    oneshot::Sender<Result<OperationOutcome, Error>>,
+    Result<OperationOutcome, Error>,
+    Option<OutputSink>,
+);
+type Admission = (
+    MutationJobId,
+    oneshot::Receiver<Result<OperationOutcome, Error>>,
+    bool,
+    Option<Completion>,
+);
+type StoppedJob = (
+    oneshot::Sender<Result<OperationOutcome, Error>>,
+    Option<OutputSink>,
+);
+
+enum SubmissionDecision {
+    Immediate(Result<OperationOutcome, Error>),
+    Queued {
+        receiver: oneshot::Receiver<Result<OperationOutcome, Error>>,
+        should_wake: bool,
+    },
+}
+
 enum TakeDecision {
     Action(NativeAction),
-    Complete(
-        oneshot::Sender<Result<OperationOutcome, Error>>,
-        Result<OperationOutcome, Error>,
-        Option<OutputSink>,
-    ),
+    Complete(Completion),
+    Idle,
+}
+
+enum CancelDecision {
+    Active(OutputSink),
+    Pending {
+        output: OutputSink,
+        completion: oneshot::Sender<Result<OperationOutcome, Error>>,
+        should_wake: bool,
+    },
+    Result(CancelResult),
 }
 
 pub struct ExecAdmission {
@@ -113,17 +144,23 @@ impl MutationScheduler {
         self.active.is_none() && self.pending.is_empty() && !self.wake_pending
     }
 
+    fn list(&self) -> Vec<Doc> {
+        self.documents.list()
+    }
+
+    fn replace_document_snapshot(&mut self, documents: Vec<crate::ffi::NativeDocSnapshot>) {
+        self.documents.replace_snapshot(documents);
+    }
+
+    fn start(&mut self) {
+        self.stopping = false;
+    }
+
     fn execution_usage(&self) -> (usize, usize) {
         self.pending
             .iter()
             .chain(self.active.iter())
-            .filter_map(|job| match &job.operation {
-                Operation::Execute { execution, .. } => Some(execution.source_bytes()),
-                Operation::Open { .. }
-                | Operation::Save { .. }
-                | Operation::Close { .. }
-                | Operation::History { .. } => None,
-            })
+            .filter_map(|job| job.operation.execution_source_bytes())
             .fold((0, 0), |(count, bytes), source_bytes| {
                 (count + 1, bytes + source_bytes)
             })
@@ -149,6 +186,370 @@ impl MutationScheduler {
 
         self.wake_pending = true;
         true
+    }
+
+    pub(super) fn take_execution_step(
+        &mut self,
+        job_id: MutationJobId,
+        now: Instant,
+    ) -> NativeExecStep {
+        let Some(job) = self.active.as_mut().filter(|job| job.job_id == job_id) else {
+            return NativeExecStep::invalid();
+        };
+
+        job.expire_if_due(now);
+        job.operation.take_execution_step()
+    }
+
+    pub(super) fn acquire_eval_value_output(
+        &self,
+        job_id: MutationJobId,
+        target: NativeDocKey,
+    ) -> Option<ValueOutputLease> {
+        self.active
+            .as_ref()
+            .filter(|job| job.job_id == job_id && job.native_target == Some(target))?
+            .operation
+            .acquire_eval_value_output()
+    }
+
+    pub(super) fn complete_execution_step(
+        &mut self,
+        job_id: MutationJobId,
+        result: ExecStepResult,
+    ) -> bool {
+        self.active
+            .as_mut()
+            .filter(|job| job.job_id == job_id)
+            .is_some_and(|job| job.operation.complete_execution_step(result))
+    }
+
+    pub(super) fn abandon_execution(
+        &mut self,
+        job_id: MutationJobId,
+        result: ExecStepResult,
+    ) -> bool {
+        self.active
+            .as_mut()
+            .filter(|job| job.job_id == job_id)
+            .is_some_and(|job| job.operation.abandon_execution(result))
+    }
+
+    pub(super) fn next_timer_deadline(&self) -> Option<Instant> {
+        let execution_start = self
+            .pending
+            .iter()
+            .chain(self.active.iter())
+            .filter(|job| job.execution_start_pending())
+            .filter_map(|job| job.start_deadline)
+            .min();
+
+        let retry = self
+            .pending
+            .front()
+            .filter(|job| job.waiting_for_readiness)
+            .and_then(|job| job.retry_at);
+        execution_start.into_iter().chain(retry).min()
+    }
+
+    pub(super) fn process_due_timers(&mut self, now: Instant) -> (Vec<Completion>, bool) {
+        if let Some(active) = self.active.as_mut() {
+            active.expire_if_due(now);
+        }
+
+        let mut expired = Vec::new();
+        let mut index = 0;
+
+        while index < self.pending.len() {
+            if !self.pending[index].deadline_is_due(now) {
+                index += 1;
+                continue;
+            }
+
+            let mut job = self.pending.remove(index).expect("queued job exists");
+
+            if job.expire_if_due(now) {
+                let output = job.operation.output_sink();
+                let outcome = job.operation.complete(&self.documents, None);
+
+                expired.push((job.completion, outcome, output));
+            } else {
+                self.pending.insert(index, job);
+                index += 1;
+            }
+        }
+
+        if let Some(head) = self.pending.front_mut()
+            && head.waiting_for_readiness
+            && head.retry_at.is_some_and(|retry_at| now >= retry_at)
+        {
+            head.waiting_for_readiness = false;
+            head.retry_at = None;
+        }
+
+        (expired, self.request_wake())
+    }
+
+    pub(super) fn native_state_may_be_ready(&mut self) -> bool {
+        if let Some(job) = self
+            .pending
+            .front_mut()
+            .filter(|job| job.waiting_for_readiness)
+        {
+            job.waiting_for_readiness = false;
+            job.retry_at = None;
+            job.retry_delay = BUSY_RETRY_INITIAL;
+        }
+
+        self.request_wake()
+    }
+
+    fn stop(&mut self) -> (Option<OutputSink>, Vec<StoppedJob>) {
+        self.stopping = true;
+        self.wake_pending = false;
+
+        let active_output = self
+            .active
+            .as_mut()
+            .and_then(|job| job.operation.request_cancel().map(|(_, output)| output));
+        let pending = std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|job| (job.completion, job.operation.output_sink()))
+            .collect();
+
+        (active_output, pending)
+    }
+
+    fn admit_execution(
+        &mut self,
+        id: DocId,
+        execution: Exec,
+        reservation: ExecReservation,
+        now: Instant,
+    ) -> Result<Admission, Error> {
+        if self.stopping {
+            return Err(Error::PluginStopping);
+        }
+
+        if self.quarantined {
+            return Err(Error::NativeMutationStateUnknown);
+        }
+
+        let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        let (completion, receiver) = oneshot::channel();
+
+        if execution.outcome().is_some() {
+            let operation = Operation::Execute {
+                id,
+                execution: Box::new(execution),
+            };
+
+            let outcome = match operation.prepare(&self.documents) {
+                Prepared::Immediate(outcome) => outcome,
+                Prepared::Native(_) => Err(Error::ExecNotFinished),
+            };
+
+            return Ok((
+                job_id,
+                receiver,
+                false,
+                Some((completion, outcome, operation.output_sink())),
+            ));
+        }
+
+        if self.mutation_job_count() >= MAX_MUTATION_JOBS {
+            return Err(Error::MutationCapacity);
+        }
+
+        let (execution_count, source_bytes) = self.execution_usage();
+
+        if execution_count >= MAX_ADMITTED_EXECUTIONS
+            || source_bytes.saturating_add(execution.source_bytes()) > MAX_ADMITTED_SOURCE_BYTES
+        {
+            return Err(Error::ExecCapacity);
+        }
+
+        self.pending.push_back(MutationJob {
+            job_id,
+            operation: Operation::Execute {
+                id,
+                execution: Box::new(execution),
+            },
+            native_target: None,
+            start_deadline: Some(now + EXECUTION_START_TIMEOUT),
+            waiting_for_readiness: false,
+            retry_at: None,
+            retry_delay: BUSY_RETRY_INITIAL,
+            _execution_reservation: Some(reservation),
+            completion,
+        });
+
+        Ok((job_id, receiver, self.request_wake(), None))
+    }
+
+    fn submit_operation(&mut self, operation: Operation) -> Result<SubmissionDecision, Error> {
+        if self.stopping {
+            return Err(Error::PluginStopping);
+        }
+
+        if self.quarantined {
+            return Err(Error::NativeMutationStateUnknown);
+        }
+
+        if self.mutation_job_count() >= MAX_MUTATION_JOBS {
+            return Err(Error::MutationCapacity);
+        }
+
+        if self.idle()
+            && let Prepared::Immediate(outcome) = operation.prepare(&self.documents)
+        {
+            return Ok(SubmissionDecision::Immediate(outcome));
+        }
+
+        let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        let (completion, receiver) = oneshot::channel();
+
+        self.pending.push_back(MutationJob {
+            job_id,
+            operation,
+            native_target: None,
+            start_deadline: None,
+            waiting_for_readiness: false,
+            retry_at: None,
+            retry_delay: BUSY_RETRY_INITIAL,
+            _execution_reservation: None,
+            completion,
+        });
+
+        Ok(SubmissionDecision::Queued {
+            receiver,
+            should_wake: self.request_wake(),
+        })
+    }
+
+    fn take_native_action(&mut self, now: Instant) -> TakeDecision {
+        self.wake_pending = false;
+
+        if self.stopping || self.quarantined || self.active.is_some() {
+            return TakeDecision::Idle;
+        }
+
+        let Some(mut job) = self.pending.pop_front() else {
+            return TakeDecision::Idle;
+        };
+
+        if job.waiting_for_readiness {
+            self.pending.push_front(job);
+
+            return TakeDecision::Idle;
+        }
+
+        job.expire_if_due(now);
+
+        match job.operation.prepare(&self.documents) {
+            Prepared::Immediate(outcome) => {
+                TakeDecision::Complete((job.completion, outcome, job.operation.output_sink()))
+            }
+            Prepared::Native(command) => {
+                job.native_target = command.target();
+                let action = NativeAction::issue(job.job_id, command);
+                self.active = Some(job);
+                TakeDecision::Action(action)
+            }
+        }
+    }
+
+    fn complete_native_action(
+        &mut self,
+        job_id: MutationJobId,
+        result: NativeActionResult,
+        quarantine: bool,
+        now: Instant,
+    ) -> (Option<Completion>, Vec<StoppedJob>, bool) {
+        let Some(mut job) = self.active.take() else {
+            return (None, Vec::new(), false);
+        };
+
+        if job.job_id != job_id {
+            self.active = Some(job);
+            return (None, Vec::new(), false);
+        }
+
+        let settled_before_start = if result.kind == NativeActionResultKind::NotQuiescent
+            && job.execution_has_not_handed_off_form()
+        {
+            if job.finish_cancel_before_start()
+                || job.expire_if_due(now)
+                || job.execution_has_outcome()
+            {
+                true
+            } else {
+                job.native_target = None;
+                job.defer_for_readiness(now);
+                self.pending.push_front(job);
+                return (None, Vec::new(), true);
+            }
+        } else {
+            false
+        };
+
+        let output = job.operation.output_sink();
+        let native_target = job.native_target;
+        let outcome = if settled_before_start {
+            job.operation.complete(&self.documents, native_target)
+        } else {
+            job.operation
+                .complete_native(result, &self.documents, native_target)
+        };
+
+        let rejected = if quarantine {
+            self.quarantined = true;
+            self.wake_pending = false;
+            std::mem::take(&mut self.pending)
+                .into_iter()
+                .map(|job| (job.completion, job.operation.output_sink()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        (Some((job.completion, outcome, output)), rejected, false)
+    }
+
+    fn cancel_execution(&mut self, job_id: MutationJobId) -> CancelDecision {
+        if let Some(job) = self.active.as_mut().filter(|job| job.job_id == job_id) {
+            return match job.operation.request_cancel() {
+                Some((true, output)) => CancelDecision::Active(output),
+                Some((false, _)) => CancelDecision::Result(CancelResult::TooLate),
+                None => CancelDecision::Result(CancelResult::NotFound),
+            };
+        }
+
+        let Some(index) = self.pending.iter().position(|job| {
+            job.job_id == job_id && matches!(job.operation, Operation::Execute { .. })
+        }) else {
+            return CancelDecision::Result(CancelResult::NotFound);
+        };
+
+        let Some(output) = self.pending[index].operation.cancel_before_start() else {
+            return CancelDecision::Result(CancelResult::TooLate);
+        };
+
+        let job = self.pending.remove(index).expect("queued job exists");
+
+        CancelDecision::Pending {
+            output,
+            completion: job.completion,
+            should_wake: self.request_wake(),
+        }
+    }
+
+    fn wake_failed(&mut self) -> Vec<StoppedJob> {
+        self.wake_pending = false;
+        std::mem::take(&mut self.pending)
+            .into_iter()
+            .map(|job| (job.completion, job.operation.output_sink()))
+            .collect()
     }
 }
 
@@ -194,74 +595,13 @@ pub fn admit_execution(
     output: OutputStream,
     reservation: ExecReservation,
 ) -> Result<ExecAdmission, Error> {
-    let deadline = Instant::now() + EXECUTION_START_TIMEOUT;
-    let (job_id, receiver, should_wake, immediate) = {
-        let mut scheduler = SCHEDULER
-            .lock()
-            .map_err(|_| Error::SchedulerStateUnavailable)?;
+    let (job_id, receiver, should_wake, immediate) = SCHEDULER
+        .lock()
+        .map_err(|_| Error::SchedulerStateUnavailable)?
+        .admit_execution(id, execution, reservation, Instant::now())?;
 
-        if scheduler.stopping {
-            return Err(Error::PluginStopping);
-        }
-
-        if scheduler.quarantined {
-            return Err(Error::NativeMutationStateUnknown);
-        }
-
-        let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
-        let (completion, receiver) = oneshot::channel();
-
-        if execution.outcome().is_some() {
-            let operation = Operation::Execute {
-                id,
-                execution: Box::new(execution),
-            };
-
-            let outcome = match prepare(&operation, &scheduler.documents) {
-                Prepared::Immediate(outcome) => outcome,
-                Prepared::Native(_) => Err(Error::ExecNotFinished),
-            };
-
-            let output = operation.output_sink();
-            (job_id, receiver, false, Some((completion, outcome, output)))
-        } else {
-            if scheduler.mutation_job_count() >= MAX_MUTATION_JOBS {
-                return Err(Error::MutationCapacity);
-            }
-
-            let (execution_count, source_bytes) = scheduler.execution_usage();
-
-            if execution_count >= MAX_ADMITTED_EXECUTIONS
-                || source_bytes.saturating_add(execution.source_bytes()) > MAX_ADMITTED_SOURCE_BYTES
-            {
-                return Err(Error::ExecCapacity);
-            }
-
-            scheduler.pending.push_back(MutationJob {
-                job_id,
-                operation: Operation::Execute {
-                    id,
-                    execution: Box::new(execution),
-                },
-                native_target: None,
-                start_deadline: Some(deadline),
-                waiting_for_readiness: false,
-                retry_at: None,
-                retry_delay: BUSY_RETRY_INITIAL,
-                _execution_reservation: Some(reservation),
-                completion,
-            });
-            let should_wake = scheduler.request_wake();
-            (job_id, receiver, should_wake, None)
-        }
-    };
-
-    if let Some((completion, outcome, output)) = immediate {
-        if let Some(output) = output {
-            output.finish();
-        }
-
-        let _ = completion.send(outcome);
+    if let Some(completion) = immediate {
+        finish_completion(completion);
     }
 
     if should_wake {
@@ -307,39 +647,23 @@ pub fn list() -> Result<Vec<Doc>, Error> {
     SCHEDULER
         .lock()
         .map_err(|_| Error::SchedulerStateUnavailable)
-        .map(|scheduler| scheduler.documents.list())
+        .map(|scheduler| scheduler.list())
 }
 
 pub fn replace_document_snapshot(documents: Vec<crate::ffi::NativeDocSnapshot>) {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
-        scheduler.documents.replace_snapshot(documents);
+        scheduler.replace_document_snapshot(documents);
     }
 }
 
 pub fn start() {
     if let Ok(mut scheduler) = SCHEDULER.lock() {
-        scheduler.stopping = false;
+        scheduler.start();
     }
 }
 
 pub fn stop() {
-    let stopped = SCHEDULER.lock().ok().map(|mut scheduler| {
-        scheduler.stopping = true;
-        scheduler.wake_pending = false;
-        let active_output = scheduler.active.as_mut().and_then(|job| {
-            if let Operation::Execute { execution, .. } = &mut job.operation {
-                let _ = execution.request_cancel();
-                Some(execution.output_sink())
-            } else {
-                None
-            }
-        });
-        let pending = std::mem::take(&mut scheduler.pending)
-            .into_iter()
-            .map(|job| (job.completion, job.operation.output_sink()))
-            .collect::<Vec<_>>();
-        (active_output, pending)
-    });
+    let stopped = SCHEDULER.lock().ok().map(|mut scheduler| scheduler.stop());
 
     if let Some((active_output, pending)) = stopped {
         if let Some(output) = active_output {
@@ -359,100 +683,40 @@ pub fn stop() {
 }
 
 async fn submit_operation(operation: Operation) -> Result<OperationOutcome, Error> {
-    let (completed, should_wake) = {
-        let mut scheduler = SCHEDULER
-            .lock()
-            .map_err(|_| Error::SchedulerStateUnavailable)?;
+    let decision = SCHEDULER
+        .lock()
+        .map_err(|_| Error::SchedulerStateUnavailable)?
+        .submit_operation(operation)?;
 
-        if scheduler.stopping {
-            return Err(Error::PluginStopping);
+    match decision {
+        SubmissionDecision::Immediate(outcome) => outcome,
+        SubmissionDecision::Queued {
+            receiver,
+            should_wake,
+        } => {
+            if should_wake {
+                schedule_native_actions();
+            }
+            receiver.await.map_err(|_| Error::Stopped)?
         }
-
-        if scheduler.quarantined {
-            return Err(Error::NativeMutationStateUnknown);
-        }
-
-        if scheduler.mutation_job_count() >= MAX_MUTATION_JOBS {
-            return Err(Error::MutationCapacity);
-        }
-
-        if scheduler.idle()
-            && let Prepared::Immediate(outcome) = prepare(&operation, &scheduler.documents)
-        {
-            return outcome;
-        }
-
-        let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
-        let (completion, completed) = oneshot::channel();
-        scheduler.pending.push_back(MutationJob {
-            job_id,
-            operation,
-            native_target: None,
-            start_deadline: None,
-            waiting_for_readiness: false,
-            retry_at: None,
-            retry_delay: BUSY_RETRY_INITIAL,
-            _execution_reservation: None,
-            completion,
-        });
-        let should_wake = scheduler.request_wake();
-        (completed, should_wake)
-    };
-
-    if should_wake {
-        schedule_native_actions();
     }
-
-    completed.await.map_err(|_| Error::Stopped)?
 }
 
 pub fn take_native_action() -> NativeAction {
-    let decision = {
-        let Ok(mut scheduler) = SCHEDULER.lock() else {
-            return NativeAction::idle();
-        };
-
-        scheduler.wake_pending = false;
-
-        if scheduler.stopping || scheduler.quarantined || scheduler.active.is_some() {
-            return NativeAction::idle();
-        }
-
-        let Some(mut job) = scheduler.pending.pop_front() else {
-            return NativeAction::idle();
-        };
-
-        if job.waiting_for_readiness {
-            scheduler.pending.push_front(job);
-
-            return NativeAction::idle();
-        }
-
-        job.expire_if_due(Instant::now());
-
-        match prepare(&job.operation, &scheduler.documents) {
-            Prepared::Immediate(outcome) => {
-                TakeDecision::Complete(job.completion, outcome, job.operation.output_sink())
-            }
-            Prepared::Native(command) => {
-                job.native_target = command.target();
-                let action = NativeAction::issue(job.job_id, command);
-                scheduler.active = Some(job);
-                TakeDecision::Action(action)
-            }
-        }
-    };
+    let decision = SCHEDULER
+        .lock()
+        .ok()
+        .map_or(TakeDecision::Idle, |mut scheduler| {
+            scheduler.take_native_action(Instant::now())
+        });
 
     match decision {
         TakeDecision::Action(action) => action,
-        TakeDecision::Complete(completion, outcome, output) => {
-            if let Some(output) = output {
-                output.finish();
-            }
-
-            let _ = completion.send(outcome);
+        TakeDecision::Complete(completion) => {
+            finish_completion(completion);
             NativeAction::idle()
         }
+        TakeDecision::Idle => NativeAction::idle(),
     }
 }
 
@@ -468,73 +732,15 @@ fn complete_native_action_with_quarantine(
 ) {
     bound_diagnostic(&mut result.native_detail);
 
-    let ((completion, outcome, output), rejected) = {
-        let Ok(mut scheduler) = SCHEDULER.lock() else {
-            return;
-        };
-
-        let Some(mut job) = scheduler.active.take() else {
-            return;
-        };
-
-        if job.job_id != job_id {
-            scheduler.active = Some(job);
-
-            return;
-        }
-
-        let settled_before_start = if result.kind == NativeActionResultKind::NotQuiescent
-            && job.execution_has_not_handed_off_form()
-        {
-            if job.finish_cancel_before_start()
-                || job.expire_if_due(Instant::now())
-                || job.execution_has_outcome()
-            {
-                true
-            } else {
-                job.native_target = None;
-                job.defer_for_readiness(Instant::now());
-                scheduler.pending.push_front(job);
-                notify_changed();
-
-                return;
-            }
-        } else {
-            false
-        };
-
-        let output = job.operation.output_sink();
-        let native_target = job.native_target;
-        let outcome = if settled_before_start {
-            finalize(&mut job.operation, &scheduler.documents, native_target)
-        } else {
-            complete_operation(
-                result,
-                &mut job.operation,
-                &scheduler.documents,
-                native_target,
-            )
-        };
-
-        let rejected = if quarantine {
-            scheduler.quarantined = true;
-            scheduler.wake_pending = false;
-            std::mem::take(&mut scheduler.pending)
-                .into_iter()
-                .map(|job| (job.completion, job.operation.output_sink()))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        ((job.completion, outcome, output), rejected)
+    let Some((completion, rejected, notify)) = SCHEDULER.lock().ok().map(|mut scheduler| {
+        scheduler.complete_native_action(job_id, result, quarantine, Instant::now())
+    }) else {
+        return;
     };
 
-    if let Some(output) = output {
-        output.finish();
+    if let Some(completion) = completion {
+        finish_completion(completion);
     }
-
-    let _ = completion.send(outcome);
 
     for (completion, output) in rejected {
         if let Some(output) = output {
@@ -542,6 +748,10 @@ fn complete_native_action_with_quarantine(
         }
 
         let _ = completion.send(Err(Error::NativeMutationStateUnknown));
+    }
+
+    if notify {
+        notify_changed();
     }
 }
 
@@ -555,76 +765,20 @@ pub(crate) fn complete_execution_native_action(
 }
 
 pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
-    enum Action {
-        Active(OutputSink),
-        Pending {
-            output: OutputSink,
-            completion: oneshot::Sender<Result<OperationOutcome, Error>>,
-            should_wake: bool,
-        },
-        Result(CancelResult),
-    }
-
-    let action = {
-        let Ok(mut scheduler) = SCHEDULER.lock() else {
-            return CancelResult::Unavailable;
-        };
-
-        if let Some(job) = scheduler.active.as_mut()
-            && job.job_id == job_id
-        {
-            match &mut job.operation {
-                Operation::Execute { execution, .. } => {
-                    if execution.request_cancel() {
-                        Action::Active(execution.output_sink())
-                    } else {
-                        Action::Result(CancelResult::TooLate)
-                    }
-                }
-
-                Operation::Open { .. }
-                | Operation::Save { .. }
-                | Operation::Close { .. }
-                | Operation::History { .. } => Action::Result(CancelResult::NotFound),
-            }
-        } else if let Some(index) = scheduler.pending.iter().position(|job| {
-            job.job_id == job_id && matches!(job.operation, Operation::Execute { .. })
-        }) {
-            let output = match &mut scheduler.pending[index].operation {
-                Operation::Execute { execution, .. } => execution
-                    .cancel_before_start()
-                    .then(|| execution.output_sink()),
-                Operation::Open { .. }
-                | Operation::Save { .. }
-                | Operation::Close { .. }
-                | Operation::History { .. } => {
-                    unreachable!("only queued executions are selected")
-                }
-            };
-
-            if let Some(output) = output {
-                let job = scheduler.pending.remove(index).expect("queued job exists");
-                let should_wake = scheduler.request_wake();
-                Action::Pending {
-                    output,
-                    completion: job.completion,
-                    should_wake,
-                }
-            } else {
-                Action::Result(CancelResult::TooLate)
-            }
-        } else {
-            Action::Result(CancelResult::NotFound)
-        }
+    let Some(decision) = SCHEDULER
+        .lock()
+        .ok()
+        .map(|mut scheduler| scheduler.cancel_execution(job_id))
+    else {
+        return CancelResult::Unavailable;
     };
 
-    match action {
-        Action::Active(output) => {
+    match decision {
+        CancelDecision::Active(output) => {
             output.request_cancel();
             CancelResult::Accepted
         }
-
-        Action::Pending {
+        CancelDecision::Pending {
             output,
             completion,
             should_wake,
@@ -639,7 +793,7 @@ pub fn cancel_execution(job_id: MutationJobId) -> CancelResult {
             notify_changed();
             CancelResult::Accepted
         }
-        Action::Result(result) => result,
+        CancelDecision::Result(result) => result,
     }
 }
 
@@ -650,15 +804,11 @@ pub fn try_claim_native_action_wake() -> bool {
 }
 
 pub fn wake_failed(status: i32) {
-    let completions = SCHEDULER.lock().ok().map(|mut scheduler| {
-        scheduler.wake_pending = false;
-        std::mem::take(&mut scheduler.pending)
-            .into_iter()
-            .map(|job| (job.completion, job.operation.output_sink()))
-            .collect::<Vec<_>>()
-    });
-
-    let Some(completions) = completions else {
+    let Some(completions) = SCHEDULER
+        .lock()
+        .ok()
+        .map(|mut scheduler| scheduler.wake_failed())
+    else {
         return;
     };
 
@@ -669,6 +819,14 @@ pub fn wake_failed(status: i32) {
 
         let _ = completion.send(Err(Error::ScheduleFailed(status)));
     }
+}
+
+fn finish_completion((completion, outcome, output): Completion) {
+    if let Some(output) = output {
+        output.finish();
+    }
+
+    let _ = completion.send(outcome);
 }
 
 impl MutationJob {
@@ -682,53 +840,26 @@ impl MutationJob {
             return false;
         }
 
-        match &mut self.operation {
-            Operation::Execute { execution, .. } => execution.expire_before_start(format!(
-                "execution did not start within {} seconds",
-                EXECUTION_START_TIMEOUT.as_secs()
-            )),
-            Operation::Open { .. }
-            | Operation::Save { .. }
-            | Operation::Close { .. }
-            | Operation::History { .. } => false,
-        }
+        self.operation.expire_before_start(format!(
+            "execution did not start within {} seconds",
+            EXECUTION_START_TIMEOUT.as_secs()
+        ))
     }
 
     fn execution_has_not_handed_off_form(&self) -> bool {
-        matches!(
-            &self.operation,
-            Operation::Execute { execution, .. } if !execution.has_handed_off_form()
-        )
+        self.operation.execution_has_not_handed_off_form()
     }
 
     pub(super) fn execution_start_pending(&self) -> bool {
-        matches!(
-            &self.operation,
-            Operation::Execute { execution, .. } if execution.start_deadline_pending()
-        )
+        self.operation.execution_start_pending()
     }
 
     fn execution_has_outcome(&self) -> bool {
-        matches!(
-            &self.operation,
-            Operation::Execute { execution, .. } if execution.outcome().is_some()
-        )
+        self.operation.execution_has_outcome()
     }
 
     fn finish_cancel_before_start(&mut self) -> bool {
-        match &mut self.operation {
-            Operation::Execute { execution, .. }
-                if !execution.has_handed_off_form() && execution.cancellation_requested() =>
-            {
-                execution.cancel_before_start()
-            }
-
-            Operation::Execute { .. }
-            | Operation::Open { .. }
-            | Operation::Save { .. }
-            | Operation::Close { .. }
-            | Operation::History { .. } => false,
-        }
+        self.operation.finish_cancel_before_start()
     }
 
     fn defer_for_readiness(&mut self, now: Instant) {

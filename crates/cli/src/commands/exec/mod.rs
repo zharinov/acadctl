@@ -2,8 +2,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use acadctl_rpc::{
-    ExecCancelDisposition, ExecClientMessage, ExecFailure, ExecMode, ExecRequest, ExecServerEvent,
-    exec_client_message, exec_outcome, exec_server_event,
+    ExecClientMessage, ExecFailure, ExecMode, ExecRequest, ExecServerEvent, exec_client_message,
+    exec_outcome, exec_server_event,
 };
 use futures_util::stream as futures_stream;
 use tonic::Code;
@@ -14,9 +14,9 @@ mod interrupt;
 mod stream;
 mod writer;
 
-use interrupt::{AcknowledgementResult, CancellationDisposition, Interrupts};
+use interrupt::{CancellationReceipt, DiagnosticWait, Interrupts};
 #[cfg(test)]
-use interrupt::{Interrupt, InterruptPhase, publish_cancel};
+use interrupt::{Interrupt, publish_cancel};
 #[cfg(test)]
 use stream::wait_for_response_start_with_timeout;
 use stream::{
@@ -30,8 +30,28 @@ use super::{fail, query_error_message, request_error_message, target::Target};
 const EXECUTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTION_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponsePhase {
+    AwaitingAcceptance,
+    Accepted,
+}
+
+struct ResponseSession {
+    response: Option<tonic::Streaming<ExecServerEvent>>,
+    source_name: String,
+    phase: ResponsePhase,
+    stdout: Option<std::io::Result<PipeWriter>>,
+    interrupts: Interrupts,
+}
+
 pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMode) -> ExitCode {
-    let source = match crate::source::read(source, mode == ExecMode::Eval) {
+    let source_mode = if mode == ExecMode::Eval {
+        crate::source::SourceMode::Eval
+    } else {
+        crate::source::SourceMode::Exec
+    };
+
+    let source = match source.load(source_mode) {
         Ok(source) => source,
         Err(error) => {
             error.report();
@@ -51,13 +71,14 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
         Err(_) => return fail(query_error_message(&QueryError::TimedOut)),
     };
 
-    let source_name = source.name.to_string();
+    let (source_name, source_bytes) = source.into_parts();
+    let diagnostic_source_name = source_name.to_string();
     let request = ExecClientMessage {
         message: Some(exec_client_message::Message::Request(ExecRequest::new(
             target.document_id,
             mode,
-            source.name,
-            source.bytes,
+            source_name,
+            source_bytes,
         ))),
     };
 
@@ -74,6 +95,7 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
     let outbound = futures_stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|message| (message, receiver))
     });
+
     let response = match wait_for_response_start(client.execute(outbound), &mut interrupts).await {
         ResponseStartWait::Ready(Ok(response)) => response,
         ResponseStartWait::Ready(Err(status)) => {
@@ -94,175 +116,232 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
         ResponseStartWait::UnconfirmedDetach => return unconfirmed_detach_exit(&interrupts),
     };
 
-    receive_response(response.into_inner(), &source_name, &mut interrupts).await
+    ResponseSession::new(response.into_inner(), diagnostic_source_name, interrupts)
+        .drive()
+        .await
 }
 
-async fn receive_response(
-    mut response: tonic::Streaming<ExecServerEvent>,
-    source_name: &str,
-    interrupts: &mut Interrupts,
-) -> ExitCode {
-    let mut accepted = false;
-    let mut stdout = None;
+impl ResponseSession {
+    fn new(
+        response: tonic::Streaming<ExecServerEvent>,
+        source_name: String,
+        interrupts: Interrupts,
+    ) -> Self {
+        Self {
+            response: Some(response),
+            source_name,
+            phase: ResponsePhase::AwaitingAcceptance,
+            stdout: None,
+            interrupts,
+        }
+    }
 
-    loop {
-        let event = match wait_for_control(response.message(), interrupts).await {
-            ControlWait::Ready(Ok(Some(event))) => event,
-            ControlWait::Ready(Ok(None)) => {
-                if interrupts.force_detach_requested() {
-                    return unconfirmed_detach_exit(interrupts);
-                }
+    fn accepted(&self) -> bool {
+        self.phase == ResponsePhase::Accepted
+    }
 
-                return lost_response(interrupts, accepted, "The execution stream ended").await;
-            }
-            ControlWait::Ready(Err(status)) => {
-                if interrupts.force_detach_requested() {
-                    return unconfirmed_detach_exit(interrupts);
-                }
-
-                let detail = if status.message().is_empty() {
-                    "The execution connection failed".into()
-                } else {
-                    format!("The execution connection failed: {}", status.message())
-                };
-
-                return lost_response(interrupts, accepted, &detail).await;
-            }
-            ControlWait::ConfirmedDetach => return confirmed_detach_exit(interrupts),
-            ControlWait::UnconfirmedDetach => return unconfirmed_detach_exit(interrupts),
-        };
-
-        match event.event {
-            Some(exec_server_event::Event::Accepted(_)) if !accepted => accepted = true,
-            Some(exec_server_event::Event::Accepted(_)) => {
-                return invalid_response(
-                    interrupts,
-                    "AutoCAD accepted the execution more than once",
-                )
-                .await;
-            }
-            Some(exec_server_event::Event::Output(output)) if accepted => {
-                if interrupts.cancellation_requested() {
-                    continue;
-                }
-
-                let writer = match stdout.get_or_insert_with(PipeWriter::stdout).as_ref() {
-                    Ok(writer) => writer,
-                    Err(error) => {
-                        drop(response);
-
-                        return diagnostic_failure(
-                            interrupts,
-                            format!(
-                                "Could not start the stdout writer: {error}. The accepted execution request may still be running; do not retry it blindly."
-                            ),
-                        )
-                        .await;
+    async fn drive(mut self) -> ExitCode {
+        loop {
+            let event = match wait_for_control(
+                self.response
+                    .as_mut()
+                    .expect("response session is active")
+                    .message(),
+                &mut self.interrupts,
+            )
+            .await
+            {
+                ControlWait::Ready(Ok(Some(event))) => event,
+                ControlWait::Ready(Ok(None)) => {
+                    if self.interrupts.force_detach_requested() {
+                        return unconfirmed_detach_exit(&self.interrupts);
                     }
-                };
 
-                match wait_for_stdout(writer.write(output.chunk), interrupts).await {
-                    StdoutWait::Ready(Ok(())) => {}
-                    StdoutWait::Ready(Err(error)) => {
-                        drop(response);
-
-                        return diagnostic_failure(
-                            interrupts,
-                            format!(
-                                "Could not write stdout: {error}. The accepted execution request may still be running; do not retry it blindly."
-                            ),
-                        )
-                        .await;
-                    }
-                    StdoutWait::Interrupted => continue,
-                    StdoutWait::ConfirmedDetach => return confirmed_detach_exit(interrupts),
-                    StdoutWait::UnconfirmedDetach => return unconfirmed_detach_exit(interrupts),
+                    return self.lost_response("The execution stream ended").await;
                 }
-            }
-            Some(exec_server_event::Event::Output(_)) => {
-                return invalid_response(
-                    interrupts,
-                    "AutoCAD sent output before accepting the execution",
-                )
-                .await;
-            }
-
-            Some(exec_server_event::Event::CancelAcknowledgement(acknowledgement)) if accepted => {
-                match record_cancellation_acknowledgement(interrupts, acknowledgement.disposition) {
-                    CancellationReceipt::Continue => {}
-                    CancellationReceipt::Detach => return confirmed_detach_exit(interrupts),
-                    CancellationReceipt::Duplicate => {
-                        return invalid_response(
-                            interrupts,
-                            "AutoCAD acknowledged the same cancellation more than once",
-                        )
-                        .await;
+                ControlWait::Ready(Err(status)) => {
+                    if self.interrupts.force_detach_requested() {
+                        return unconfirmed_detach_exit(&self.interrupts);
                     }
-                    CancellationReceipt::Invalid => {
-                        return invalid_response(
-                            interrupts,
-                            "AutoCAD returned an invalid cancellation acknowledgement",
-                        )
-                        .await;
+
+                    let detail = if status.message().is_empty() {
+                        "The execution connection failed".into()
+                    } else {
+                        format!("The execution connection failed: {}", status.message())
+                    };
+
+                    return self.lost_response(&detail).await;
+                }
+                ControlWait::ConfirmedDetach => return confirmed_detach_exit(&self.interrupts),
+                ControlWait::UnconfirmedDetach => return unconfirmed_detach_exit(&self.interrupts),
+            };
+
+            match event.event {
+                Some(exec_server_event::Event::Accepted(_)) => {
+                    if self.accepted() {
+                        return self
+                            .invalid_response("AutoCAD accepted the execution more than once")
+                            .await;
+                    }
+
+                    self.phase = ResponsePhase::Accepted;
+                }
+                Some(exec_server_event::Event::Output(output)) => {
+                    if !self.accepted() {
+                        return self
+                            .invalid_response("AutoCAD sent output before accepting the execution")
+                            .await;
+                    }
+
+                    if self.interrupts.cancellation_requested() {
+                        continue;
+                    }
+
+                    let writer = match self.stdout.get_or_insert_with(PipeWriter::stdout).as_ref() {
+                        Ok(writer) => writer,
+                        Err(error) => {
+                            let error = error.to_string();
+                            self.response.take();
+
+                            return diagnostic_failure(
+                                &mut self.interrupts,
+                                format!(
+                                    "Could not start the stdout writer: {error}. The accepted execution request may still be running; do not retry it blindly."
+                                ),
+                            )
+                            .await;
+                        }
+                    };
+
+                    match wait_for_stdout(writer.write(output.chunk), &mut self.interrupts).await {
+                        StdoutWait::Ready(Ok(())) => {}
+                        StdoutWait::Ready(Err(error)) => {
+                            self.response.take();
+
+                            return diagnostic_failure(
+                                &mut self.interrupts,
+                                format!(
+                                    "Could not write stdout: {error}. The accepted execution request may still be running; do not retry it blindly."
+                                ),
+                            )
+                            .await;
+                        }
+                        StdoutWait::Interrupted => continue,
+                        StdoutWait::ConfirmedDetach => {
+                            return confirmed_detach_exit(&self.interrupts);
+                        }
+                        StdoutWait::UnconfirmedDetach => {
+                            return unconfirmed_detach_exit(&self.interrupts);
+                        }
                     }
                 }
-            }
-            Some(exec_server_event::Event::CancelAcknowledgement(_)) => {
-                return invalid_response(
-                    interrupts,
-                    "AutoCAD acknowledged cancellation before accepting the execution",
-                )
-                .await;
-            }
-            Some(exec_server_event::Event::Finished(finished)) => {
-                let Some(outcome) = finished.outcome.and_then(|outcome| outcome.outcome) else {
-                    return invalid_response(
-                        interrupts,
-                        "AutoCAD returned an empty execution result",
-                    )
-                    .await;
-                };
+                Some(exec_server_event::Event::CancelAcknowledgement(acknowledgement)) => {
+                    if !self.accepted() {
+                        return self
+                            .invalid_response(
+                                "AutoCAD acknowledged cancellation before accepting the execution",
+                            )
+                            .await;
+                    }
 
-                return match outcome {
-                    exec_outcome::Outcome::Success(_)
-                        if accepted && interrupts.cancellation_requested() =>
+                    match self
+                        .interrupts
+                        .record_cancellation_acknowledgement(acknowledgement.disposition)
                     {
-                        cancelled_exit()
+                        CancellationReceipt::Continue => {}
+                        CancellationReceipt::Detach => {
+                            return confirmed_detach_exit(&self.interrupts);
+                        }
+                        CancellationReceipt::Duplicate => {
+                            return self
+                                .invalid_response(
+                                    "AutoCAD acknowledged the same cancellation more than once",
+                                )
+                                .await;
+                        }
+                        CancellationReceipt::Invalid => {
+                            return self
+                                .invalid_response(
+                                    "AutoCAD returned an invalid cancellation acknowledgement",
+                                )
+                                .await;
+                        }
                     }
-                    exec_outcome::Outcome::Success(_) if accepted => ExitCode::SUCCESS,
-                    exec_outcome::Outcome::Cancelled(_) if accepted => cancelled_exit(),
-                    exec_outcome::Outcome::Failure(failure) => {
-                        report_failure(interrupts, failure, source_name).await
+                }
+                Some(exec_server_event::Event::Finished(finished)) => {
+                    let Some(outcome) = finished.outcome.and_then(|outcome| outcome.outcome) else {
+                        return self
+                            .invalid_response("AutoCAD returned an empty execution result")
+                            .await;
+                    };
+
+                    if !self.accepted()
+                        && matches!(
+                            &outcome,
+                            exec_outcome::Outcome::Success(_) | exec_outcome::Outcome::Cancelled(_)
+                        )
+                    {
+                        return self
+                            .invalid_response(
+                                "AutoCAD finished an execution that it did not accept",
+                            )
+                            .await;
                     }
 
-                    exec_outcome::Outcome::Success(_) | exec_outcome::Outcome::Cancelled(_) => {
-                        invalid_response(
-                            interrupts,
-                            "AutoCAD finished an execution that it did not accept",
-                        )
-                        .await
-                    }
-                };
-            }
-            None => {
-                return invalid_response(interrupts, "AutoCAD returned an empty execution event")
-                    .await;
+                    return match outcome {
+                        exec_outcome::Outcome::Success(_)
+                            if self.interrupts.cancellation_requested() =>
+                        {
+                            cancelled_exit()
+                        }
+                        exec_outcome::Outcome::Success(_) => ExitCode::SUCCESS,
+                        exec_outcome::Outcome::Cancelled(_) => cancelled_exit(),
+                        exec_outcome::Outcome::Failure(failure) => {
+                            self.report_failure(failure).await
+                        }
+                    };
+                }
+                None => {
+                    return self
+                        .invalid_response("AutoCAD returned an empty execution event")
+                        .await;
+                }
             }
         }
     }
-}
 
-async fn report_failure(
-    interrupts: &mut Interrupts,
-    failure: ExecFailure,
-    fallback_source_name: &str,
-) -> ExitCode {
-    let mut text = failure_lines(&failure, fallback_source_name).join("\n");
-    text.push('\n');
+    async fn lost_response(&mut self, detail: &str) -> ExitCode {
+        let message = if self.accepted() {
+            format!(
+                "{detail} before a result was returned. The accepted execution request may still be running; do not retry it blindly."
+            )
+        } else {
+            format!(
+                "{detail} before acceptance was reported. The request may still have been accepted; do not retry it blindly."
+            )
+        };
 
-    match write_diagnostic(interrupts, text).await {
-        DiagnosticWait::Complete => ExitCode::FAILURE,
-        DiagnosticWait::Interrupted => cancelled_exit(),
+        diagnostic_failure(&mut self.interrupts, message).await
+    }
+
+    async fn invalid_response(&mut self, detail: &str) -> ExitCode {
+        diagnostic_failure(
+            &mut self.interrupts,
+            format!(
+                "Invalid execution response: {detail}. The execution outcome is unknown; do not retry it blindly."
+            ),
+        )
+        .await
+    }
+
+    async fn report_failure(&mut self, failure: ExecFailure) -> ExitCode {
+        let mut text = failure_lines(&failure, &self.source_name).join("\n");
+        text.push('\n');
+
+        match self.interrupts.write_diagnostic(text).await {
+            DiagnosticWait::Complete => ExitCode::FAILURE,
+            DiagnosticWait::Interrupted => cancelled_exit(),
+        }
     }
 }
 
@@ -328,75 +407,8 @@ fn response_start_error(status: tonic::Status) -> String {
     )
 }
 
-async fn lost_response(interrupts: &mut Interrupts, accepted: bool, detail: &str) -> ExitCode {
-    let message = if accepted {
-        format!(
-            "{detail} before a result was returned. The accepted execution request may still be running; do not retry it blindly."
-        )
-    } else {
-        format!(
-            "{detail} before acceptance was reported. The request may still have been accepted; do not retry it blindly."
-        )
-    };
-
-    diagnostic_failure(interrupts, message).await
-}
-
-async fn invalid_response(interrupts: &mut Interrupts, detail: &str) -> ExitCode {
-    diagnostic_failure(
-        interrupts,
-        format!(
-            "Invalid execution response: {detail}. The execution outcome is unknown; do not retry it blindly."
-        ),
-    )
-    .await
-}
-
 fn cancelled_exit() -> ExitCode {
     ExitCode::from(130)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum CancellationReceipt {
-    Continue,
-    Detach,
-    Duplicate,
-    Invalid,
-}
-
-fn record_cancellation_acknowledgement(
-    interrupts: &mut Interrupts,
-    disposition: i32,
-) -> CancellationReceipt {
-    let disposition = match ExecCancelDisposition::try_from(disposition) {
-        Ok(ExecCancelDisposition::Accepted) => CancellationDisposition::Accepted,
-        Ok(ExecCancelDisposition::TooLate) => {
-            interrupts.notice(
-                "acadctl: cancellation was too late; execution will continue. Press Ctrl+C again to detach.",
-            );
-            CancellationDisposition::TooLate
-        }
-        Ok(ExecCancelDisposition::Unspecified) | Err(_) => {
-            return CancellationReceipt::Invalid;
-        }
-    };
-
-    match interrupts.acknowledge_cancellation(disposition) {
-        AcknowledgementResult::Recorded => {}
-        AcknowledgementResult::RecordedBeforeInterrupt => {
-            if disposition == CancellationDisposition::Accepted {
-                interrupts.notice("acadctl: cancellation requested; press Ctrl+C again to detach.");
-            }
-        }
-        AcknowledgementResult::Duplicate => return CancellationReceipt::Duplicate,
-        AcknowledgementResult::Invalid => return CancellationReceipt::Invalid,
-    }
-
-    if interrupts.detach_requested() {
-        CancellationReceipt::Detach
-    } else {
-        CancellationReceipt::Continue
-    }
 }
 
 fn confirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
@@ -412,28 +424,12 @@ fn unconfirmed_detach_exit(interrupts: &Interrupts) -> ExitCode {
 }
 
 async fn diagnostic_failure(interrupts: &mut Interrupts, message: String) -> ExitCode {
-    match write_diagnostic(interrupts, format!("acadctl: {message}\n")).await {
+    match interrupts
+        .write_diagnostic(format!("acadctl: {message}\n"))
+        .await
+    {
         DiagnosticWait::Complete => ExitCode::FAILURE,
         DiagnosticWait::Interrupted => cancelled_exit(),
-    }
-}
-
-enum DiagnosticWait {
-    Complete,
-    Interrupted,
-}
-
-async fn write_diagnostic(interrupts: &mut Interrupts, text: String) -> DiagnosticWait {
-    let diagnostics = interrupts.diagnostics.clone();
-    let write = diagnostics.write(text);
-    tokio::pin!(write);
-    tokio::select! {
-        biased;
-        interrupt = interrupts.next() => {
-            interrupts.note(interrupt);
-            DiagnosticWait::Interrupted
-        }
-        _ = &mut write => DiagnosticWait::Complete,
     }
 }
 
