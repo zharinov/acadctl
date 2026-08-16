@@ -666,64 +666,16 @@ fn requires_readable_escape(character: char) -> bool {
 }
 
 #[cfg(test)]
+#[path = "printer_fixtures.rs"]
+mod fixture_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::exec::output::{OutputStream, channel};
 
-    #[tokio::test]
-    async fn renders_readable_nested_strings_incrementally() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink);
-        printer.begin_list().unwrap();
-        printer.integer(1).unwrap();
-        printer.begin_string().unwrap();
-        printer.string_chunk("a\"\\\u{1b}\u{2}\n\r\t中").unwrap();
-        printer.end_string().unwrap();
-        printer.nil().unwrap();
-        printer.end_list().unwrap();
-        printer.finish().unwrap();
-        terminal.finish();
-
-        assert_eq!(
-            collect(stream).await,
-            "(1 \"a\\\"\\\\\\e\\002\\n\\r\\t中\" nil)\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn renders_proper_and_dotted_structure() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink);
-        printer.begin_list().unwrap();
-        symbol(&mut printer, "A");
-        printer.begin_list().unwrap();
-        symbol(&mut printer, "B");
-        printer.dot().unwrap();
-        symbol(&mut printer, "C");
-        printer.end_list().unwrap();
-        printer.end_list().unwrap();
-        printer.finish().unwrap();
-        terminal.finish();
-
-        assert_eq!(collect(stream).await, "(A (B . C))\n");
-    }
-
-    #[tokio::test]
-    async fn applies_autolisp_backslash_semantics_to_symbols() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink);
-        symbol(&mut printer, "A\\B");
-        printer.finish().unwrap();
-        terminal.finish();
-
-        assert_eq!(collect(stream).await, "A\\\\B\n");
-    }
-
     #[test]
-    fn distinguishes_symbols_from_numeric_and_nil_tokens_across_chunks() {
+    fn rejects_numeric_and_nil_symbols_across_chunks() {
         for chunks in [
             &["123"][..],
             &["+", "123"][..],
@@ -742,40 +694,16 @@ mod tests {
 
             assert_eq!(printer.end_symbol(), Err(PrintError::InvalidSequence));
         }
-
-        for chunks in [
-            &["+"][..],
-            &["-"][..],
-            &["123", "A"][..],
-            &["1", "E"][..],
-            &["1E", "+"][..],
-        ] {
-            let (sink, _stream) = channel();
-            let mut printer = ValuePrinter::new(sink);
-            printer.begin_symbol().unwrap();
-
-            for chunk in chunks {
-                printer.symbol_chunk(chunk).unwrap();
-            }
-
-            printer.end_symbol().unwrap();
-        }
     }
 
     #[tokio::test]
-    async fn uses_resolvable_entities_and_kind_specific_opaque_displays() {
+    async fn normalizes_or_rejects_opaque_payloads() {
         let (sink, stream) = channel();
         let terminal = sink.clone();
         let mut printer = ValuePrinter::new(sink);
         printer.begin_list().unwrap();
         printer.entity(Some("5a2")).unwrap();
         printer.entity(Some("not-a-handle")).unwrap();
-        printer.selection_set().unwrap();
-        printer.vla_object().unwrap();
-        printer.file().unwrap();
-        printer.function().unwrap();
-        printer.cycle().unwrap();
-        printer.too_deep().unwrap();
         printer.object(Some("bad label")).unwrap();
         printer.end_list().unwrap();
         printer.finish().unwrap();
@@ -783,43 +711,13 @@ mod tests {
 
         assert_eq!(
             collect(stream).await,
-            "((handent \"5A2\") #<Entity> #<SelectionSet> #<VlaObject> #<File> #<Function> #<Cycle> #<TooDeep> #<Object>)\n"
+            "((handent \"5A2\") #<Entity> #<Object>)\n"
         );
-    }
-
-    #[tokio::test]
-    async fn formats_autolisp_reals_from_native_binary_values() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink);
-        printer.begin_list().unwrap();
-
-        for number in [1.0, -0.0, 1.234567890123, 1.0e-12, 1.0e20] {
-            printer.real(number).unwrap();
-        }
-
-        assert_eq!(printer.real(f64::NAN), Err(PrintError::InvalidSequence));
-        assert_eq!(
-            printer.real(f64::INFINITY),
-            Err(PrintError::InvalidSequence)
-        );
-        printer.end_list().unwrap();
-        printer.finish().unwrap();
-        terminal.finish();
-
-        assert_eq!(collect(stream).await, "(1.0 0.0 1.23457 1.0e-12 1.0e+20)\n");
     }
 
     #[test]
-    fn matches_live_autolisp_real_thresholds_and_rounding() {
+    fn matches_live_autolisp_real_rounding() {
         for (value, expected) in [
-            (1.0e-6, "1.0e-06"),
-            (1.0e-5, "1.0e-05"),
-            (1.0e-4, "0.0001"),
-            (1.0e-3, "0.001"),
-            (1.0e4, "10000.0"),
-            (1.0e5, "100000.0"),
-            (1.0e6, "1.0e+06"),
             (9.999994, "9.99999"),
             (9.999995, "10.0"),
             (999_999.4, "999999.0"),
@@ -847,6 +745,9 @@ mod tests {
             format_autolisp_real(f64::MIN_POSITIVE).as_deref(),
             Some("2.22507e-308")
         );
+        assert_eq!(format_autolisp_real(-0.0).as_deref(), Some("0.0"));
+        assert_eq!(format_autolisp_real(f64::NAN), None);
+        assert_eq!(format_autolisp_real(f64::INFINITY), None);
     }
 
     #[test]
@@ -888,47 +789,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn zero_output_atom_boundaries_observe_cancellation() {
-        let (symbol_sink, _stream) = channel();
-        let symbol_terminal = symbol_sink.clone();
-        let mut symbol_printer = ValuePrinter::new(symbol_sink);
-        symbol_printer.begin_symbol().unwrap();
-        symbol_printer.symbol_chunk("A").unwrap();
-        symbol_terminal.request_cancel();
-        assert_eq!(
-            symbol_printer.end_symbol(),
-            Err(PrintError::Output(EmitResult::Cancelled))
-        );
-
-        let (string_sink, _stream) = channel();
-        let string_terminal = string_sink.clone();
-        let mut string_printer = ValuePrinter::new(string_sink);
-        string_printer.begin_string().unwrap();
-        string_terminal.request_cancel();
-        assert_eq!(
-            string_printer.end_string(),
-            Err(PrintError::Output(EmitResult::Cancelled))
-        );
-    }
-
-    #[tokio::test]
-    async fn escapes_dense_control_text_without_changing_bytes() {
-        let (sink, stream) = channel();
-        let terminal = sink.clone();
-        let mut printer = ValuePrinter::new(sink);
-        printer.begin_string().unwrap();
-        printer
-            .string_chunk(&"\u{2}".repeat(MAX_VALUE_TEXT_BYTES))
-            .unwrap();
-        printer.end_string().unwrap();
-        printer.finish().unwrap();
-        terminal.finish();
-
-        let expected = format!("\"{}\"\n", "\\002".repeat(MAX_VALUE_TEXT_BYTES));
-        assert_eq!(collect(stream).await, expected);
-    }
-
     #[tokio::test]
     async fn replaces_excessive_depth_with_too_deep() {
         let (sink, stream) = channel();
@@ -951,12 +811,6 @@ mod tests {
         let output = collect(stream).await;
         assert!(output.contains("#<TooDeep>"));
         assert!(!output.contains('1'));
-    }
-
-    fn symbol(printer: &mut ValuePrinter, text: &str) {
-        printer.begin_symbol().unwrap();
-        printer.symbol_chunk(text).unwrap();
-        printer.end_symbol().unwrap();
     }
 
     async fn collect(stream: OutputStream) -> String {
