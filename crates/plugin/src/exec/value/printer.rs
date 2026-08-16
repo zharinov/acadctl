@@ -244,7 +244,7 @@ impl ValuePrinter {
         Ok(())
     }
 
-    pub fn string_chunk(&mut self, text: &str) -> Result<(), PrintError> {
+    pub fn string_chunk(&self, text: &str) -> Result<(), PrintError> {
         if text.len() > MAX_VALUE_TEXT_BYTES {
             return Err(PrintError::InvalidSequence);
         }
@@ -597,10 +597,10 @@ fn format_autolisp_real(value: f64) -> Option<String> {
 
         if decimal <= 0 {
             result.push_str("0.");
-            result.extend(std::iter::repeat_n('0', (-decimal) as usize));
+            result.extend(std::iter::repeat_n('0', decimal.unsigned_abs() as usize));
             result.push_str(&digits);
         } else {
-            let decimal = decimal as usize;
+            let decimal = usize::try_from(decimal).ok()?;
 
             if decimal >= digits.len() {
                 result.push_str(&digits);
@@ -959,7 +959,7 @@ mod tests {
         printer.end_symbol().unwrap();
     }
 
-    async fn collect(mut stream: OutputStream) -> String {
+    async fn collect(stream: OutputStream) -> String {
         let mut output = String::new();
 
         while let Some(chunk) = stream.next_chunk().await {

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormSpan {
     pub byte_start: usize,

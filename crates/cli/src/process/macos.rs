@@ -31,6 +31,7 @@ impl AutoCadProcess {
             return false;
         };
 
+        // SAFETY: `kill` receives only an initialized process ID and a valid signal number.
         current == self.application && unsafe { libc::kill(process_id, libc::SIGKILL) == 0 }
     }
 

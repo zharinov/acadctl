@@ -336,6 +336,7 @@ fn wake_native_actions() -> i32 {
         fn acadctl_wake_native_actions() -> i32;
     }
 
+    // SAFETY: the native bridge exports this no-argument function for the plugin's lifetime.
     unsafe { acadctl_wake_native_actions() }
 }
 

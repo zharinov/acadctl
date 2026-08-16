@@ -17,33 +17,19 @@ service ExecService {
 
 message ListRequest {}
 
-message ListResponse {
-  repeated Doc documents = 1;
-}
+message ListResponse { repeated Doc documents = 1; }
 
-message OpenRequest {
-  string path = 1;
-}
+message OpenRequest { string path = 1; }
 
-message OpenResponse {
-  Doc document = 1;
-}
+message OpenResponse { Doc document = 1; }
 
-message SaveRequest {
-  uint32 id = 1;
-}
+message SaveRequest { uint32 id = 1; }
 
-message SaveResponse {
-  Doc document = 1;
-}
+message SaveResponse { Doc document = 1; }
 
-message HistoryRequest {
-  uint32 id = 1;
-}
+message HistoryRequest { uint32 id = 1; }
 
-message HistoryResponse {
-  Doc document = 1;
-}
+message HistoryResponse { Doc document = 1; }
 
 message CloseRequest {
   uint32 id = 1;
@@ -85,13 +71,9 @@ message ExecServerEvent {
 
 message ExecAccepted {}
 
-message ExecOutput {
-  string chunk = 1;
-}
+message ExecOutput { string chunk = 1; }
 
-message ExecFinished {
-  ExecOutcome outcome = 1;
-}
+message ExecFinished { ExecOutcome outcome = 1; }
 
 message ExecOutcome {
   oneof outcome {
@@ -105,9 +87,7 @@ message ExecSuccess {}
 
 message ExecCancelled {}
 
-message ExecCancelAcknowledgement {
-  ExecCancelDisposition disposition = 1;
-}
+message ExecCancelAcknowledgement { ExecCancelDisposition disposition = 1; }
 
 enum ExecCancelDisposition {
   EXEC_CANCEL_DISPOSITION_UNSPECIFIED = 0;

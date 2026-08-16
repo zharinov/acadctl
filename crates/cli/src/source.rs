@@ -148,7 +148,7 @@ impl SourceError {
 
 fn read_bounded(mut reader: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut buffer = [0; READ_BUFFER_BYTES];
+    let mut buffer = vec![0; READ_BUFFER_BYTES];
 
     while bytes.len() < MAX_RAW_SOURCE_BYTES {
         let remaining = MAX_RAW_SOURCE_BYTES - bytes.len();

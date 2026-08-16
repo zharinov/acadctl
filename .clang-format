@@ -1,0 +1,12 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++17
+ColumnLimit: 80
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: CaseSensitive
+---
+Language: Proto
+BasedOnStyle: LLVM
+ColumnLimit: 80

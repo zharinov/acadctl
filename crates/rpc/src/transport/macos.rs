@@ -29,6 +29,10 @@ impl Listener {
         Ok(Self { inner, path })
     }
 
+    #[allow(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the shared transport loop also serves the mutable Windows listener"
+    )]
     pub async fn accept(&mut self) -> io::Result<ServerStream> {
         self.inner.accept().await.map(|(stream, _)| stream)
     }

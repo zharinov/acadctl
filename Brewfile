@@ -1,0 +1,6 @@
+brew "cargo-deny"
+brew "cargo-shear"
+brew "llvm@22"
+brew "rustup"
+brew "shellcheck"
+brew "shfmt"

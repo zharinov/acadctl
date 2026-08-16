@@ -19,6 +19,7 @@ impl AutoCadProcess {
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
         };
 
+        // SAFETY: `OpenProcess` receives only access flags and an initialized process ID.
         let termination = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
@@ -32,12 +33,15 @@ impl AutoCadProcess {
         }
 
         let terminated = same_windows_process(self.handle, termination)
+            // SAFETY: `termination` is a live process handle owned by this function.
             && unsafe { TerminateProcess(termination, 1) != 0 };
+        // SAFETY: `termination` is non-null, owned here, and is closed exactly once.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(termination) };
         terminated
     }
 
     pub fn has_exited(&self) -> bool {
+        // SAFETY: `self.handle` remains live until this object is dropped.
         unsafe {
             windows_sys::Win32::System::Threading::WaitForSingleObject(self.handle, 0)
                 == windows_sys::Win32::Foundation::WAIT_OBJECT_0
@@ -60,14 +64,18 @@ impl AutoCadProcess {
         }
 
         unsafe extern "system" fn close_window(window: HWND, request: LPARAM) -> i32 {
+            // SAFETY: `request_windows_close` passes a live `CloseRequest` for this synchronous
+            // enumeration, and `EnumWindows` returns before that value is dropped.
             let request = unsafe { &mut *(request as *mut CloseRequest) };
             let mut process_id = 0;
+            // SAFETY: `window` came from `EnumWindows` and `process_id` is writable.
             unsafe { GetWindowThreadProcessId(window, &mut process_id) };
 
             if process_id != request.process_id {
                 return 1;
             }
 
+            // SAFETY: `OpenProcess` receives only access flags and the enumerated process ID.
             let current = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
 
             if current.is_null() {
@@ -75,12 +83,14 @@ impl AutoCadProcess {
             }
 
             let same_process = same_windows_process(request.original, current);
+            // SAFETY: `current` is non-null, owned here, and is closed exactly once.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(current) };
 
             if !same_process {
                 return 1;
             }
 
+            // SAFETY: `window` came from `EnumWindows`; the message carries no borrowed pointers.
             if unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
                 request.sent = true;
             }
@@ -94,6 +104,8 @@ impl AutoCadProcess {
             sent: false,
         };
 
+        // SAFETY: `request` remains live for the synchronous enumeration and the callback does not
+        // retain its pointer.
         unsafe {
             EnumWindows(
                 Some(close_window),
@@ -121,6 +133,8 @@ fn same_windows_process(
         let mut exited = created;
         let mut kernel = created;
         let mut user = created;
+        // SAFETY: `process` is a live handle supplied by this module, and every output pointer
+        // references an initialized local `FILETIME`.
         (unsafe {
             GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) != 0
         })
@@ -134,6 +148,7 @@ fn same_windows_process(
 
 impl Drop for AutoCadProcess {
     fn drop(&mut self) {
+        // SAFETY: this object owns the non-null handle and closes it exactly once during drop.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
     }
 }
@@ -155,6 +170,7 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
             continue;
         };
 
+        // SAFETY: `OpenProcess` receives only access flags and an initialized process ID.
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -168,7 +184,9 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
         }
 
         let mut image = vec![0_u16; 32_768];
-        let mut length = image.len() as u32;
+        let mut length = u32::try_from(image.len()).expect("image buffer length fits u32");
+        // SAFETY: `handle` is live, `image` exposes its full writable allocation, and `length`
+        // contains that allocation's element capacity.
         let queried =
             unsafe { QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut length) != 0 };
         let is_autocad = queried
@@ -177,6 +195,7 @@ pub(super) fn discover() -> Vec<AutoCadProcess> {
                 .is_some_and(|name| name.eq_ignore_ascii_case("acad.exe"));
 
         if !is_autocad {
+            // SAFETY: `handle` is non-null, owned here, and is not retained on this branch.
             unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
 
             continue;

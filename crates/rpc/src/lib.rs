@@ -29,6 +29,11 @@ pub use protocol::{
 pub use source::{SourceName, SourceNameError};
 pub use transport::{Incoming, incoming};
 
+#[allow(
+    clippy::all,
+    clippy::allow_attributes_without_reason,
+    reason = "tonic and prost generate this module"
+)]
 mod protocol {
     tonic::include_proto!("acadctl");
 }

@@ -1,12 +1,12 @@
-#include "host.hpp"
 #include "acadctl-plugin/src/lib.rs.h"
-#include "adscodes.h"
 #include "acedads.h"
+#include "adscodes.h"
+#include "host.hpp"
 #include "rxregsvc.h"
 #include <syslog.h>
 
 extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
-                                           void *applicationId) {
+                                           void* applicationId) {
   switch (message) {
   case AcRx::kInitAppMsg: {
     acrxDynamicLinker->registerAppMDIAware(applicationId);
@@ -96,9 +96,8 @@ extern "C" AcRx::AppRetCode acrxEntryPoint(AcRx::AppMsgCode message,
     }
 
     if (!acadctl_stop_bridge()) {
-      syslog(LOG_ERR,
-             "acadctl plugin cannot unload while AutoCAD may retain a "
-             "database reactor");
+      syslog(LOG_ERR, "acadctl plugin cannot unload while AutoCAD may retain a "
+                      "database reactor");
       return AcRx::kRetError;
     }
 

@@ -56,9 +56,30 @@ clang++ \
     -std=c++17 \
     -arch arm64 \
     -mmacosx-version-min="$deployment_target" \
+    -Wall \
+    -Wextra \
+    -Wpedantic \
+    -Wconversion \
+    -Wsign-conversion \
+    -Wshadow-all \
+    -Wnon-virtual-dtor \
+    -Wold-style-cast \
+    -Wcast-align \
+    -Woverloaded-virtual \
+    -Wnull-dereference \
+    -Wdouble-promotion \
+    -Wformat=2 \
+    -Wimplicit-fallthrough \
+    -Wextra-semi \
+    -Wundef \
+    -Wmissing-declarations \
+    -Wunreachable-code \
+    -Wcomma \
+    -Wconditional-uninitialized \
+    -Werror \
     -bundle \
     -isystem "$sdk_root/inc" \
-    -I"$rust_target/cxxbridge" \
+    -isystem "$rust_target/cxxbridge" \
     -L"$autocad_root/Contents/Frameworks" \
     -F"$autocad_root/Contents/Frameworks" \
     "$repo_root/crates/plugin/native/entry.cpp" \

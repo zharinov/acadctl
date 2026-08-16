@@ -273,7 +273,7 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Eval, source_name("inspect.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     let action = take_native_action();
@@ -337,7 +337,7 @@ async fn queued_cancellation_removes_only_that_execution() {
 
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
     let job_id = SCHEDULER
         .lock()
@@ -374,7 +374,7 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
 
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, queued) = spawn_test_execution(id, execution, output);
+    let (output, queued) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
     let job_id = SCHEDULER
         .lock()
@@ -411,7 +411,7 @@ async fn wake_failure_stops_a_pending_execution_output_stream() {
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     wake_failed(42);
@@ -429,7 +429,7 @@ async fn active_cancellation_rolls_back_after_the_current_form() {
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     let action = take_native_action();
@@ -470,7 +470,7 @@ async fn active_cancellation_before_the_first_form_closes_the_empty_undo_group()
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     let action = take_native_action();
@@ -503,7 +503,7 @@ async fn cancellation_after_commit_handoff_does_not_cancel_output() {
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     let action = take_native_action();
@@ -542,7 +542,7 @@ async fn shutdown_wakes_output_and_cancels_an_active_execution_safely() {
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, pending) = spawn_test_execution(id, execution, output);
+    let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     let action = take_native_action();
@@ -579,7 +579,7 @@ async fn dropped_execution_waiter_does_not_release_the_active_mutation_job() {
     let id = list().unwrap()[0].id;
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let (mut output, executing) = spawn_test_execution(id, execution, output);
+    let (output, executing) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
     let action = take_native_action();
@@ -815,7 +815,7 @@ async fn queued_execution_expires_without_starting_a_form() {
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
     let admission = admit_test_execution(id, execution, output).unwrap();
-    let (job_id, mut output, completion) = admission.into_parts();
+    let (job_id, output, completion) = admission.into_parts();
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
         let job = scheduler

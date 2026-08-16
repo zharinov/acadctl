@@ -201,7 +201,7 @@ impl Drop for OutputSink {
 }
 
 impl OutputStream {
-    pub async fn next_chunk(&mut self) -> Option<String> {
+    pub async fn next_chunk(&self) -> Option<String> {
         loop {
             let notified = self.shared.data_available.notified();
             {
@@ -302,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_bytes_with_bounded_coalesced_chunks() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
 
         for _ in 0..100_000 {
             assert_eq!(sink.emit("x"), EmitResult::Continue);
@@ -322,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn splits_only_at_utf8_boundaries() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         let text = "界".repeat(OUTPUT_CHUNK_BYTES);
         assert_eq!(sink.emit(&text), EmitResult::Continue);
         sink.finish();
@@ -339,16 +339,15 @@ mod tests {
 
     #[test]
     fn backpressure_blocks_until_the_consumer_drains_space() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         assert_eq!(
             sink.emit(&"x".repeat(OUTPUT_BUFFER_BYTES)),
             EmitResult::Continue
         );
 
         let (completed, completion) = mpsc::channel();
-        let producer = sink.clone();
         let writer = thread::spawn(move || {
-            completed.send(producer.emit("y")).unwrap();
+            completed.send(sink.emit("y")).unwrap();
         });
         assert!(completion.recv_timeout(Duration::from_millis(20)).is_err());
 
@@ -400,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_pending_read_does_not_consume_output() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         tokio::select! {
             _ = stream.next_chunk() => panic!("an empty stream should remain pending"),
             _ = tokio::task::yield_now() => {}
@@ -413,7 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_fragments_are_not_messages_until_flushed() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
 
         for _ in 0..1_000 {
             assert_eq!(sink.emit("x"), EmitResult::Continue);
@@ -431,7 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn finish_wakes_a_pending_reader() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         let reader = tokio::spawn(async move { stream.next_chunk().await });
         tokio::task::yield_now().await;
 
@@ -441,7 +440,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_drains_published_output_then_ends_the_stream() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         assert_eq!(sink.emit("before cancel"), EmitResult::Continue);
         sink.request_cancel();
 
@@ -451,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_cancellation_remains_terminal_when_execution_finishes() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         assert_eq!(sink.emit("before cancel"), EmitResult::Continue);
         sink.request_cancel();
         sink.finish();
@@ -463,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn stopping_discards_cancelled_output() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         assert_eq!(sink.emit("discarded"), EmitResult::Continue);
         sink.request_cancel();
         sink.stop();
@@ -474,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_the_last_producer_stops_an_unfinished_stream() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         assert_eq!(sink.emit("discarded"), EmitResult::Continue);
         drop(sink);
 
@@ -483,7 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_one_producer_does_not_stop_its_clone() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         let remaining = sink.clone();
         drop(sink);
 
@@ -495,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_finished_producer_preserves_published_output() {
-        let (sink, mut stream) = channel();
+        let (sink, stream) = channel();
         assert_eq!(sink.emit("kept"), EmitResult::Continue);
         sink.finish();
         drop(sink);
