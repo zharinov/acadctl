@@ -35,55 +35,21 @@ std::atomic<bool> acceptNativeActionWakes{true};
 const ACHAR kHistoryCommandGroup[] = ACRX_T("ACADCTL_INTERNAL");
 const ACHAR kHistoryCommandName[] = ACRX_T("ACADCTL_INTERNAL_HISTORY");
 const ACHAR kHistoryCommandInvocation[] = ACRX_T("ACADCTL_INTERNAL_HISTORY\n");
-
-AcString nativeString(const rust::String& value) {
-  return AcString(value.data(), AcString::Utf8,
-                  static_cast<Adesk::UInt32>(value.size()));
-}
-
-struct BridgeProtocolText {
-  BridgeProtocolText()
-      : BridgeProtocolText(acadctl::native_bridge_protocol()) {}
-
-  explicit BridgeProtocolText(const acadctl::NativeBridgeProtocol& protocol)
-      : executionDriverExpression(
-            nativeString(protocol.execution_driver_expression)),
-        executionDriverInvocation(
-            nativeString(protocol.execution_driver_invocation)),
-        outputEventFunction(nativeString(protocol.output_event_function)),
-        evalValueEmitterExpression(
-            nativeString(protocol.eval_value_emitter_expression)),
-        advanceExecutionFunction(
-            nativeString(protocol.advance_execution_function)),
-        sourceSymbol(nativeString(protocol.source_symbol)),
-        stagedFormSymbol(nativeString(protocol.staged_form_symbol)),
-        statusSymbol(nativeString(protocol.status_symbol)),
-        errorSymbol(nativeString(protocol.error_symbol)),
-        errnoSymbol(nativeString(protocol.errno_symbol)),
-        valueSymbol(nativeString(protocol.value_symbol)),
-        pendingStatus(nativeString(protocol.pending_status)),
-        valueChunkCaptureUnits(protocol.value_chunk_capture_units) {}
-
-  AcString executionDriverExpression;
-  AcString executionDriverInvocation;
-  AcString outputEventFunction;
-  AcString evalValueEmitterExpression;
-  AcString advanceExecutionFunction;
-  AcString sourceSymbol;
-  AcString stagedFormSymbol;
-  AcString statusSymbol;
-  AcString errorSymbol;
-  AcString errnoSymbol;
-  AcString valueSymbol;
-  AcString pendingStatus;
-  std::size_t valueChunkCaptureUnits;
-};
-
-const BridgeProtocolText& bridgeProtocol() {
-  static const BridgeProtocolText protocol;
-
-  return protocol;
-}
+const ACHAR kExecutionDriverExpression[] = ACRX_T("(actl:_drive-execution)");
+const ACHAR kExecutionDriverInvocation[] = ACRX_T("(actl:_drive-execution)\n");
+const ACHAR kEvalMarker[] = ACRX_T("actl:_eval");
+const ACHAR kEmitRetainedValueExpression[] =
+    ACRX_T("(actl:_emit-retained-value)");
+const ACHAR kOutputEventFunction[] = ACRX_T("actl:_output-event");
+const ACHAR kAdvanceExecutionFunction[] = ACRX_T("actl:_advance-execution");
+const ACHAR kSourceSymbol[] = ACRX_T("actl:*bridge-source*");
+const ACHAR kStagedFormSymbol[] = ACRX_T("actl:*bridge-staged-form*");
+const ACHAR kStatusSymbol[] = ACRX_T("actl:*bridge-status*");
+const ACHAR kErrorSymbol[] = ACRX_T("actl:*bridge-error*");
+const ACHAR kErrnoSymbol[] = ACRX_T("actl:*bridge-errno*");
+const ACHAR kValueSymbol[] = ACRX_T("actl:*bridge-value*");
+const ACHAR kPendingStatus[] = ACRX_T("pending");
+constexpr std::size_t kValueChunkCaptureUnits = 4096;
 
 class NativeActionCallbackLease final {
 public:
@@ -467,7 +433,7 @@ void finishOutputPort(
 }
 
 std::size_t boundedWideChunkLength(const ACHAR* text) {
-  const std::size_t captureUnits = bridgeProtocol().valueChunkCaptureUnits;
+  const std::size_t captureUnits = kValueChunkCaptureUnits;
   std::size_t length = 0;
 
   while (length < captureUnits && text[length] != 0) {
@@ -714,10 +680,8 @@ int defineLispFunction(const ACHAR* name, int code, int (*callback)()) {
 }
 
 int defineLispFunctions() {
-  const BridgeProtocolText& protocol = bridgeProtocol();
-  int status =
-      defineLispFunction(protocol.outputEventFunction.kACharPtr(),
-                         kOutputEventFunctionCode, &acadctlOutputEvent);
+  int status = defineLispFunction(
+      kOutputEventFunction, kOutputEventFunctionCode, &acadctlOutputEvent);
 
   if (status != RTNORM) {
     undefineLispFunctions();
@@ -725,7 +689,7 @@ int defineLispFunctions() {
     return status;
   }
 
-  status = defineLispFunction(protocol.advanceExecutionFunction.kACharPtr(),
+  status = defineLispFunction(kAdvanceExecutionFunction,
                               kAdvanceExecutionFunctionCode,
                               &acadctlAdvanceExecution);
 
@@ -739,12 +703,10 @@ int defineLispFunctions() {
 }
 
 int undefineLispFunctions() {
-  const BridgeProtocolText& protocol = bridgeProtocol();
   const int executionStatus =
-      acedUndef(protocol.advanceExecutionFunction.kACharPtr(),
-                kAdvanceExecutionFunctionCode);
-  const int outputStatus = acedUndef(protocol.outputEventFunction.kACharPtr(),
-                                     kOutputEventFunctionCode);
+      acedUndef(kAdvanceExecutionFunction, kAdvanceExecutionFunctionCode);
+  const int outputStatus =
+      acedUndef(kOutputEventFunction, kOutputEventFunctionCode);
 
   if (executionStatus != RTNORM) {
     return executionStatus;
@@ -753,12 +715,16 @@ int undefineLispFunctions() {
   return outputStatus;
 }
 
-int putStringSymbol(const ACHAR* name, const AcString& text) {
+int putStringSymbol(const ACHAR* name, const ACHAR* text) {
   resbuf value{};
   value.restype = RTSTR;
-  value.resval.rstring = const_cast<ACHAR*>(text.kACharPtr());
+  value.resval.rstring = const_cast<ACHAR*>(text);
 
   return acedPutSym(name, &value);
+}
+
+int putStringSymbol(const ACHAR* name, const AcString& text) {
+  return putStringSymbol(name, text.kACharPtr());
 }
 
 int clearSymbol(const ACHAR* name) {
@@ -821,14 +787,10 @@ UndoGroupState observeUndoGroup(int& status) {
 }
 
 int clearExecutionBridgeSymbols(bool includeValue = true) {
-  const BridgeProtocolText& protocol = bridgeProtocol();
   int firstFailure = RTNORM;
 
-  for (const ACHAR* name :
-       {protocol.sourceSymbol.kACharPtr(),
-        protocol.stagedFormSymbol.kACharPtr(),
-        protocol.statusSymbol.kACharPtr(), protocol.errorSymbol.kACharPtr(),
-        protocol.errnoSymbol.kACharPtr()}) {
+  for (const ACHAR* name : {kSourceSymbol, kStagedFormSymbol, kStatusSymbol,
+                            kErrorSymbol, kErrnoSymbol}) {
     const int status = clearSymbol(name);
 
     if (firstFailure == RTNORM && status != RTNORM) {
@@ -837,7 +799,7 @@ int clearExecutionBridgeSymbols(bool includeValue = true) {
   }
 
   if (includeValue) {
-    const int status = clearSymbol(protocol.valueSymbol.kACharPtr());
+    const int status = clearSymbol(kValueSymbol);
 
     if (firstFailure == RTNORM && status != RTNORM) {
       firstFailure = status;
@@ -876,9 +838,7 @@ finishEvaluation(acadctl::NativeExecStepResult result,
 }
 
 acadctl::NativeBridgeStepResult stageEvaluation(rust::Str source,
-                                                const AcString& evaluatorText,
                                                 bool retainValue) {
-  const BridgeProtocolText& protocol = bridgeProtocol();
   const int clearStatus = clearExecutionBridgeSymbols();
 
   if (clearStatus != RTNORM) {
@@ -891,11 +851,9 @@ acadctl::NativeBridgeStepResult stageEvaluation(rust::Str source,
     const AcString form(source.data(), AcString::Utf8,
                         static_cast<Adesk::UInt32>(source.size()));
 
-    if (putStringSymbol(protocol.sourceSymbol.kACharPtr(), form) != RTNORM ||
-        putStringSymbol(protocol.stagedFormSymbol.kACharPtr(), evaluatorText) !=
-            RTNORM ||
-        putStringSymbol(protocol.statusSymbol.kACharPtr(),
-                        protocol.pendingStatus) != RTNORM) {
+    if (putStringSymbol(kSourceSymbol, form) != RTNORM ||
+        putStringSymbol(kStagedFormSymbol, kEvalMarker) != RTNORM ||
+        putStringSymbol(kStatusSymbol, kPendingStatus) != RTNORM) {
       return finishEvaluation(stepNativeFailure(RTERROR), retainValue);
     }
   }
@@ -904,9 +862,8 @@ acadctl::NativeBridgeStepResult stageEvaluation(rust::Str source,
 }
 
 acadctl::NativeLispObservation observeLispOutcome(int commandStatus) {
-  const BridgeProtocolText& protocol = bridgeProtocol();
   int statusResult = RTERROR;
-  ResbufPtr status = getSymbol(protocol.statusSymbol.kACharPtr(), statusResult);
+  ResbufPtr status = getSymbol(kStatusSymbol, statusResult);
   const bool nilStatus =
       statusResult == RTNIL || (statusResult == RTNORM && !status) ||
       (statusResult == RTNORM && status && status->restype == RTNIL);
@@ -917,13 +874,12 @@ acadctl::NativeLispObservation observeLispOutcome(int commandStatus) {
                                          : acadctl::NativeLispStatusKind::Other;
 
   int errnoResult = RTERROR;
-  ResbufPtr lispErrno =
-      getSymbol(protocol.errnoSymbol.kACharPtr(), errnoResult);
+  ResbufPtr lispErrno = getSymbol(kErrnoSymbol, errnoResult);
   const int lispErrnoValue =
       errnoResult == RTNORM ? integerValue(lispErrno.get()) : 0;
 
   int errorResult = RTERROR;
-  ResbufPtr error = getSymbol(protocol.errorSymbol.kACharPtr(), errorResult);
+  ResbufPtr error = getSymbol(kErrorSymbol, errorResult);
   BoundedNativeText detail{rust::String(), false};
   const bool errorAvailable = errorResult == RTNORM && error &&
                               error->restype == RTSTR && error->resval.rstring;
@@ -1090,7 +1046,6 @@ ObjectArxBridge::~ObjectArxBridge() {
 ObjectArxBridge* ObjectArxBridge::commandBridge_ = nullptr;
 
 Acad::ErrorStatus ObjectArxBridge::start() {
-  (void)bridgeProtocol();
   const Acad::ErrorStatus commandStatus = acedRegCmds->addCommand(
       kHistoryCommandGroup, kHistoryCommandName, kHistoryCommandName,
       ACRX_CMD_MODAL | ACRX_CMD_NOHISTORY | ACRX_CMD_NO_UNDO_MARKER,
@@ -1526,10 +1481,9 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
   });
 
   nativeActionCallbacksOutstanding.fetch_add(1, std::memory_order_seq_cst);
-  const ACHAR* invocation =
-      kind == DocContextDispatch::Kind::ExecDriver
-          ? bridgeProtocol().executionDriverInvocation.kACharPtr()
-          : kHistoryCommandInvocation;
+  const ACHAR* invocation = kind == DocContextDispatch::Kind::ExecDriver
+                                ? kExecutionDriverInvocation
+                                : kHistoryCommandInvocation;
   const Acad::ErrorStatus scheduleStatus =
       acDocManager->sendStringToExecute(target, invocation, true, false, false);
 
@@ -1654,8 +1608,7 @@ void ObjectArxBridge::queuedExecutionDriverStarted(const ACHAR* firstLine) {
   }
 
   const std::size_t actualLength = std::char_traits<ACHAR>::length(firstLine);
-  const ACHAR* driverExpression =
-      bridgeProtocol().executionDriverExpression.kACharPtr();
+  const ACHAR* driverExpression = kExecutionDriverExpression;
   const std::size_t expectedLength =
       std::char_traits<ACHAR>::length(driverExpression);
 
@@ -1751,8 +1704,7 @@ void ObjectArxBridge::recoverCancelledExecutionDriver() {
       DocContextDispatch::ExecDriverLifecycle::AwaitingStart;
   dispatch.lispDepth = 0;
   const Acad::ErrorStatus scheduleStatus = acDocManager->sendStringToExecute(
-      target, bridgeProtocol().executionDriverInvocation.kACharPtr(), true,
-      false, false);
+      target, kExecutionDriverInvocation, true, false, false);
 
   if (scheduleStatus != Acad::eOk) {
     dispatch.dispatchResult = nativeFailure(
@@ -1894,13 +1846,6 @@ int acadctlAdvanceExecution() noexcept {
       dispatch.dispatchResult =
           result(acadctl::NativeActionResultKind::UndoDisabled);
     } else {
-      const rust::Str evaluator = acadctl::form_evaluator_source();
-      const AcString evaluatorText(
-          evaluator.data(), AcString::Utf8,
-          static_cast<Adesk::UInt32>(evaluator.size()));
-      const AcString evalValueEmitter(
-          bridgeProtocol().evalValueEmitterExpression);
-
       if (dispatch.stagedFormKind ==
           ObjectArxBridge::DocContextDispatch::StagedFormKind::Evaluator) {
         finishOutputPort(dispatch.outputPort, false);
@@ -2028,9 +1973,8 @@ int acadctlAdvanceExecution() noexcept {
             break;
           }
 
-          acadctl::NativeBridgeStepResult staging =
-              stageEvaluation(acadctl::execution_step_source(*step),
-                              evaluatorText, retainValue);
+          acadctl::NativeBridgeStepResult staging = stageEvaluation(
+              acadctl::execution_step_source(*step), retainValue);
           dispatch.bridgeSymbolsMayBeRetained =
               staging.bridge_symbols_may_be_retained;
 
@@ -2090,15 +2034,12 @@ int acadctlAdvanceExecution() noexcept {
           int preparationStatus = clearExecutionBridgeSymbols(false);
 
           if (preparationStatus == RTNORM) {
-            preparationStatus =
-                putStringSymbol(bridgeProtocol().stagedFormSymbol.kACharPtr(),
-                                evalValueEmitter);
+            preparationStatus = putStringSymbol(kStagedFormSymbol,
+                                                kEmitRetainedValueExpression);
           }
 
           if (preparationStatus == RTNORM) {
-            preparationStatus =
-                putStringSymbol(bridgeProtocol().statusSymbol.kACharPtr(),
-                                bridgeProtocol().pendingStatus);
+            preparationStatus = putStringSymbol(kStatusSymbol, kPendingStatus);
           }
 
           if (preparationStatus != RTNORM) {

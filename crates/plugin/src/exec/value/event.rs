@@ -1,6 +1,35 @@
-use crate::exec::protocol::OutputEventCode;
-
 use super::port::ValueEvent;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub(crate) enum OutputEventCode {
+    BeginList = 1,
+    EndList = 2,
+    Dot = 3,
+    Nil = 4,
+    True = 5,
+    Integer = 6,
+    Real = 7,
+    BeginString = 8,
+    StringChunk = 9,
+    EndString = 10,
+    BeginSymbol = 11,
+    SymbolChunk = 12,
+    EndSymbol = 13,
+    Entity = 14,
+    SelectionSet = 15,
+    VlaObject = 16,
+    File = 17,
+    Function = 18,
+    ErrorObject = 19,
+    Object = 20,
+    Cycle = 21,
+    TooDeep = 22,
+    BeginValue = 23,
+    EndValue = 24,
+    Label = 25,
+    InvalidLabel = 26,
+}
 
 pub(crate) enum OutputEvent<'a> {
     BeginValue,

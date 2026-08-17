@@ -99,28 +99,32 @@ fn eval_requires_exactly_one_form_while_exec_accepts_a_batch() {
 }
 
 #[test]
-fn embedded_evaluator_is_one_complete_form() {
-    assert_eq!(acadctl_lisp::validate(form_evaluator_source()), Ok(1));
-}
+fn lisp_sources_are_valid() {
+    fn validate_tree(directory: &std::path::Path) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                validate_tree(&path);
+            } else if path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("lsp"))
+            {
+                let source = std::fs::read_to_string(&path).unwrap();
+                assert!(
+                    acadctl_lisp::validate(&source).is_ok(),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
 
-#[test]
-fn embedded_execution_driver_is_one_complete_definition() {
-    assert_eq!(
-        acadctl_lisp::validate(&protocol::execution_driver_source()),
-        Ok(1)
-    );
-}
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    validate_tree(&manifest.join("lisp"));
 
-#[test]
-fn embedded_driver_defines_the_public_output_contract() {
-    let source = protocol::execution_driver_source();
-
-    assert!(source.contains("(defun actl:print (actl:value"));
-    assert!(source.contains("(defun actl:label (actl:text)"));
-    assert!(source.contains("(defun actl:_emit-value (actl:value"));
-    assert!(source.contains("actl:_output-event"));
-    assert!(source.contains("actl:value)"));
-    assert!(source.contains("nil)"));
+    let loader = std::fs::read_to_string(manifest.join("native/loader.lsp")).unwrap();
+    assert!(acadctl_lisp::validate(&loader).is_ok());
 }
 
 #[test]

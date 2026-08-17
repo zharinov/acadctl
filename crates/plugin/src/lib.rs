@@ -121,22 +121,6 @@ mod ffi {
         has_text: bool,
     }
 
-    struct NativeBridgeProtocol {
-        execution_driver_expression: String,
-        execution_driver_invocation: String,
-        output_event_function: String,
-        eval_value_emitter_expression: String,
-        advance_execution_function: String,
-        source_symbol: String,
-        staged_form_symbol: String,
-        status_symbol: String,
-        error_symbol: String,
-        errno_symbol: String,
-        value_symbol: String,
-        pending_status: String,
-        value_chunk_capture_units: usize,
-    }
-
     struct NativeLispObservation {
         command_status: i32,
         status_kind: NativeLispStatusKind,
@@ -215,15 +199,11 @@ mod ffi {
 
         fn execution_step_retain_value(step: &NativeExecStep) -> bool;
 
-        fn form_evaluator_source() -> &'static str;
-
         fn native_diagnostic_capture_units() -> usize;
 
         fn complete_execution_step(job_id: u64, result: NativeExecStepResult) -> bool;
 
         fn abandon_execution(job_id: u64, result: NativeExecStepResult) -> bool;
-
-        fn native_bridge_protocol() -> NativeBridgeProtocol;
 
         fn interpret_lisp_observation(
             observation: NativeLispObservation,
@@ -331,30 +311,8 @@ fn execution_step_retain_value(step: &NativeExecStep) -> bool {
     step.retain_value()
 }
 
-fn form_evaluator_source() -> &'static str {
-    exec::form_evaluator_source()
-}
-
 fn native_diagnostic_capture_units() -> usize {
     acadctl_rpc::MAX_DIAGNOSTIC_BYTES + 1
-}
-
-fn native_bridge_protocol() -> ffi::NativeBridgeProtocol {
-    ffi::NativeBridgeProtocol {
-        execution_driver_expression: exec::protocol::execution_driver_expression(),
-        execution_driver_invocation: exec::protocol::execution_driver_invocation(),
-        output_event_function: exec::protocol::OUTPUT_EVENT_FUNCTION.into(),
-        eval_value_emitter_expression: exec::protocol::eval_value_emitter_expression(),
-        advance_execution_function: exec::protocol::ADVANCE_EXECUTION_FUNCTION.into(),
-        source_symbol: exec::protocol::SOURCE_SYMBOL.into(),
-        staged_form_symbol: exec::protocol::STAGED_FORM_SYMBOL.into(),
-        status_symbol: exec::protocol::STATUS_SYMBOL.into(),
-        error_symbol: exec::protocol::ERROR_SYMBOL.into(),
-        errno_symbol: exec::protocol::ERRNO_SYMBOL.into(),
-        value_symbol: exec::protocol::VALUE_SYMBOL.into(),
-        pending_status: exec::protocol::PENDING_STATUS.into(),
-        value_chunk_capture_units: exec::protocol::NATIVE_VALUE_CHUNK_CAPTURE_UNITS,
-    }
 }
 
 fn interpret_lisp_observation(

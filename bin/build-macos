@@ -77,7 +77,7 @@ sed \
     "$repo_root/crates/plugin/native/PackageContents.xml" \
     >"$build_bundle/PackageContents.xml"
 cp "$repo_root/crates/plugin/native/loader.lsp" "$build_bundle/Contents/loader.lsp"
-cp "$rust_target/acadctl-generated/$cargo_profile/driver.lsp" "$build_bundle/Contents/driver.lsp"
+cp -R "$repo_root/crates/plugin/lisp" "$build_bundle/Contents/lisp"
 
 clang++ \
     -std=c++17 \

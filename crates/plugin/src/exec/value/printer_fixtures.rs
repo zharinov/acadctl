@@ -61,6 +61,26 @@ async fn run_fixture(name: &str, expected: &str) {
     }
 }
 
+#[tokio::test]
+async fn fixtures() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/printer");
+    let mut paths = std::fs::read_dir(directory)
+        .expect("read printer fixtures")
+        .map(|entry| entry.expect("read printer fixture").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "txt"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("printer fixture name is UTF-8");
+        let expected = std::fs::read_to_string(&path).expect("read printer fixture");
+        run_fixture(name, &expected).await;
+    }
+}
+
 async fn format_value(value: &FixtureValue, chunking: Chunking) -> Result<String, PrintError> {
     let (sink, stream) = channel();
     let terminal = sink.clone();
@@ -474,5 +494,3 @@ fn decode_symbol(token: &str) -> Result<String, &'static str> {
     }
     Ok(symbol)
 }
-
-include!(concat!(env!("OUT_DIR"), "/printer_fixtures.rs"));
