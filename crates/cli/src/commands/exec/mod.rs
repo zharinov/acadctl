@@ -81,12 +81,12 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
 
     let diagnostics = match PipeWriter::stderr() {
         Ok(diagnostics) => diagnostics,
-        Err(_) => return fail("Could not start diagnostic output".into()),
+        Err(_) => return fail("Diagnostics unavailable.".into()),
     };
 
     let (mut interrupts, receiver) = match Interrupts::new(request, diagnostics) {
         Ok(interrupts) => interrupts,
-        Err(_) => return fail("Could not listen for Ctrl+C".into()),
+        Err(_) => return fail("Ctrl+C unavailable.".into()),
     };
 
     let outbound = futures_stream::unfold(receiver, |mut receiver| async move {
@@ -199,8 +199,7 @@ impl ResponseSession {
 
                             return diagnostic_failure(
                                 &mut self.interrupts,
-                                "Could not write AutoLISP output (AutoLISP may still be running)"
-                                    .into(),
+                                "Output failed: code may still be running.".into(),
                             )
                             .await;
                         }
@@ -213,8 +212,7 @@ impl ResponseSession {
 
                             return diagnostic_failure(
                                 &mut self.interrupts,
-                                "Could not write AutoLISP output (AutoLISP may still be running)"
-                                    .into(),
+                                "Output failed: code may still be running.".into(),
                             )
                             .await;
                         }
@@ -306,7 +304,7 @@ impl ResponseSession {
 
         diagnostic_failure(
             &mut self.interrupts,
-            "Connection lost (AutoLISP may still be running)".into(),
+            "Connection lost: code may still be running.".into(),
         )
         .await
     }
@@ -314,15 +312,17 @@ impl ResponseSession {
     async fn invalid_response(&mut self, _detail: &str) -> ExitCode {
         diagnostic_failure(
             &mut self.interrupts,
-            "Invalid response from AutoCAD (execution outcome unknown)".into(),
+            "Invalid response: outcome unknown.".into(),
         )
         .await
     }
 
     async fn report_failure(&mut self, failure: ExecFailure) -> ExitCode {
         self.interrupts.finish_stopping("done.");
-        let mut text = failure_lines(&failure, &self.source_name, self.target).join("\n");
-        text.push('\n');
+        let text = format!(
+            "{}\n",
+            failure_message(&failure, &self.source_name, self.target)
+        );
 
         match self.interrupts.write_diagnostic(text).await {
             DiagnosticWait::Complete => ExitCode::FAILURE,
@@ -331,16 +331,20 @@ impl ResponseSession {
     }
 }
 
-fn failure_lines(failure: &ExecFailure, fallback_source_name: &str, target: Target) -> Vec<String> {
+fn failure_message(failure: &ExecFailure, fallback_source_name: &str, target: Target) -> String {
+    if readiness_timed_out(failure) {
+        return "Timeout: code was not run.".into();
+    }
+
     let message = if failure.message.is_empty() {
-        format!("Could not execute AutoLISP in drawing {target}")
+        format!("Code failed in drawing {target}")
     } else if failure.location.is_some() || failure.form_index.is_some() {
         failure.message.clone()
     } else {
         location_free_failure_message(failure, target)
     };
 
-    let mut lines = match (&failure.location, failure.form_index) {
+    let rendered_failure = match (&failure.location, failure.form_index) {
         (Some(location), Some(form_index)) => {
             let source_name = if location.source_name.is_empty() {
                 fallback_source_name
@@ -348,13 +352,10 @@ fn failure_lines(failure: &ExecFailure, fallback_source_name: &str, target: Targ
                 &location.source_name
             };
 
-            vec![
-                format!(
-                    "AutoLISP failed in {source_name} at form {form_index}, line {}",
-                    location.line
-                ),
-                message,
-            ]
+            format!(
+                "Code failed in {source_name} at form {form_index}, line {}: {message}",
+                location.line
+            )
         }
         (Some(location), None) => {
             let source_name = if location.source_name.is_empty() {
@@ -363,23 +364,21 @@ fn failure_lines(failure: &ExecFailure, fallback_source_name: &str, target: Targ
                 &location.source_name
             };
 
-            vec![
-                format!(
-                    "Could not read AutoLISP in {source_name} at line {}, column {}",
-                    location.line, location.column
-                ),
-                message,
-            ]
+            format!(
+                "Invalid code in {source_name} at line {}, column {}: {message}",
+                location.line, location.column
+            )
         }
-        (None, Some(form_index)) => vec![
-            format!("AutoLISP failed in {fallback_source_name} at form {form_index}"),
-            message,
-        ],
-        (None, None) => vec![message],
+        (None, Some(form_index)) => {
+            format!("Code failed in {fallback_source_name} at form {form_index}: {message}")
+        }
+        (None, None) => message,
     };
 
-    lines.push(drawing_outcome_message(failure.drawing_outcome).into());
-    lines
+    join_sentences(
+        &rendered_failure,
+        drawing_outcome_message(failure.drawing_outcome),
+    )
 }
 
 fn location_free_failure_message(failure: &ExecFailure, target: Target) -> String {
@@ -390,30 +389,39 @@ fn location_free_failure_message(failure: &ExecFailure, target: Target) -> Strin
     } else if failure.message.starts_with("The source ") || failure.message.starts_with("eval ") {
         failure.message.trim_end_matches('.').to_owned()
     } else {
-        format!("Could not execute AutoLISP in drawing {target}")
+        format!("Code failed in drawing {target}")
     }
+}
+
+fn readiness_timed_out(failure: &ExecFailure) -> bool {
+    failure.message.starts_with("AutoCAD did not become ready")
+        || acadctl_rpc::DrawingErrorKind::try_from(failure.drawing_error)
+            == Ok(acadctl_rpc::DrawingErrorKind::ReadinessTimedOut)
+}
+
+fn join_sentences(first: &str, second: &str) -> String {
+    format!("{}. {}", first.trim_end_matches(['.', '!', '?']), second)
 }
 
 fn drawing_outcome_message(outcome: i32) -> &'static str {
     match DrawingOutcome::try_from(outcome) {
-        Ok(DrawingOutcome::NotStarted) => "AutoLISP was not run",
+        Ok(DrawingOutcome::NotStarted) => "Code was not run.",
         Ok(DrawingOutcome::RolledBack) => {
-            "Drawing changes were rolled back (other side effects may remain)"
+            "Changes were rolled back. Other side effects may remain."
         }
-        Ok(DrawingOutcome::Committed) => "Drawing changes were committed before the failure",
+        Ok(DrawingOutcome::Committed) => "Changes were committed before the failure.",
         Ok(DrawingOutcome::Unknown | DrawingOutcome::Unspecified) | Err(_) => {
-            "Drawing outcome is unknown (running it again may repeat the operation)"
+            "Outcome unknown: retrying may run code twice."
         }
     }
 }
 
 fn response_start_error(status: tonic::Status) -> String {
     if status.code() == Code::Unimplemented || incompatible_message(status.message()) {
-        return "CLI and AutoCAD plugin are incompatible (AutoLISP was not run)".into();
+        return "Plugin incompatible: code was not run.".into();
     }
 
-    "AutoCAD did not report whether it started the AutoLISP (running it again may execute it twice)"
-        .into()
+    "Outcome unknown: retrying may run code twice.".into()
 }
 
 fn cancelled_exit() -> ExitCode {
@@ -426,12 +434,12 @@ fn stopped_exit(interrupts: &Interrupts) -> ExitCode {
 }
 
 fn detach_exit(interrupts: &Interrupts) -> ExitCode {
-    interrupts.diagnostic("\nDetached (AutoLISP may still be running)\n");
+    interrupts.diagnostic("\nDetached: code may still be running.\n");
     cancelled_exit()
 }
 
 fn stopping_connection_lost(interrupts: &Interrupts) -> ExitCode {
-    interrupts.finish_stopping("connection lost (AutoLISP may still be running)");
+    interrupts.finish_stopping("connection lost: code may still be running.");
     cancelled_exit()
 }
 

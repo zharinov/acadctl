@@ -19,7 +19,7 @@ pub async fn run(requested_instance: Option<InstanceId>, force: bool) -> ExitCod
     let instance_id = instance.instance_id();
 
     if !instance.request_termination(force) {
-        return fail(format!("Could not stop AutoCAD instance {instance_id}"));
+        return fail(format!("Stop failed for AutoCAD instance {instance_id}."));
     }
 
     if wait_until_stopped(instance).await {
@@ -28,12 +28,12 @@ pub async fn run(requested_instance: Option<InstanceId>, force: bool) -> ExitCod
 
     if force {
         return fail(format!(
-            "AutoCAD instance {instance_id} did not stop within 5 seconds"
+            "Timeout: AutoCAD instance {instance_id} did not stop."
         ));
     }
 
     fail(format!(
-        "AutoCAD instance {instance_id} did not stop within 5 seconds (--force stops it immediately)"
+        "Timeout: AutoCAD instance {instance_id} did not stop. Use --force."
     ))
 }
 

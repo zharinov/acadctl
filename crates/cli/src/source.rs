@@ -42,10 +42,7 @@ impl SourceSpec {
             Self::Stdin => {
                 let stdin = io::stdin();
                 let bytes = read_bounded(stdin.lock()).map_err(|error| {
-                    SourceError::Message(format!(
-                        "Could not read AutoLISP from stdin ({})",
-                        io_error_description(&error)
-                    ))
+                    SourceError::Message(format!("Input failed: {}.", io_error_description(&error)))
                 })?;
 
                 SourceInput::try_from_bytes(diagnostic_name("<stdin>"), bytes, mode)
@@ -58,29 +55,29 @@ impl SourceSpec {
             Self::File(path) => {
                 let source_name = path.to_str().ok_or_else(|| {
                     SourceError::Message(format!(
-                        "Source path '{}' is not valid UTF-8",
+                        "Invalid source path: '{}' is not UTF-8.",
                         path.to_string_lossy()
                     ))
                 })?;
 
                 let source_name = SourceName::new(source_name).map_err(|error| match error {
                     SourceNameError::Empty => {
-                        SourceError::Message("The source path is empty".into())
+                        SourceError::Message("Invalid source path: path is empty.".into())
                     }
                     SourceNameError::TooLong => {
-                        SourceError::Message("The source path exceeds the 4 KiB limit".into())
+                        SourceError::Message("Invalid source path: path exceeds 4 KiB.".into())
                     }
                 })?;
 
                 let file = std::fs::File::open(&path).map_err(|error| {
                     SourceError::Message(format!(
-                        "Could not read '{source_name}' ({})",
+                        "Input failed for '{source_name}': {}.",
                         io_error_description(&error)
                     ))
                 })?;
                 let bytes = read_bounded(file).map_err(|error| {
                     SourceError::Message(format!(
-                        "Could not read '{source_name}' ({})",
+                        "Input failed for '{source_name}': {}.",
                         io_error_description(&error)
                     ))
                 })?;
@@ -105,16 +102,16 @@ impl SourceInput {
 
         if bytes.len() > acadctl_rpc::MAX_EXECUTION_SOURCE_BYTES {
             return Err(SourceError::Message(
-                "The source exceeds the 4 MiB limit".into(),
+                "Invalid code: source exceeds 4 MiB.".into(),
             ));
         }
 
         let source = std::str::from_utf8(&bytes)
-            .map_err(|_| SourceError::Message("The source is not valid UTF-8".into()))?;
+            .map_err(|_| SourceError::Message("Invalid code: source is not UTF-8.".into()))?;
 
         if source.contains('\0') {
             return Err(SourceError::Message(
-                "The source contains U+0000, which AutoLISP cannot represent".into(),
+                "Invalid code: source contains U+0000.".into(),
             ));
         }
 
@@ -125,7 +122,7 @@ impl SourceInput {
 
         if mode == SourceMode::Eval && form_count != 1 {
             return Err(SourceError::Message(format!(
-                "eval accepts one AutoLISP expression (found {form_count} top-level forms)"
+                "Invalid code: eval requires one expression, found {form_count}."
             )));
         }
 
@@ -146,10 +143,11 @@ impl SourceError {
             Self::Message(message) => eprintln!("{message}"),
             Self::Scan { source_name, error } => {
                 eprintln!(
-                    "Could not read AutoLISP in {source_name} at line {}, column {}",
-                    error.line, error.column
+                    "Invalid code in {source_name} at line {}, column {}: {}.",
+                    error.line,
+                    error.column,
+                    error.kind.message().trim_end_matches('.')
                 );
-                eprintln!("{}", error.kind.message());
             }
         }
     }

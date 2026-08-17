@@ -55,7 +55,7 @@ fn render(instances: &[Instance], long: bool) -> Rendered {
             match drawing_line(instance.instance_id, instance_id_width, drawing, long) {
                 Ok(line) => lines.push(line),
                 Err(error) => diagnostics.push(format!(
-                    "Could not inspect a drawing in AutoCAD instance {} ({error})",
+                    "Drawing inspection failed in AutoCAD instance {}: {error}.",
                     instance.instance_id
                 )),
             }
@@ -164,15 +164,15 @@ mod tests {
     fn preserves_healthy_drawings_and_explains_each_failed_instance() {
         assert_eq!(
             render(&[failed(123, QueryError::CannotConnect)], false).diagnostics,
-            ["Plugin unavailable. Install it and restart AutoCAD."]
+            ["Plugin unavailable: install it and restart AutoCAD."]
         );
         assert_eq!(
             render(&[failed(123, QueryError::TimedOut)], false).diagnostics,
-            ["Plugin does not respond within 5 seconds."]
+            ["Timeout: plugin did not respond."]
         );
         assert_eq!(
             render(&[failed(123, QueryError::OutdatedPlugin)], false).diagnostics,
-            ["Plugin incompatible. Update it and restart AutoCAD."]
+            ["Plugin incompatible: update it and restart AutoCAD."]
         );
         assert_eq!(
             render(
@@ -193,7 +193,7 @@ mod tests {
                 false,
             )
             .diagnostics,
-            ["Plugin incompatible. Update it and restart AutoCAD."]
+            ["Plugin incompatible: update it and restart AutoCAD."]
         );
         assert_eq!(
             render(
@@ -215,10 +215,7 @@ mod tests {
             false,
         );
         assert_eq!(rendered.lines, ["007B:32F3  .  rw  a.dwg"]);
-        assert_eq!(
-            rendered.diagnostics,
-            ["Plugin does not respond within 5 seconds."]
-        );
+        assert_eq!(rendered.diagnostics, ["Timeout: plugin did not respond."]);
     }
 
     fn available(instance_id: u32, drawings: Vec<Drawing>) -> Instance {

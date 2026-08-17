@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::HistoryRequest;
 
-use super::{fail, request_error_message, target::Target};
+use super::{RequestOperation, fail, request_error_message, target::Target};
 
 #[derive(Clone, Copy)]
 pub enum Direction {
@@ -25,16 +25,16 @@ pub async fn run(target: Target, direction: Direction) -> ExitCode {
         Ok(response) => response.into_inner(),
         Err(status) => {
             let operation = match direction {
-                Direction::Undo => format!("undo the previous action in drawing {target}"),
-                Direction::Redo => format!("redo the previous action in drawing {target}"),
+                Direction::Undo => RequestOperation::Undo,
+                Direction::Redo => RequestOperation::Redo,
             };
 
-            return fail(request_error_message(&operation, Some(target), status));
+            return fail(request_error_message(operation, Some(target), status));
         }
     };
 
     if response.drawing.is_none() {
-        return fail("AutoCAD did not identify the updated drawing".into());
+        return fail("Invalid response: updated drawing is missing.".into());
     }
 
     ExitCode::SUCCESS

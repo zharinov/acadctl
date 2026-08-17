@@ -111,7 +111,7 @@ pub(super) fn launch() -> Result<Option<InstanceId>, String> {
         .ok_or_else(|| "Could not find an installed AutoCAD application".to_owned())?;
     let application = application
         .to_str()
-        .ok_or_else(|| "Could not start AutoCAD".to_owned())?;
+        .ok_or_else(|| "AutoCAD failed to start.".to_owned())?;
     let application = NSString::from_str(application);
     let application = NSURL::fileURLWithPath_isDirectory(&application, true);
     let configuration = NSWorkspaceOpenConfiguration::configuration();
@@ -145,7 +145,7 @@ pub(super) fn launch() -> Result<Option<InstanceId>, String> {
     match completion.get() {
         LaunchCompletion::Finished(Some(instance_id)) => Ok(Some(instance_id)),
         LaunchCompletion::Pending | LaunchCompletion::Finished(None) => {
-            Err("Could not start AutoCAD".to_owned())
+            Err("AutoCAD failed to start.".to_owned())
         }
     }
 }

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::{SavePath, SaveRequest};
 
-use super::{fail, request_error_message, target::Target};
+use super::{RequestOperation, fail, request_error_message, target::Target};
 
 pub async fn run(target: Target, path: Option<PathBuf>) -> ExitCode {
     let path = match path.map(SavePath::prepare).transpose() {
@@ -20,7 +20,7 @@ pub async fn run(target: Target, path: Option<PathBuf>) -> ExitCode {
         Ok(response) => response.into_inner(),
         Err(status) => {
             return fail(request_error_message(
-                &format!("save drawing {target}"),
+                RequestOperation::Save,
                 Some(target),
                 status,
             ));
@@ -28,7 +28,7 @@ pub async fn run(target: Target, path: Option<PathBuf>) -> ExitCode {
     };
 
     if saved.drawing.is_none() {
-        return fail("AutoCAD did not identify the saved drawing".into());
+        return fail("Invalid response: saved drawing is missing.".into());
     }
 
     ExitCode::SUCCESS

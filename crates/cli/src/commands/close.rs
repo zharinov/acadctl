@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use acadctl_rpc::CloseRequest;
 
-use super::{fail, request_error_message, target::Target};
+use super::{RequestOperation, fail, request_error_message, target::Target};
 
 pub async fn run(target: Target, discard: bool) -> ExitCode {
     let mut client = match super::connect_drawings(target.instance_id).await {
@@ -15,7 +15,7 @@ pub async fn run(target: Target, discard: bool) -> ExitCode {
         .await
     {
         return fail(request_error_message(
-            &format!("close drawing {target}"),
+            RequestOperation::Close,
             Some(target),
             status,
         ));

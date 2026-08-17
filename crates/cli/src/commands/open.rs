@@ -7,7 +7,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::instance::{Instance, InstanceSnapshot};
 
-use super::{fail, parse_drawing_id, query_error_message, request_error_message};
+use super::{RequestOperation, fail, parse_drawing_id, query_error_message, request_error_message};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -31,11 +31,11 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     let request = OpenRequest::from(path);
     let opened = match client.open(request).await {
         Ok(response) => response.into_inner(),
-        Err(status) => return fail(request_error_message("open the DWG file", None, status)),
+        Err(status) => return fail(request_error_message(RequestOperation::Open, None, status)),
     };
 
     let Some(drawing) = opened.drawing else {
-        return fail("AutoCAD did not identify the opened drawing".into());
+        return fail("Invalid response: opened drawing is missing.".into());
     };
 
     let drawing_id = match parse_drawing_id(drawing.id) {
@@ -80,12 +80,7 @@ async fn wait_for_launched_instance(launched: Option<InstanceId>) -> Result<Inst
         }
     })
     .await
-    .unwrap_or_else(|_| {
-        Err(format!(
-            "AutoCAD did not become ready within {} seconds",
-            STARTUP_TIMEOUT.as_secs()
-        ))
-    })
+    .unwrap_or_else(|_| Err("Timeout: AutoCAD did not start.".into()))
 }
 
 fn select_launched_instance(

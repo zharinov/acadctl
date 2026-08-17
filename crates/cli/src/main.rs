@@ -220,38 +220,38 @@ fn report_parse_error(error: clap::Error) -> ExitCode {
             let value = error_context(&error, ContextKind::InvalidValue).unwrap_or_default();
 
             if argument.contains("TARGET") {
-                eprintln!("Invalid target '{value}' (expected INSTANCE:DRAWING from acadctl ps)");
+                eprintln!("Invalid target '{value}': expected INSTANCE:DRAWING from acadctl ps.");
             } else if argument.contains("INSTANCE") {
-                eprintln!("Invalid instance '{value}' (expected 4–8 hexadecimal digits)");
+                eprintln!("Invalid instance '{value}': expected 4–8 hexadecimal digits.");
             } else {
-                eprintln!("Invalid value '{value}' for {argument}");
+                eprintln!("Invalid value '{value}' for {argument}.");
             }
 
             ExitCode::from(2)
         }
         ErrorKind::UnknownArgument => {
             let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
-            eprintln!("Unknown argument '{argument}'");
+            eprintln!("Unknown argument '{argument}'.");
             ExitCode::from(2)
         }
         ErrorKind::InvalidSubcommand => {
             let command = error_context(&error, ContextKind::InvalidSubcommand).unwrap_or_default();
-            eprintln!("Unknown command '{command}'");
+            eprintln!("Unknown command '{command}'.");
             ExitCode::from(2)
         }
         ErrorKind::MissingRequiredArgument => {
             let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
-            eprintln!("Missing required argument {argument}");
+            eprintln!("Missing required argument {argument}.");
             ExitCode::from(2)
         }
         ErrorKind::ArgumentConflict => {
             let argument = error_context(&error, ContextKind::InvalidArg).unwrap_or_default();
             let prior = error_context(&error, ContextKind::PriorArg).unwrap_or_default();
-            eprintln!("{argument} cannot be used with {prior}");
+            eprintln!("{argument} cannot be used with {prior}.");
             ExitCode::from(2)
         }
         _ => {
-            eprintln!("Invalid command arguments");
+            eprintln!("Invalid command arguments.");
             ExitCode::from(2)
         }
     }
@@ -270,7 +270,7 @@ fn print_help(command_name: Option<String>) -> ExitCode {
                 command
             }
             None => {
-                eprintln!("Unknown command '{name}'");
+                eprintln!("Unknown command '{name}'.");
                 return ExitCode::from(2);
             }
         },

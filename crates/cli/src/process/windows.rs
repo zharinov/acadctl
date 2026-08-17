@@ -240,6 +240,6 @@ pub(super) fn launch() -> Result<Option<InstanceId>, String> {
     if result as isize > 32 {
         Ok(None)
     } else {
-        Err("Could not start AutoCAD".into())
+        Err("AutoCAD failed to start.".into())
     }
 }

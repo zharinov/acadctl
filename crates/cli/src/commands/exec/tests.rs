@@ -80,12 +80,8 @@ fn formats_runtime_and_reader_failures_with_honest_locations() {
     };
 
     assert_eq!(
-        failure_lines(&runtime, "<stdin>", target()),
-        [
-            "AutoLISP failed in script.lsp at form 3, line 12",
-            "bad argument type: numberp nil",
-            "Drawing changes were rolled back (other side effects may remain)",
-        ]
+        failure_message(&runtime, "<stdin>", target()),
+        "Code failed in script.lsp at form 3, line 12: bad argument type: numberp nil. Changes were rolled back. Other side effects may remain."
     );
 
     let reader = ExecFailure {
@@ -101,12 +97,8 @@ fn formats_runtime_and_reader_failures_with_honest_locations() {
     };
 
     assert_eq!(
-        failure_lines(&reader, "<stdin>", target()),
-        [
-            "Could not read AutoLISP in script.lsp at line 12, column 17",
-            "unterminated string",
-            "AutoLISP was not run",
-        ]
+        failure_message(&reader, "<stdin>", target()),
+        "Invalid code in script.lsp at line 12, column 17: unterminated string. Code was not run."
     );
 }
 
@@ -121,8 +113,24 @@ fn keeps_location_free_failures_concise() {
     };
 
     assert_eq!(
-        failure_lines(&failure, "script.lsp", target()),
-        ["Drawing 6A84:36C8 is busy", "AutoLISP was not run"]
+        failure_message(&failure, "script.lsp", target()),
+        "Drawing 6A84:36C8 is busy. Code was not run."
+    );
+}
+
+#[test]
+fn renders_readiness_timeout_as_one_line() {
+    let failure = ExecFailure {
+        message: "AutoCAD did not become ready within 60 seconds".into(),
+        form_index: None,
+        location: None,
+        drawing_outcome: DrawingOutcome::NotStarted as i32,
+        drawing_error: acadctl_rpc::DrawingErrorKind::Unspecified as i32,
+    };
+
+    assert_eq!(
+        failure_message(&failure, "<command-line>", target()),
+        "Timeout: code was not run."
     );
 }
 
@@ -130,19 +138,19 @@ fn keeps_location_free_failures_concise() {
 fn reports_every_drawing_outcome() {
     assert_eq!(
         drawing_outcome_message(DrawingOutcome::NotStarted as i32),
-        "AutoLISP was not run"
+        "Code was not run."
     );
     assert_eq!(
         drawing_outcome_message(DrawingOutcome::RolledBack as i32),
-        "Drawing changes were rolled back (other side effects may remain)"
+        "Changes were rolled back. Other side effects may remain."
     );
     assert_eq!(
         drawing_outcome_message(DrawingOutcome::Committed as i32),
-        "Drawing changes were committed before the failure"
+        "Changes were committed before the failure."
     );
     assert_eq!(
         drawing_outcome_message(DrawingOutcome::Unknown as i32),
-        "Drawing outcome is unknown (running it again may repeat the operation)"
+        "Outcome unknown: retrying may run code twice."
     );
 }
 
@@ -184,7 +192,7 @@ async fn ctrl_c_feedback_is_one_status_line_until_detachment() {
 
     assert_eq!(
         String::from_utf8(output.lock().unwrap().clone()).unwrap(),
-        "Stopping... \nDetached (AutoLISP may still be running)\n"
+        "Stopping... \nDetached: code may still be running.\n"
     );
 
     let output = Arc::new(Mutex::new(Vec::new()));
@@ -203,27 +211,24 @@ async fn ctrl_c_feedback_is_one_status_line_until_detachment() {
 
     assert_eq!(
         String::from_utf8(output.lock().unwrap().clone()).unwrap(),
-        "Stopping... connection lost (AutoLISP may still be running)\n"
+        "Stopping... connection lost: code may still be running.\n"
     );
 }
 
 #[test]
 fn treats_transport_loss_after_request_exposure_as_an_unknown_handoff() {
     let message = response_start_error(tonic::Status::unavailable("connection reset"));
-    assert_eq!(
-        message,
-        "AutoCAD did not report whether it started the AutoLISP (running it again may execute it twice)"
-    );
+    assert_eq!(message, "Outcome unknown: retrying may run code twice.");
 
     assert_eq!(
         response_start_error(tonic::Status::unimplemented("missing service")),
-        "CLI and AutoCAD plugin are incompatible (AutoLISP was not run)"
+        "Plugin incompatible: code was not run."
     );
     assert_eq!(
         response_start_error(tonic::Status::unknown(
             "failed to decode Protobuf message: ExecRequest.drawing_id",
         )),
-        "CLI and AutoCAD plugin are incompatible (AutoLISP was not run)"
+        "Plugin incompatible: code was not run."
     );
 }
 

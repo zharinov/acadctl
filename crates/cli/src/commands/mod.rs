@@ -17,6 +17,15 @@ use target::Target;
 
 type DrawingClient = acadctl_rpc::DrawingServiceClient<Channel>;
 
+#[derive(Clone, Copy)]
+enum RequestOperation {
+    Open,
+    Save,
+    Close,
+    Undo,
+    Redo,
+}
+
 fn fail(message: String) -> ExitCode {
     eprintln!("{message}");
     ExitCode::FAILURE
@@ -24,11 +33,11 @@ fn fail(message: String) -> ExitCode {
 
 fn query_error_message(error: &QueryError) -> String {
     match error {
-        QueryError::CannotConnect => "Plugin unavailable. Install it and restart AutoCAD.".into(),
-        QueryError::TimedOut => "Plugin does not respond within 5 seconds.".into(),
-        QueryError::OutdatedPlugin => "Plugin incompatible. Update it and restart AutoCAD.".into(),
+        QueryError::CannotConnect => "Plugin unavailable: install it and restart AutoCAD.".into(),
+        QueryError::TimedOut => "Timeout: plugin did not respond.".into(),
+        QueryError::OutdatedPlugin => "Plugin incompatible: update it and restart AutoCAD.".into(),
         QueryError::RequestFailed(message) if incompatible_message(message) => {
-            "Plugin incompatible. Update it and restart AutoCAD.".into()
+            "Plugin incompatible: update it and restart AutoCAD.".into()
         }
         QueryError::RequestFailed(_) => "Unknown error.".into(),
     }
@@ -40,9 +49,13 @@ async fn connect_drawings(instance_id: acadctl_rpc::InstanceId) -> Result<Drawin
         .map_err(|error| query_error_message(&error))
 }
 
-fn request_error_message(operation: &str, target: Option<Target>, status: Status) -> String {
+fn request_error_message(
+    operation: RequestOperation,
+    target: Option<Target>,
+    status: Status,
+) -> String {
     if status.code() == Code::Unimplemented || incompatible_message(status.message()) {
-        return "CLI and AutoCAD plugin are incompatible".into();
+        return "Plugin incompatible: update it and restart AutoCAD.".into();
     }
 
     if let Some(error) = acadctl_rpc::DrawingError::from_status(&status)
@@ -50,7 +63,7 @@ fn request_error_message(operation: &str, target: Option<Target>, status: Status
         && kind != acadctl_rpc::DrawingErrorKind::Unspecified
     {
         if kind == acadctl_rpc::DrawingErrorKind::ReadinessTimedOut {
-            return readiness_timeout_message(target);
+            return operation.timeout_message(target);
         }
 
         if let Some(target) = target {
@@ -58,39 +71,60 @@ fn request_error_message(operation: &str, target: Option<Target>, status: Status
         }
     }
 
-    format!("Could not {operation}")
+    operation.failure_message(target)
 }
 
 fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) -> String {
     use acadctl_rpc::DrawingErrorKind;
 
     match kind {
-        DrawingErrorKind::NotOpen => format!("Drawing {target} is not open"),
+        DrawingErrorKind::NotOpen => format!("Drawing {target} is not open."),
         DrawingErrorKind::Replaced => {
-            format!("Drawing {target} changed before AutoCAD could perform the operation")
+            format!("Drawing {target} changed before the operation.")
         }
-        DrawingErrorKind::ReadOnly => format!("Drawing {target} is read-only"),
-        DrawingErrorKind::UnsavedChanges => format!("Drawing {target} has unsaved changes"),
+        DrawingErrorKind::ReadOnly => format!("Drawing {target} is read-only."),
+        DrawingErrorKind::UnsavedChanges => format!("Drawing {target} has unsaved changes."),
         DrawingErrorKind::NoFileName => {
-            format!("Drawing {target} has no file name; use --as FILE")
+            format!("Drawing {target} has no filename: use --as FILE.")
         }
-        DrawingErrorKind::Busy => format!("Drawing {target} is busy"),
-        DrawingErrorKind::UndoDisabled => format!("Undo is disabled for drawing {target}"),
-        DrawingErrorKind::DestinationExists => {
-            "Destination already exists; use another path or omit --as".into()
+        DrawingErrorKind::Busy => format!("Drawing {target} is busy."),
+        DrawingErrorKind::UndoDisabled => format!("Undo is disabled for drawing {target}."),
+        DrawingErrorKind::DestinationExists => "Destination exists: choose another path.".into(),
+        DrawingErrorKind::ReadinessTimedOut => {
+            unreachable!("readiness timeouts require operation context")
         }
-        DrawingErrorKind::ReadinessTimedOut => readiness_timeout_message(Some(target)),
         DrawingErrorKind::Unspecified => {
             unreachable!("unspecified drawing errors are not rendered")
         }
     }
 }
 
-fn readiness_timeout_message(target: Option<Target>) -> String {
-    target.map_or_else(
-        || "AutoCAD did not become ready within 60 seconds".into(),
-        |target| format!("AutoCAD did not become ready for drawing {target} within 60 seconds"),
-    )
+impl RequestOperation {
+    fn failure_message(self, target: Option<Target>) -> String {
+        match (self, target) {
+            (Self::Open, _) => "Drawing was not opened.".into(),
+            (Self::Save, Some(target)) => format!("Drawing {target} was not saved."),
+            (Self::Close, Some(target)) => format!("Drawing {target} was not closed."),
+            (Self::Undo, Some(target)) => format!("Undo was not run for drawing {target}."),
+            (Self::Redo, Some(target)) => format!("Redo was not run for drawing {target}."),
+            _ => "Operation failed.".into(),
+        }
+    }
+
+    fn timeout_message(self, target: Option<Target>) -> String {
+        match (self, target) {
+            (Self::Open, _) => "Timeout: drawing was not opened.".into(),
+            (Self::Save, Some(target)) => format!("Timeout: drawing {target} was not saved."),
+            (Self::Close, Some(target)) => format!("Timeout: drawing {target} was not closed."),
+            (Self::Undo, Some(target)) => {
+                format!("Timeout: undo was not run for drawing {target}.")
+            }
+            (Self::Redo, Some(target)) => {
+                format!("Timeout: redo was not run for drawing {target}.")
+            }
+            _ => "Timeout: operation failed.".into(),
+        }
+    }
 }
 
 fn parse_drawing_id(id: u32) -> Result<acadctl_rpc::DrawingId, String> {
@@ -113,23 +147,23 @@ mod tests {
         for (kind, expected) in [
             (
                 acadctl_rpc::DrawingErrorKind::NotOpen,
-                "Drawing 6A84:36C8 is not open",
+                "Drawing 6A84:36C8 is not open.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::ReadOnly,
-                "Drawing 6A84:36C8 is read-only",
+                "Drawing 6A84:36C8 is read-only.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::UnsavedChanges,
-                "Drawing 6A84:36C8 has unsaved changes",
+                "Drawing 6A84:36C8 has unsaved changes.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::Busy,
-                "Drawing 6A84:36C8 is busy",
+                "Drawing 6A84:36C8 is busy.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::ReadinessTimedOut,
-                "AutoCAD did not become ready for drawing 6A84:36C8 within 60 seconds",
+                "Timeout: drawing 6A84:36C8 was not saved.",
             ),
         ] {
             let status = acadctl_rpc::DrawingError {
@@ -139,7 +173,7 @@ mod tests {
             .status(Code::FailedPrecondition);
 
             assert_eq!(
-                request_error_message("save drawing 6A84:36C8", Some(target), status),
+                request_error_message(RequestOperation::Save, Some(target), status),
                 expected
             );
         }
@@ -154,8 +188,8 @@ mod tests {
         .status(Code::DeadlineExceeded);
 
         assert_eq!(
-            request_error_message("open drawing", None, status),
-            "AutoCAD did not become ready within 60 seconds"
+            request_error_message(RequestOperation::Open, None, status),
+            "Timeout: drawing was not opened."
         );
     }
 
@@ -163,13 +197,13 @@ mod tests {
     fn hides_transport_decoder_details() {
         assert_eq!(
             request_error_message(
-                "save drawing 6A84:36C8",
+                RequestOperation::Save,
                 None,
                 Status::unknown(
                     "failed to decode Protobuf message: Drawing.id: invalid wire type: Varint",
                 ),
             ),
-            "CLI and AutoCAD plugin are incompatible"
+            "Plugin incompatible: update it and restart AutoCAD."
         );
     }
 }
