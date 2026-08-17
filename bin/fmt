@@ -19,21 +19,25 @@ require_tools() {
 
 format_sources() {
     cargo fmt --all --manifest-path "$repo_root/Cargo.toml"
+
     clang-format -i \
         "$repo_root/crates/plugin/native/entry.cpp" \
         "$repo_root/crates/plugin/native/host.cpp" \
         "$repo_root/crates/plugin/native/host.hpp" \
         "$repo_root/crates/rpc/proto/acadctl.proto"
+
     shfmt -w -i 4 -ci "$repo_root"/bin/*
 }
 
 check_sources() {
     cargo fmt --all --manifest-path "$repo_root/Cargo.toml" -- --check
+
     clang-format --dry-run --Werror \
         "$repo_root/crates/plugin/native/entry.cpp" \
         "$repo_root/crates/plugin/native/host.cpp" \
         "$repo_root/crates/plugin/native/host.hpp" \
         "$repo_root/crates/rpc/proto/acadctl.proto"
+
     shfmt -d -i 4 -ci "$repo_root"/bin/*
 }
 

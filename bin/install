@@ -87,6 +87,7 @@ install_plugin() {
     if test -e "$plugin_destination"; then
         mv "$plugin_destination" "$plugin_previous"
     fi
+
     plugin_touched=true
     mv "$plugin_staging" "$plugin_destination"
 }
@@ -94,9 +95,11 @@ install_plugin() {
 install_cli() {
     cp "$source_cli" "$cli_staging"
     chmod 755 "$cli_staging"
+
     if test -e "$cli_destination"; then
         mv "$cli_destination" "$cli_previous"
     fi
+
     cli_touched=true
     mv -f "$cli_staging" "$cli_destination"
 }

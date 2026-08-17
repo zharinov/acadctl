@@ -109,8 +109,10 @@ build_native_plugin() {
 
 publish_artifacts() {
     cp "$rust_target/$acadctl_rust_target/$cargo_profile/acadctl" "$build_cli"
+
     codesign --force --sign - "$build_plugin"
     codesign --force --sign - "$build_cli"
+
     mkdir -p "$out_root"
     rm -rf "$bundle"
     mv "$build_bundle" "$bundle"
