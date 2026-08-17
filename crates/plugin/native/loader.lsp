@@ -1,8 +1,6 @@
 (setq actl:*loader-directory*
   (vl-filename-directory (findfile "loader.lsp")))
 
-(arxload (strcat actl:*loader-directory* "/acadctl-plugin.bundle"))
-
 (defun actl:_loader-files
   (directory / entry extension files path)
   (foreach entry (vl-directory-files directory nil 0)
@@ -23,6 +21,8 @@
    (foreach file (vl-sort files '<)
      (load file)))
  (actl:_loader-files (strcat actl:*loader-directory* "/lisp")))
+
+(arxload (strcat actl:*loader-directory* "/acadctl-plugin.bundle"))
 
 (setq actl:*loader-directory* nil)
 (princ)
