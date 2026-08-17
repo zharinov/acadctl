@@ -1,24 +1,24 @@
 (progn
-  ((lambda (/ acadctl:forms acadctl:outcome)
-     (setq acadctl:outcome
+  ((lambda (/ actl:forms actl:outcome)
+     (setq actl:outcome
        (vl-catch-all-apply
          '(lambda ()
-            (setq acadctl:forms
+            (setq actl:forms
               (read (strcat "(" {{SOURCE_SYMBOL}} "\n)")))
-            (if (= (length acadctl:forms) 1)
-              (list 'acadctl:ok (eval (car acadctl:forms)))
+            (if (= (length actl:forms) 1)
+              (list 'actl:ok (eval (car actl:forms)))
               ({{INVALID_FORM_SPAN_FUNCTION}})))
          '()))
 
      (setq {{ERRNO_SYMBOL}} (getvar "ERRNO"))
 
-     (if (vl-catch-all-error-p acadctl:outcome)
+     (if (vl-catch-all-error-p actl:outcome)
        (progn
          (setq {{STATUS_SYMBOL}} nil)
          (setq {{ERROR_SYMBOL}}
-           (vl-catch-all-error-message acadctl:outcome)))
+           (vl-catch-all-error-message actl:outcome)))
        (progn
-         (setq {{VALUE_SYMBOL}} (cadr acadctl:outcome))
+         (setq {{VALUE_SYMBOL}} (cadr actl:outcome))
          (setq {{STATUS_SYMBOL}} T)
          (setq {{ERROR_SYMBOL}} nil)))))
 

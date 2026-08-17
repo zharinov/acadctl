@@ -3,19 +3,19 @@ const EXECUTION_DRIVER_TEMPLATE: &str = include_str!("../../lisp/exec/driver.lsp
 const FORM_EVALUATOR_TEMPLATE: &str = include_str!("../../lisp/exec/evaluator.lsp");
 const VALUE_EMITTER_TEMPLATE: &str = include_str!("../../lisp/exec/emitter.lsp");
 
-pub const OUTPUT_EVENT_FUNCTION: &str = "acadctl:_output-event";
-pub const ADVANCE_EXECUTION_FUNCTION: &str = "acadctl:_advance-execution";
-pub const DRIVE_EXECUTION_FUNCTION: &str = "acadctl:_drive-execution";
-pub const EMIT_VALUE_FUNCTION: &str = "acadctl:_emit-value";
-pub const EMIT_RETAINED_VALUE_FUNCTION: &str = "acadctl:_emit-retained-value";
-pub const INVALID_FORM_SPAN_FUNCTION: &str = "acadctl:_invalid-form-span";
+pub const OUTPUT_EVENT_FUNCTION: &str = "actl:_output-event";
+pub const ADVANCE_EXECUTION_FUNCTION: &str = "actl:_advance-execution";
+pub const DRIVE_EXECUTION_FUNCTION: &str = "actl:_drive-execution";
+pub const EMIT_VALUE_FUNCTION: &str = "actl:_emit-value";
+pub const EMIT_RETAINED_VALUE_FUNCTION: &str = "actl:_emit-retained-value";
+pub const INVALID_FORM_SPAN_FUNCTION: &str = "actl:_invalid-form-span";
 
-pub const SOURCE_SYMBOL: &str = "acadctl:*bridge-source*";
-pub const STAGED_FORM_SYMBOL: &str = "acadctl:*bridge-staged-form*";
-pub const STATUS_SYMBOL: &str = "acadctl:*bridge-status*";
-pub const ERROR_SYMBOL: &str = "acadctl:*bridge-error*";
-pub const ERRNO_SYMBOL: &str = "acadctl:*bridge-errno*";
-pub const VALUE_SYMBOL: &str = "acadctl:*bridge-value*";
+pub const SOURCE_SYMBOL: &str = "actl:*bridge-source*";
+pub const STAGED_FORM_SYMBOL: &str = "actl:*bridge-staged-form*";
+pub const STATUS_SYMBOL: &str = "actl:*bridge-status*";
+pub const ERROR_SYMBOL: &str = "actl:*bridge-error*";
+pub const ERRNO_SYMBOL: &str = "actl:*bridge-errno*";
+pub const VALUE_SYMBOL: &str = "actl:*bridge-value*";
 pub const PENDING_STATUS: &str = "pending";
 
 pub const VALUE_MAX_DEPTH: usize = 4096;

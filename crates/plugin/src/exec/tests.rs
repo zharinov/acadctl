@@ -115,11 +115,11 @@ fn embedded_execution_driver_is_one_complete_definition() {
 fn embedded_driver_defines_the_public_output_contract() {
     let source = protocol::execution_driver_source();
 
-    assert!(source.contains("(defun acadctl:print (acadctl:value"));
-    assert!(source.contains("(defun acadctl:label (acadctl:text)"));
-    assert!(source.contains("(defun acadctl:_emit-value (acadctl:value"));
-    assert!(source.contains("acadctl:_output-event"));
-    assert!(source.contains("acadctl:value)"));
+    assert!(source.contains("(defun actl:print (actl:value"));
+    assert!(source.contains("(defun actl:label (actl:text)"));
+    assert!(source.contains("(defun actl:_emit-value (actl:value"));
+    assert!(source.contains("actl:_output-event"));
+    assert!(source.contains("actl:value)"));
     assert!(source.contains("nil)"));
 }
 
@@ -204,7 +204,7 @@ fn a_private_output_protocol_violation_rolls_back_its_form() {
     let (mut execution, _output) = Exec::new(
         ExecMode::Exec,
         source_name("batch.lsp"),
-        "(acadctl:print value)".into(),
+        "(actl:print value)".into(),
     )
     .unwrap();
     begin(&mut execution);

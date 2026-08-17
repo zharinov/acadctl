@@ -35,8 +35,8 @@ $ acadctl eval 6A84:36C8 '(square 7)'
 - `acadctl undo` and `acadctl redo`
 - `acadctl exec` and `acadctl eval` for running AutoLISP.
 - Basic utilities:
-  - `(acadctl:print value)`: print the value to the console
-  - `(acadctl:label "FOO")`: print the `--- FOO ---` label for debug
+  - `(actl:print value)`: print the value to the console
+  - `(actl:label "FOO")`: print the `--- FOO ---` label for debug
 
 ## Build on macOS
 
