@@ -1,0 +1,129 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+usage() {
+    echo "usage: $0" >&2
+    exit 2
+}
+
+require_supported_platform() {
+    case "$(uname -s)" in
+        Darwin)
+            ;;
+        *)
+            echo "acadctl has no plugin installer for this platform" >&2
+            exit 1
+            ;;
+    esac
+}
+
+configure_paths() {
+    source_bundle="$repo_root/out/acadctl.bundle"
+    plugin_root=${ACAD_PLUGIN_DIR:-"$HOME/Library/Application Support/Autodesk/ApplicationAddins"}
+    plugin_destination="$plugin_root/acadctl.bundle"
+    plugin_staging="$plugin_root/.acadctl.bundle.installing.$$"
+    plugin_previous="$plugin_root/.acadctl.bundle.previous.$$"
+
+    source_cli="$repo_root/out/acadctl"
+    cli_root=${ACADCTL_BIN_DIR:-"$HOME/.local/bin"}
+    cli_destination="$cli_root/acadctl"
+    cli_staging="$cli_root/.acadctl.installing.$$"
+    cli_previous="$cli_root/.acadctl.previous.$$"
+
+    plugin_touched=false
+    cli_touched=false
+    installation_committed=false
+}
+
+preflight() {
+    test -d "$source_bundle" || {
+        echo "plugin not found at $source_bundle; run 'bin/build release'" >&2
+        exit 1
+    }
+    test -x "$source_cli" || {
+        echo "CLI not found at $source_cli; run 'bin/build release'" >&2
+        exit 1
+    }
+    test -d "$plugin_root" || {
+        echo "AutoCAD plugin directory not found at $plugin_root" >&2
+        exit 1
+    }
+    test -d "$cli_root" || {
+        echo "CLI directory not found at $cli_root" >&2
+        exit 1
+    }
+}
+
+cleanup() {
+    rm -f "$cli_staging"
+
+    if test "$installation_committed" = true; then
+        rm -rf "$plugin_previous"
+        rm -f "$cli_previous"
+    else
+        if test "$plugin_touched" = true; then
+            rm -rf "$plugin_destination"
+        fi
+        if test -e "$plugin_previous"; then
+            mv "$plugin_previous" "$plugin_destination"
+        fi
+        if test "$cli_touched" = true; then
+            rm -f "$cli_destination"
+        fi
+        if test -e "$cli_previous"; then
+            mv "$cli_previous" "$cli_destination"
+        fi
+    fi
+
+    rm -rf "$plugin_staging"
+}
+
+interrupt() {
+    status=$1
+    trap - EXIT HUP INT TERM
+    cleanup
+    exit "$status"
+}
+
+install_plugin() {
+    ditto "$source_bundle" "$plugin_staging"
+    codesign --verify --strict "$plugin_staging/Contents/acadctl-plugin.bundle"
+
+    if test -e "$plugin_destination"; then
+        mv "$plugin_destination" "$plugin_previous"
+    fi
+    plugin_touched=true
+    mv "$plugin_staging" "$plugin_destination"
+}
+
+install_cli() {
+    cp "$source_cli" "$cli_staging"
+    chmod 755 "$cli_staging"
+    if test -e "$cli_destination"; then
+        mv "$cli_destination" "$cli_previous"
+    fi
+    cli_touched=true
+    mv -f "$cli_staging" "$cli_destination"
+}
+
+main() {
+    test "$#" -eq 0 || usage
+    require_supported_platform
+    configure_paths
+    preflight
+    trap cleanup EXIT
+    trap 'interrupt 129' HUP
+    trap 'interrupt 130' INT
+    trap 'interrupt 143' TERM
+
+    install_plugin
+    install_cli
+    installation_committed=true
+
+    echo "$plugin_destination"
+    echo "$cli_destination"
+}
+
+main "$@"

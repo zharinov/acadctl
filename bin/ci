@@ -1,32 +1,34 @@
 #!/bin/sh
 set -eu
 
-if test "$#" -ne 0; then
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+
+# shellcheck source=bin/config
+. "$repo_root/bin/config"
+
+usage() {
     echo "usage: $0" >&2
     exit 2
-fi
-
-repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-fail() {
-    echo "$1" >&2
-    exit 1
 }
 
-require_command() {
-    command -v "$1" >/dev/null 2>&1 ||
-        fail "$1 not found"
+require_portable_tools() {
+    for command_name in cargo clang-format git shellcheck shfmt; do
+        acadctl_require_command "$command_name"
+    done
+    cargo deny --version >/dev/null 2>&1 || acadctl_fail "cargo-deny not found"
+    cargo shear --version >/dev/null 2>&1 || acadctl_fail "cargo-shear not found"
 }
 
-for command_name in cargo git shellcheck shfmt; do
-    require_command "$command_name"
-done
-cargo deny --version >/dev/null 2>&1 ||
-    fail "cargo-deny not found"
-cargo shear --version >/dev/null 2>&1 ||
-    fail "cargo-shear not found"
+require_macos_tools() {
+    for command_name in clang-tidy codesign lipo nm plutil xmllint; do
+        acadctl_require_command "$command_name"
+    done
+}
 
-log_root=$(mktemp -d "${TMPDIR:-/tmp}/acadctl-ci.XXXXXX")
-step_number=0
+setup_logs() {
+    log_root=$(mktemp -d "${TMPDIR:-/tmp}/acadctl-ci.XXXXXX")
+    step_number=0
+}
 
 cleanup() {
     rm -rf -- "$log_root"
@@ -41,11 +43,6 @@ interrupt() {
     exit "$status"
 }
 
-trap cleanup EXIT
-trap 'interrupt 129' HUP
-trap 'interrupt 130' INT
-trap 'interrupt 143' TERM
-
 run_step() {
     label=$1
     shift
@@ -53,7 +50,6 @@ run_step() {
     log="$log_root/$step_number.log"
 
     printf '%s... ' "$label"
-
     if "$@" >"$log" 2>&1; then
         echo "ok"
     else
@@ -64,41 +60,149 @@ run_step() {
     fi
 }
 
-cd "$repo_root"
+run_portable_checks() {
+    run_step "diff (worktree)" git diff --check
+    run_step "diff (index)" git diff --cached --check
+    run_step "format (Rust)" cargo fmt --all -- --check
+    run_step "format (native)" clang-format --dry-run --Werror \
+        crates/plugin/native/entry.cpp \
+        crates/plugin/native/host.cpp \
+        crates/plugin/native/host.hpp \
+        crates/rpc/proto/acadctl.proto
+    run_step "format (shell)" shfmt -d -i 4 -ci \
+        bin/build \
+        bin/ci \
+        bin/install \
+        bin/fmt \
+        bin/config
+    run_step "shell" shellcheck bin/build bin/ci bin/install bin/fmt bin/config
+    run_step "clippy (host)" cargo clippy --quiet \
+        --workspace \
+        --all-targets \
+        --all-features \
+        --locked \
+        -- \
+        -D warnings
+    run_step "test" cargo test --quiet --workspace --all-targets --all-features --locked
+    run_step "documentation" env RUSTDOCFLAGS='-D warnings' cargo doc --quiet \
+        --workspace \
+        --all-features \
+        --no-deps \
+        --locked
+    run_step "unused dependencies" cargo shear --locked --deny-warnings
+    run_step "dependency policy" cargo deny --log-level error check
+}
 
-run_step "diff (worktree)" git diff --check
-run_step "diff (index)" git diff --cached --check
-run_step "format" bin/fmt --check
-run_step "shell" shellcheck \
-    bin/build \
-    bin/build-macos \
-    bin/ci \
-    bin/ci-macos \
-    bin/config-macos \
-    bin/fmt \
-    bin/install-plugin \
-    bin/install-plugin-macos
-run_step "clippy (host)" cargo clippy --quiet \
-    --workspace \
-    --all-targets \
-    --all-features \
-    --locked \
-    -- \
-    -D warnings
-run_step "test" cargo test --quiet --workspace --all-targets --all-features --locked
-run_step "documentation" env RUSTDOCFLAGS='-D warnings' cargo doc --quiet \
-    --workspace \
-    --all-features \
-    --no-deps \
-    --locked
-run_step "unused dependencies" cargo shear --locked --deny-warnings
-run_step "dependency policy" cargo deny --log-level error check
+configure_macos_paths() {
+    rust_target="$repo_root/target/rust-objectarx"
+    bundle="$repo_root/out/acadctl.bundle"
+    plugin="$bundle/Contents/acadctl-plugin.bundle"
+    executable="$plugin/Contents/MacOS/acadctl-plugin"
+    cli="$repo_root/out/acadctl"
+}
 
-case "$(uname -s)" in
-    Darwin)
-        run_step "build and post-checks (macOS)" bin/ci-macos
-        ;;
-    *)
-        fail "acadctl has no CI build for this platform"
-        ;;
-esac
+check_macos_inputs() {
+    test -f "$acadctl_sdk_root/inc/rxregsvc.h" ||
+        acadctl_fail "ObjectARX SDK not found at $acadctl_sdk_root"
+    test -d "$acadctl_autocad_root/Contents/Frameworks" ||
+        acadctl_fail "AutoCAD not found at $acadctl_autocad_root"
+}
+
+check_artifacts_exist() {
+    test -d "$bundle" && test -f "$executable" && test -x "$cli" ||
+        acadctl_fail "build artifacts not found; run 'bin/build release' before 'bin/ci'"
+}
+
+check_artifacts_current() {
+    if find \
+        "$repo_root/Cargo.toml" \
+        "$repo_root/Cargo.lock" \
+        "$repo_root/crates" \
+        "$repo_root/bin/build" \
+        "$repo_root/bin/config" \
+        -type f -newer "$cli" -print -quit | grep -q .; then
+        acadctl_fail "build artifacts are stale; run 'bin/build release' before 'bin/ci'"
+    fi
+}
+
+check_entry_point() {
+    nm -gU "$executable" | grep -q ' _acrxEntryPoint$'
+}
+
+run_native_analysis() {
+    clang-tidy --quiet \
+        crates/plugin/native/entry.cpp \
+        crates/plugin/native/host.cpp \
+        -- \
+        -std=c++17 \
+        -arch "$acadctl_arch" \
+        -mmacosx-version-min="$acadctl_deployment_target" \
+        -Wall \
+        -Wextra \
+        -Wpedantic \
+        -Wconversion \
+        -Wsign-conversion \
+        -Wshadow-all \
+        -Wnon-virtual-dtor \
+        -Wold-style-cast \
+        -Wcast-align \
+        -Woverloaded-virtual \
+        -Wnull-dereference \
+        -Wdouble-promotion \
+        -Wformat=2 \
+        -Wimplicit-fallthrough \
+        -Wextra-semi \
+        -Wundef \
+        -Wmissing-declarations \
+        -Wunreachable-code \
+        -Wcomma \
+        -Wconditional-uninitialized \
+        -Werror \
+        -isystem "$acadctl_sdk_root/inc" \
+        -isystem "$rust_target/cxxbridge"
+}
+
+run_macos_checks() {
+    require_macos_tools
+    acadctl_configure "$repo_root"
+    configure_macos_paths
+    check_macos_inputs
+    check_artifacts_exist
+    check_artifacts_current
+
+    run_step "AutoCAD architecture" lipo \
+        "$acadctl_autocad_root/Contents/Frameworks/libacdb.dylib" \
+        -verify_arch "$acadctl_arch"
+    run_step "plugin plist" plutil -lint "$plugin/Contents/Info.plist"
+    run_step "package XML" xmllint --noout "$bundle/PackageContents.xml"
+    run_step "plugin architecture" lipo "$executable" -verify_arch "$acadctl_arch"
+    run_step "plugin entry point" check_entry_point
+    run_step "plugin signature" codesign --verify --strict "$plugin"
+    run_step "CLI signature" codesign --verify --strict "$cli"
+    run_step "CLI executable" test -x "$cli"
+    run_step "native analysis (macOS)" run_native_analysis
+}
+
+main() {
+    test "$#" -eq 0 || usage
+    require_portable_tools
+    setup_logs
+    trap cleanup EXIT
+    trap 'interrupt 129' HUP
+    trap 'interrupt 130' INT
+    trap 'interrupt 143' TERM
+
+    cd "$repo_root"
+    run_portable_checks
+
+    case "$(uname -s)" in
+        Darwin)
+            run_macos_checks
+            ;;
+        *)
+            acadctl_fail "acadctl has no CI build for this platform"
+            ;;
+    esac
+}
+
+main "$@"

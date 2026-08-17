@@ -1,9 +1,28 @@
 #!/bin/sh
 
+acadctl_fail() {
+    echo "$1" >&2
+    exit 1
+}
+
+acadctl_require_command() {
+    command -v "$1" >/dev/null 2>&1 || acadctl_fail "$1 not found"
+}
+
+acadctl_configure() {
+    case "$(uname -s)" in
+        Darwin)
+            acadctl_configure_mac
+            ;;
+        *)
+            acadctl_fail "acadctl has no build for this platform"
+            ;;
+    esac
+}
+
 # Variables assigned here are consumed by scripts that source this file.
 # shellcheck disable=SC2034
 acadctl_configure_mac() {
-    acadctl_repo_root=$1
 
     acadctl_autocad_root=${ACAD_DIR:-"/Applications/Autodesk/AutoCAD 2027/AutoCAD 2027.app"}
     acadctl_autocad_identifier=$(plutil -extract CFBundleIdentifier raw \
@@ -12,8 +31,7 @@ acadctl_configure_mac() {
 
     case "$acadctl_autocad_version" in
         '' | *[!0-9]*)
-            echo "could not determine the AutoCAD release year from $acadctl_autocad_root" >&2
-            return 1
+            acadctl_fail "could not determine the AutoCAD release year from $acadctl_autocad_root"
             ;;
     esac
 
@@ -29,8 +47,7 @@ acadctl_configure_mac() {
             acadctl_rust_target=x86_64-apple-darwin
             ;;
         *)
-            echo "unsupported macOS architecture '$acadctl_arch' (expected arm64 or x86_64)" >&2
-            return 1
+            acadctl_fail "unsupported macOS architecture '$acadctl_arch' (expected arm64 or x86_64)"
             ;;
     esac
 }
@@ -44,7 +61,7 @@ acadctl_workspace_version() {
             print $3
             exit
         }
-    ' "$acadctl_repo_root/Cargo.toml"
+    ' "$1/Cargo.toml"
 }
 
 acadctl_autocad_series() {
@@ -54,16 +71,14 @@ acadctl_autocad_series() {
 
     case "$acadctl_autocad_major" in
         '' | *[!0-9]*)
-            echo "could not derive the AutoCAD series from CFBundleVersion '$acadctl_autocad_bundle_version'" >&2
-            return 1
+            acadctl_fail "could not derive the AutoCAD series from CFBundleVersion '$acadctl_autocad_bundle_version'"
             ;;
     esac
 
     acadctl_series=R$acadctl_autocad_major.0
 
     if ! printf '%s\n' "$acadctl_series" | grep -Eq '^R[0-9]+(\.[0-9]+)?$'; then
-        echo "invalid AutoCAD series '$acadctl_series'" >&2
-        return 1
+        acadctl_fail "invalid AutoCAD series '$acadctl_series'"
     fi
 
     printf '%s\n' "$acadctl_series"

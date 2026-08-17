@@ -50,16 +50,16 @@ Make `cargo` available on `PATH`.
 
 ```sh
 bin/build release
-bin/install-plugin
+bin/install
 ```
 
-Build artifacts are written to `out/`.
+`bin/build` writes artifacts to `out/`, and `bin/install` installs the plugin and CLI.
 
 The defaults are AutoCAD 2027 and ObjectARX 2027. Override their paths if needed:
 
 ```sh
 ACAD_DIR=/path/to/AutoCAD.app ACAD_SDK_DIR=/path/to/ObjectARX bin/build release
-ACAD_PLUGIN_DIR=/path/to/plugins bin/install-plugin
+ACAD_PLUGIN_DIR=/path/to/plugins ACADCTL_BIN_DIR=/path/to/bin bin/install
 ```
 
 ## License
