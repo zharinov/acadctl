@@ -2,11 +2,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use acadctl_rpc::{
-    DrawingError, DrawingErrorKind, DrawingPath, InstanceId, OpenRequest, OpenResponse,
-};
-use tokio::time::{Instant, sleep, timeout};
-use tonic::Status;
+use acadctl_rpc::{DrawingPath, InstanceId, OpenRequest};
+use tokio::time::{sleep, timeout};
 
 use crate::instance::{Instance, InstanceSnapshot};
 
@@ -14,7 +11,6 @@ use super::{fail, parse_drawing_id, query_error_message, request_error_message};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const STARTUP_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     let path = match DrawingPath::canonicalize(&path) {
@@ -22,7 +18,7 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
         Err(error) => return fail(error.to_string()),
     };
 
-    let (instance_id, launched_by_open) = match resolve_instance(instance_id).await {
+    let instance_id = match resolve_instance(instance_id).await {
         Ok(instance) => instance,
         Err(error) => return fail(error),
     };
@@ -33,8 +29,8 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     };
 
     let request = OpenRequest::from(path);
-    let opened = match open_when_ready(&mut client, request, launched_by_open).await {
-        Ok(response) => response,
+    let opened = match client.open(request).await {
+        Ok(response) => response.into_inner(),
         Err(status) => return fail(request_error_message("open the DWG file", None, status)),
     };
 
@@ -51,9 +47,9 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn resolve_instance(instance_id: Option<InstanceId>) -> Result<(InstanceId, bool), String> {
+async fn resolve_instance(instance_id: Option<InstanceId>) -> Result<InstanceId, String> {
     if let Some(instance_id) = instance_id {
-        return Ok((instance_id, false));
+        return Ok(instance_id);
     }
 
     let snapshot = InstanceSnapshot::discover();
@@ -65,39 +61,11 @@ async fn resolve_instance(instance_id: Option<InstanceId>) -> Result<(InstanceId
     if running.is_empty() {
         let launched = InstanceSnapshot::launch()?;
 
-        return wait_for_launched_instance(launched)
-            .await
-            .map(|instance_id| (instance_id, true));
+        return wait_for_launched_instance(launched).await;
     }
 
     let instances = snapshot.query_instances().await;
-    select_instance(&instances, &running).map(|instance_id| (instance_id, false))
-}
-
-async fn open_when_ready(
-    client: &mut super::DrawingClient,
-    request: OpenRequest,
-    launched_by_open: bool,
-) -> Result<OpenResponse, Status> {
-    let retry_until = launched_by_open.then(|| Instant::now() + STARTUP_OPEN_TIMEOUT);
-
-    loop {
-        match client.open(request.clone()).await {
-            Ok(response) => return Ok(response.into_inner()),
-            Err(status)
-                if retry_until.is_some_and(|deadline| Instant::now() < deadline)
-                    && startup_open_retryable(&status) =>
-            {
-                sleep(STARTUP_POLL_INTERVAL).await;
-            }
-            Err(status) => return Err(status),
-        }
-    }
-}
-
-fn startup_open_retryable(status: &Status) -> bool {
-    DrawingError::from_status(status).and_then(|error| DrawingErrorKind::try_from(error.kind).ok())
-        == Some(DrawingErrorKind::Busy)
+    select_instance(&instances, &running)
 }
 
 async fn wait_for_launched_instance(launched: Option<InstanceId>) -> Result<InstanceId, String> {
@@ -259,26 +227,5 @@ mod tests {
             select_launched_instance(&instances, Some(launched)),
             Ok(Some(launched))
         );
-    }
-
-    #[test]
-    fn retries_open_only_after_an_explicit_busy_rejection() {
-        let busy = DrawingError {
-            kind: DrawingErrorKind::Busy as i32,
-            drawing_id: None,
-        }
-        .status(tonic::Code::FailedPrecondition);
-
-        assert!(startup_open_retryable(&busy));
-
-        for status in [
-            Status::unknown("connection closed"),
-            Status::deadline_exceeded("request timed out"),
-            Status::failed_precondition("not ready"),
-            Status::internal("server stopped"),
-            Status::unavailable("connection lost"),
-        ] {
-            assert!(!startup_open_retryable(&status));
-        }
     }
 }

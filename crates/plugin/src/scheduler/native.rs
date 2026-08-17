@@ -278,7 +278,6 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
             .map(Error::DestinationExists)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::OpenFailed => Err(Error::OpenFailed(failure)),
-        NativeActionResultKind::LockFailed => Err(Error::LockFailed(failure)),
         NativeActionResultKind::SaveFailed => Err(Error::SaveFailed(failure)),
         NativeActionResultKind::CloseFailed => Err(Error::CloseFailed(failure)),
         NativeActionResultKind::HistoryFailed => {
@@ -346,7 +345,7 @@ pub(super) fn schedule_native_actions() {
     let status = wake_native_actions();
 
     if status != 0 {
-        super::queue::wake_failed(status);
+        super::queue::wake_failed();
     }
 }
 

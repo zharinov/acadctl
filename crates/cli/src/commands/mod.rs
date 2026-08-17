@@ -45,12 +45,17 @@ fn request_error_message(operation: &str, target: Option<Target>, status: Status
         return "CLI and AutoCAD plugin are incompatible".into();
     }
 
-    if let Some(target) = target
-        && let Some(error) = acadctl_rpc::DrawingError::from_status(&status)
+    if let Some(error) = acadctl_rpc::DrawingError::from_status(&status)
         && let Ok(kind) = acadctl_rpc::DrawingErrorKind::try_from(error.kind)
         && kind != acadctl_rpc::DrawingErrorKind::Unspecified
     {
-        return drawing_error_message(kind, target);
+        if kind == acadctl_rpc::DrawingErrorKind::ReadinessTimedOut {
+            return readiness_timeout_message(target);
+        }
+
+        if let Some(target) = target {
+            return drawing_error_message(kind, target);
+        }
     }
 
     format!("Could not {operation}")
@@ -74,10 +79,18 @@ fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) ->
         DrawingErrorKind::DestinationExists => {
             "Destination already exists; use another path or omit --as".into()
         }
+        DrawingErrorKind::ReadinessTimedOut => readiness_timeout_message(Some(target)),
         DrawingErrorKind::Unspecified => {
             unreachable!("unspecified drawing errors are not rendered")
         }
     }
+}
+
+fn readiness_timeout_message(target: Option<Target>) -> String {
+    target.map_or_else(
+        || "AutoCAD did not become ready within 60 seconds".into(),
+        |target| format!("AutoCAD did not become ready for drawing {target} within 60 seconds"),
+    )
 }
 
 fn parse_drawing_id(id: u32) -> Result<acadctl_rpc::DrawingId, String> {
@@ -114,6 +127,10 @@ mod tests {
                 acadctl_rpc::DrawingErrorKind::Busy,
                 "Drawing 6A84:36C8 is busy",
             ),
+            (
+                acadctl_rpc::DrawingErrorKind::ReadinessTimedOut,
+                "AutoCAD did not become ready for drawing 6A84:36C8 within 60 seconds",
+            ),
         ] {
             let status = acadctl_rpc::DrawingError {
                 kind: kind as i32,
@@ -126,6 +143,20 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn translates_targetless_open_readiness_timeout() {
+        let status = acadctl_rpc::DrawingError {
+            kind: acadctl_rpc::DrawingErrorKind::ReadinessTimedOut as i32,
+            drawing_id: None,
+        }
+        .status(Code::DeadlineExceeded);
+
+        assert_eq!(
+            request_error_message("open drawing", None, status),
+            "AutoCAD did not become ready within 60 seconds"
+        );
     }
 
     #[test]

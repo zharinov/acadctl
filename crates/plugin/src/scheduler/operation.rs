@@ -189,13 +189,17 @@ impl Operation {
         self.execution().map(Exec::source_bytes)
     }
 
-    pub(super) fn execution_start_pending(&self) -> bool {
-        self.execution().is_some_and(Exec::start_deadline_pending)
+    pub(super) fn is_execution(&self) -> bool {
+        self.execution().is_some()
     }
 
-    pub(super) fn execution_has_not_handed_off_form(&self) -> bool {
+    pub(super) fn can_wait_for_readiness(&self) -> bool {
         self.execution()
-            .is_some_and(|execution| !execution.has_handed_off_form())
+            .is_none_or(|execution| !execution.has_handed_off_form())
+    }
+
+    pub(super) fn execution_readiness_wait_pending(&self) -> bool {
+        self.execution().is_some_and(Exec::readiness_wait_pending)
     }
 
     pub(super) fn execution_has_outcome(&self) -> bool {

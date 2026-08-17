@@ -19,7 +19,9 @@ use super::native::{
     schedule_native_actions,
 };
 use super::operation::{HistoryDirection, Operation, OperationOutcome, Prepared};
-use super::timer::{BUSY_RETRY_INITIAL, BUSY_RETRY_MAX, EXECUTION_START_TIMEOUT, notify_changed};
+use super::timer::{
+    READINESS_RETRY_INITIAL, READINESS_RETRY_MAX, READINESS_TIMEOUT, notify_changed,
+};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -48,12 +50,24 @@ struct MutationJob {
     job_id: MutationJobId,
     operation: Operation,
     native_target: Option<NativeDocumentKey>,
-    start_deadline: Option<Instant>,
-    waiting_for_readiness: bool,
-    retry_at: Option<Instant>,
-    retry_delay: Duration,
+    wait: WaitState,
     _execution_reservation: Option<ExecReservation>,
     completion: oneshot::Sender<Result<OperationOutcome, Error>>,
+}
+
+enum WaitState {
+    Queued {
+        deadline: Instant,
+    },
+    Ready {
+        deadline: Instant,
+        retry_delay: Duration,
+    },
+    Deferred {
+        deadline: Instant,
+        retry_at: Instant,
+        retry_delay: Duration,
+    },
 }
 
 #[derive(Clone)]
@@ -175,10 +189,7 @@ impl MutationScheduler {
             || self.quarantined
             || self.active.is_some()
             || self.pending.is_empty()
-            || self
-                .pending
-                .front()
-                .is_some_and(|job| job.waiting_for_readiness)
+            || self.pending.front().is_some_and(MutationJob::is_deferred)
             || self.wake_pending
         {
             return false;
@@ -197,7 +208,7 @@ impl MutationScheduler {
             return NativeExecStep::invalid();
         };
 
-        job.expire_if_due(now);
+        job.expire_active_execution_if_due(now);
         job.operation.take_execution_step()
     }
 
@@ -248,69 +259,50 @@ impl MutationScheduler {
     }
 
     pub(super) fn next_timer_deadline(&self) -> Option<Instant> {
-        let execution_start = self
-            .pending
+        let active_execution = self
+            .active
             .iter()
-            .chain(self.active.iter())
-            .filter(|job| job.execution_start_pending())
-            .filter_map(|job| job.start_deadline)
-            .min();
+            .filter(|job| job.operation.execution_readiness_wait_pending())
+            .map(MutationJob::wait_deadline);
+        let pending = self.pending.iter().map(MutationJob::wait_deadline);
 
-        let retry = self
-            .pending
-            .front()
-            .filter(|job| job.waiting_for_readiness)
-            .and_then(|job| job.retry_at);
-        execution_start.into_iter().chain(retry).min()
+        let retry = self.pending.front().and_then(MutationJob::retry_at);
+        active_execution.chain(pending).chain(retry).min()
     }
 
     pub(super) fn process_due_timers(&mut self, now: Instant) -> (Vec<Completion>, bool) {
         if let Some(active) = self.active.as_mut() {
-            active.expire_if_due(now);
+            active.expire_active_execution_if_due(now);
         }
 
         let mut expired = Vec::new();
         let mut index = 0;
 
         while index < self.pending.len() {
-            if !self.pending[index].deadline_is_due(now) {
+            if !self.pending[index].wait_is_due(now) {
                 index += 1;
                 continue;
             }
 
             let mut job = self.pending.remove(index).expect("queued job exists");
 
-            if job.expire_if_due(now) {
-                let output = job.operation.output_sink();
-                let outcome = job.operation.complete(&self.drawings, None);
-
-                expired.push((job.completion, outcome, output));
-            } else {
-                self.pending.insert(index, job);
-                index += 1;
-            }
+            let output = job.operation.output_sink();
+            let outcome = job.wait_timeout_outcome(&self.drawings, None);
+            expired.push((job.completion, outcome, output));
         }
 
         if let Some(head) = self.pending.front_mut()
-            && head.waiting_for_readiness
-            && head.retry_at.is_some_and(|retry_at| now >= retry_at)
+            && head.retry_is_due(now)
         {
-            head.waiting_for_readiness = false;
-            head.retry_at = None;
+            head.retry_now();
         }
 
         (expired, self.request_wake())
     }
 
     pub(super) fn native_state_may_be_ready(&mut self) -> bool {
-        if let Some(job) = self
-            .pending
-            .front_mut()
-            .filter(|job| job.waiting_for_readiness)
-        {
-            job.waiting_for_readiness = false;
-            job.retry_at = None;
-            job.retry_delay = BUSY_RETRY_INITIAL;
+        if let Some(job) = self.pending.front_mut().filter(|job| job.is_deferred()) {
+            job.readiness_may_have_changed();
         }
 
         self.request_wake()
@@ -388,10 +380,7 @@ impl MutationScheduler {
                 execution: Box::new(execution),
             },
             native_target: None,
-            start_deadline: Some(now + EXECUTION_START_TIMEOUT),
-            waiting_for_readiness: false,
-            retry_at: None,
-            retry_delay: BUSY_RETRY_INITIAL,
+            wait: WaitState::queued(now),
             _execution_reservation: Some(reservation),
             completion,
         });
@@ -399,7 +388,11 @@ impl MutationScheduler {
         Ok((job_id, receiver, self.request_wake(), None))
     }
 
-    fn submit_operation(&mut self, operation: Operation) -> Result<SubmissionDecision, Error> {
+    fn submit_operation(
+        &mut self,
+        operation: Operation,
+        now: Instant,
+    ) -> Result<SubmissionDecision, Error> {
         if self.stopping {
             return Err(Error::PluginStopping);
         }
@@ -425,10 +418,7 @@ impl MutationScheduler {
             job_id,
             operation,
             native_target: None,
-            start_deadline: None,
-            waiting_for_readiness: false,
-            retry_at: None,
-            retry_delay: BUSY_RETRY_INITIAL,
+            wait: WaitState::queued(now),
             _execution_reservation: None,
             completion,
         });
@@ -450,13 +440,19 @@ impl MutationScheduler {
             return TakeDecision::Idle;
         };
 
-        if job.waiting_for_readiness {
+        if job.is_deferred() {
             self.pending.push_front(job);
 
             return TakeDecision::Idle;
         }
 
-        job.expire_if_due(now);
+        if job.wait_is_due(now) {
+            let output = job.operation.output_sink();
+            let outcome = job.wait_timeout_outcome(&self.drawings, None);
+            return TakeDecision::Complete((job.completion, outcome, output));
+        }
+
+        job.begin_readiness(now);
 
         match job.operation.prepare(&self.drawings) {
             Prepared::Immediate(outcome) => {
@@ -487,14 +483,13 @@ impl MutationScheduler {
             return (None, Vec::new(), false);
         }
 
-        let settled_before_start = if result.kind == NativeActionResultKind::NotQuiescent
-            && job.execution_has_not_handed_off_form()
+        let waited_outcome = if result.kind == NativeActionResultKind::NotQuiescent
+            && job.operation.can_wait_for_readiness()
         {
-            if job.finish_cancel_before_start()
-                || job.expire_if_due(now)
-                || job.execution_has_outcome()
-            {
-                true
+            if job.finish_cancel_before_start() || job.execution_has_outcome() {
+                Some(job.operation.complete(&self.drawings, job.native_target))
+            } else if job.wait_is_due(now) {
+                Some(job.wait_timeout_outcome(&self.drawings, job.native_target))
             } else {
                 job.native_target = None;
                 job.defer_for_readiness(now);
@@ -502,17 +497,15 @@ impl MutationScheduler {
                 return (None, Vec::new(), true);
             }
         } else {
-            false
+            None
         };
 
         let output = job.operation.output_sink();
         let native_target = job.native_target;
-        let outcome = if settled_before_start {
-            job.operation.complete(&self.drawings, native_target)
-        } else {
+        let outcome = waited_outcome.unwrap_or_else(|| {
             job.operation
                 .complete_native(result, &self.drawings, native_target)
-        };
+        });
 
         let rejected = if quarantine {
             self.quarantined = true;
@@ -556,12 +549,29 @@ impl MutationScheduler {
         }
     }
 
-    fn wake_failed(&mut self) -> Vec<StoppedJob> {
+    fn wake_failed(&mut self, now: Instant) -> (Option<Completion>, bool) {
         self.wake_pending = false;
-        std::mem::take(&mut self.pending)
-            .into_iter()
-            .map(|job| (job.completion, job.operation.output_sink()))
-            .collect()
+
+        if self.stopping || self.quarantined || self.active.is_some() {
+            return (None, false);
+        }
+
+        let Some(mut job) = self.pending.pop_front() else {
+            return (None, false);
+        };
+
+        if job.wait_is_due(now) {
+            let output = job.operation.output_sink();
+            let outcome = job.wait_timeout_outcome(&self.drawings, None);
+            let should_wake = self.request_wake();
+
+            return (Some((job.completion, outcome, output)), should_wake);
+        }
+
+        job.begin_readiness(now);
+        job.defer_for_readiness(now);
+        self.pending.push_front(job);
+        (None, false)
     }
 }
 
@@ -698,7 +708,7 @@ async fn submit_operation(operation: Operation) -> Result<OperationOutcome, Erro
     let decision = SCHEDULER
         .lock()
         .map_err(|_| Error::SchedulerStateUnavailable)?
-        .submit_operation(operation)?;
+        .submit_operation(operation, Instant::now())?;
 
     match decision {
         SubmissionDecision::Immediate(outcome) => outcome,
@@ -815,22 +825,24 @@ pub fn try_claim_native_action_wake() -> bool {
         .is_ok_and(|mut scheduler| scheduler.request_wake())
 }
 
-pub fn wake_failed(status: i32) {
-    let Some(completions) = SCHEDULER
+pub fn wake_failed() {
+    let Some((completion, should_wake)) = SCHEDULER
         .lock()
         .ok()
-        .map(|mut scheduler| scheduler.wake_failed())
+        .map(|mut scheduler| scheduler.wake_failed(Instant::now()))
     else {
         return;
     };
 
-    for (completion, output) in completions {
-        if let Some(output) = output {
-            output.stop();
-        }
-
-        let _ = completion.send(Err(Error::ScheduleFailed(status)));
+    if let Some(completion) = completion {
+        finish_completion(completion);
     }
+
+    if should_wake {
+        schedule_native_actions();
+    }
+
+    notify_changed();
 }
 
 fn finish_completion((completion, outcome, output): Completion) {
@@ -842,28 +854,64 @@ fn finish_completion((completion, outcome, output): Completion) {
 }
 
 impl MutationJob {
-    pub(super) fn deadline_is_due(&self, now: Instant) -> bool {
-        self.start_deadline.is_some_and(|deadline| now >= deadline)
-            && self.execution_start_pending()
+    fn wait_deadline(&self) -> Instant {
+        self.wait.deadline()
     }
 
-    pub(super) fn expire_if_due(&mut self, now: Instant) -> bool {
-        if !self.deadline_is_due(now) {
+    fn wait_is_due(&self, now: Instant) -> bool {
+        now >= self.wait_deadline()
+    }
+
+    fn expire_active_execution_if_due(&mut self, now: Instant) -> bool {
+        if !self.wait_is_due(now) || !self.operation.execution_readiness_wait_pending() {
             return false;
         }
 
         self.operation.expire_before_start(format!(
-            "execution did not start within {} seconds",
-            EXECUTION_START_TIMEOUT.as_secs()
+            "AutoCAD did not become ready within {} seconds",
+            READINESS_TIMEOUT.as_secs()
         ))
     }
 
-    fn execution_has_not_handed_off_form(&self) -> bool {
-        self.operation.execution_has_not_handed_off_form()
+    fn wait_timeout_outcome(
+        &mut self,
+        drawings: &DrawingRegistry,
+        native_target: Option<NativeDocumentKey>,
+    ) -> Result<OperationOutcome, Error> {
+        if self.operation.is_execution() {
+            let _ = self.operation.expire_before_start(format!(
+                "AutoCAD did not become ready within {} seconds",
+                READINESS_TIMEOUT.as_secs()
+            ));
+
+            self.operation.complete(drawings, native_target)
+        } else {
+            Err(Error::ReadinessTimedOut(self.operation.drawing_id()))
+        }
     }
 
-    pub(super) fn execution_start_pending(&self) -> bool {
-        self.operation.execution_start_pending()
+    fn begin_readiness(&mut self, now: Instant) {
+        self.wait.begin_readiness(now);
+    }
+
+    fn is_deferred(&self) -> bool {
+        matches!(self.wait, WaitState::Deferred { .. })
+    }
+
+    fn retry_at(&self) -> Option<Instant> {
+        self.wait.retry_at()
+    }
+
+    fn retry_is_due(&self, now: Instant) -> bool {
+        self.retry_at().is_some_and(|retry_at| now >= retry_at)
+    }
+
+    fn retry_now(&mut self) {
+        self.wait.retry_now();
+    }
+
+    fn readiness_may_have_changed(&mut self) {
+        self.wait.readiness_may_have_changed();
     }
 
     fn execution_has_outcome(&self) -> bool {
@@ -875,9 +923,80 @@ impl MutationJob {
     }
 
     fn defer_for_readiness(&mut self, now: Instant) {
-        self.waiting_for_readiness = true;
-        self.retry_at = Some(now + self.retry_delay);
-        self.retry_delay = self.retry_delay.saturating_mul(2).min(BUSY_RETRY_MAX);
+        self.wait.defer(now);
+    }
+}
+
+impl WaitState {
+    fn queued(now: Instant) -> Self {
+        Self::Queued {
+            deadline: now + READINESS_TIMEOUT,
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Queued { deadline }
+            | Self::Ready { deadline, .. }
+            | Self::Deferred { deadline, .. } => *deadline,
+        }
+    }
+
+    fn begin_readiness(&mut self, now: Instant) {
+        if matches!(self, Self::Queued { .. }) {
+            *self = Self::Ready {
+                deadline: now + READINESS_TIMEOUT,
+                retry_delay: READINESS_RETRY_INITIAL,
+            };
+        }
+    }
+
+    fn retry_at(&self) -> Option<Instant> {
+        match self {
+            Self::Deferred { retry_at, .. } => Some(*retry_at),
+            Self::Queued { .. } | Self::Ready { .. } => None,
+        }
+    }
+
+    fn retry_now(&mut self) {
+        let Self::Deferred {
+            deadline,
+            retry_delay,
+            ..
+        } = *self
+        else {
+            return;
+        };
+        *self = Self::Ready {
+            deadline,
+            retry_delay,
+        };
+    }
+
+    fn readiness_may_have_changed(&mut self) {
+        let Self::Deferred { deadline, .. } = *self else {
+            return;
+        };
+        *self = Self::Ready {
+            deadline,
+            retry_delay: READINESS_RETRY_INITIAL,
+        };
+    }
+
+    fn defer(&mut self, now: Instant) {
+        let Self::Ready {
+            deadline,
+            retry_delay,
+        } = *self
+        else {
+            return;
+        };
+        let retry_at = (now + retry_delay).min(deadline);
+        *self = Self::Deferred {
+            deadline,
+            retry_at,
+            retry_delay: retry_delay.saturating_mul(2).min(READINESS_RETRY_MAX),
+        };
     }
 }
 

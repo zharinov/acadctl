@@ -2,7 +2,7 @@ use super::super::bridge::{
     begin_eval_output, begin_form_output, complete_execution_step, take_execution_step,
 };
 use super::super::native::{classify_execution_finalization, interpret};
-use super::super::timer::{BUSY_RETRY_MAX, EXECUTION_START_TIMEOUT, process_due_timers};
+use super::super::timer::{READINESS_RETRY_MAX, READINESS_TIMEOUT, process_due_timers};
 use super::*;
 use crate::exec::value::event::OutputEvent;
 use crate::exec::value::port::{ValueEvent, WriteResult};
@@ -13,6 +13,20 @@ use crate::ffi::{
 
 fn source_name(value: &str) -> acadctl_rpc::SourceName {
     acadctl_rpc::SourceName::new(value).unwrap()
+}
+
+fn force_wait_due(job: &mut MutationJob) {
+    let deadline = Instant::now() - Duration::from_millis(1);
+
+    match &mut job.wait {
+        WaitState::Queued { deadline: current }
+        | WaitState::Ready {
+            deadline: current, ..
+        }
+        | WaitState::Deferred {
+            deadline: current, ..
+        } => *current = deadline,
+    }
 }
 
 #[test]
@@ -185,6 +199,60 @@ async fn save_with_a_clean_cached_snapshot_still_reaches_native_code() {
 }
 
 #[tokio::test]
+async fn busy_save_retries_the_same_request_after_readiness_changes() {
+    let _test = TEST_LOCK.lock().await;
+    reset(vec![drawing(1, 101, true)]);
+    let id = list().unwrap()[0].id;
+
+    let saving = tokio::spawn(save(id, None));
+    tokio::task::yield_now().await;
+    let first = take_native_action();
+    assert_eq!(first.kind(), NativeActionKind::Save);
+
+    complete_native_action(first.job_id(), result(NativeActionResultKind::NotQuiescent));
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
+
+    process_due_timers(Instant::now() + READINESS_RETRY_MAX);
+    let retried = take_native_action();
+    assert_eq!(retried.kind(), NativeActionKind::Save);
+    assert_eq!(retried.job_id(), first.job_id());
+
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
+    complete_native_action(retried.job_id(), result(NativeActionResultKind::Success));
+    assert!(saving.await.unwrap().is_ok());
+    stop();
+}
+
+#[tokio::test]
+async fn busy_save_has_a_clear_readiness_timeout() {
+    let _test = TEST_LOCK.lock().await;
+    reset(vec![drawing(1, 101, true)]);
+    let id = list().unwrap()[0].id;
+
+    let saving = tokio::spawn(save(id, None));
+    tokio::task::yield_now().await;
+    let action = take_native_action();
+    assert_eq!(action.kind(), NativeActionKind::Save);
+    complete_native_action(
+        action.job_id(),
+        result(NativeActionResultKind::NotQuiescent),
+    );
+
+    {
+        let mut scheduler = SCHEDULER.lock().unwrap();
+        force_wait_due(scheduler.pending.front_mut().unwrap());
+    }
+    process_due_timers(Instant::now());
+
+    assert_eq!(
+        saving.await.unwrap(),
+        Err(Error::ReadinessTimedOut(Some(id)))
+    );
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
+    stop();
+}
+
+#[tokio::test]
 async fn save_to_a_new_path_requires_the_published_path_and_clean_state() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, false)]);
@@ -289,7 +357,7 @@ async fn drawing_history_fails_closed_on_missing_or_replaced_drawings() {
 }
 
 #[tokio::test]
-async fn wake_failure_completes_every_job_waiting_on_that_wake() {
+async fn wake_failure_waits_before_timing_out_pending_jobs() {
     let _test = TEST_LOCK.lock().await;
     reset(Vec::new());
 
@@ -298,10 +366,13 @@ async fn wake_failure_completes_every_job_waiting_on_that_wake() {
     let third = tokio::spawn(open(drawing_path("third")));
     tokio::task::yield_now().await;
 
-    wake_failed(42);
+    wake_failed();
+
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
+    process_due_timers(Instant::now() + READINESS_TIMEOUT);
 
     for job in [first, second, third] {
-        assert_eq!(job.await.unwrap(), Err(Error::ScheduleFailed(42)));
+        assert_eq!(job.await.unwrap(), Err(Error::ReadinessTimedOut(None)));
     }
 
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
@@ -543,7 +614,7 @@ async fn dropping_a_queued_execution_waiter_keeps_the_job_and_output_alive() {
 }
 
 #[tokio::test]
-async fn wake_failure_stops_a_pending_execution_output_stream() {
+async fn wake_failure_keeps_an_execution_pending_until_readiness_times_out() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
@@ -552,9 +623,18 @@ async fn wake_failure_stops_a_pending_execution_output_stream() {
     let (output, pending) = spawn_test_execution(id, execution, output);
     tokio::task::yield_now().await;
 
-    wake_failed(42);
+    wake_failed();
 
-    assert_eq!(pending.await.unwrap(), Err(Error::ScheduleFailed(42)));
+    assert_eq!(take_native_action().kind(), NativeActionKind::None);
+    process_due_timers(Instant::now() + READINESS_TIMEOUT);
+
+    assert!(matches!(
+        pending.await.unwrap(),
+        Ok(ExecOutcome::Failure(crate::exec::ExecFailure {
+            drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
+            ..
+        }))
+    ));
     assert_eq!(output.next_chunk().await, None);
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
     stop();
@@ -971,7 +1051,7 @@ async fn queued_execution_expires_without_starting_a_form() {
             .iter_mut()
             .find(|job| job.job_id == job_id)
             .unwrap();
-        job.start_deadline = Some(Instant::now() - Duration::from_millis(1));
+        force_wait_due(job);
     }
 
     process_due_timers(Instant::now());
@@ -980,7 +1060,7 @@ async fn queued_execution_expires_without_starting_a_form() {
     assert_eq!(
         completion.wait().await.unwrap(),
         ExecOutcome::Failure(crate::exec::ExecFailure {
-            message: "execution did not start within 5 seconds".into(),
+            message: "AutoCAD did not become ready within 60 seconds".into(),
             form_index: None,
             location: None,
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
@@ -1013,7 +1093,7 @@ async fn busy_execution_waits_for_a_readiness_retry_without_spinning() {
     complete_native_action(first.job_id(), result(NativeActionResultKind::NotQuiescent));
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
-    process_due_timers(Instant::now() + BUSY_RETRY_MAX);
+    process_due_timers(Instant::now() + READINESS_RETRY_MAX);
     let retried = take_native_action();
     assert_eq!(retried.kind(), NativeActionKind::QueueExecDriver);
     assert_eq!(retried.job_id(), job_id);
@@ -1040,8 +1120,7 @@ async fn deadline_wins_while_the_busy_probe_is_in_flight() {
     assert_eq!(action.kind(), NativeActionKind::QueueExecDriver);
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
-        scheduler.active.as_mut().unwrap().start_deadline =
-            Some(Instant::now() - Duration::from_millis(1));
+        force_wait_due(scheduler.active.as_mut().unwrap());
     }
 
     process_due_timers(Instant::now());
@@ -1074,8 +1153,7 @@ async fn deadline_winner_survives_a_native_preflight_failure() {
     );
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
-        scheduler.active.as_mut().unwrap().start_deadline =
-            Some(Instant::now() - Duration::from_millis(1));
+        force_wait_due(scheduler.active.as_mut().unwrap());
     }
 
     process_due_timers(Instant::now());
@@ -1084,7 +1162,7 @@ async fn deadline_winner_survives_a_native_preflight_failure() {
     assert_eq!(
         completion.wait().await.unwrap(),
         ExecOutcome::Failure(crate::exec::ExecFailure {
-            message: "execution did not start within 5 seconds".into(),
+            message: "AutoCAD did not become ready within 60 seconds".into(),
             form_index: None,
             location: None,
             drawing_outcome: crate::exec::DrawingOutcome::NotStarted,
@@ -1113,8 +1191,7 @@ async fn deadline_winner_survives_a_failing_begin_step() {
     );
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
-        scheduler.active.as_mut().unwrap().start_deadline =
-            Some(Instant::now() - Duration::from_millis(1));
+        force_wait_due(scheduler.active.as_mut().unwrap());
     }
 
     process_due_timers(Instant::now());
@@ -1141,7 +1218,7 @@ async fn deadline_winner_survives_a_failing_begin_step() {
     assert!(
         failure
             .message
-            .starts_with("execution did not start within 5 seconds")
+            .starts_with("AutoCAD did not become ready within 60 seconds")
     );
     assert!(failure.message.contains("undo begin failed"));
     assert_eq!(
@@ -1224,12 +1301,12 @@ async fn queued_cancel_and_deadline_have_one_serialized_winner() {
     let (expired_id, _output, expired_completion) = admission.into_parts();
     {
         let mut scheduler = SCHEDULER.lock().unwrap();
-        scheduler
+        let job = scheduler
             .pending
             .iter_mut()
             .find(|job| job.job_id == expired_id)
-            .unwrap()
-            .start_deadline = Some(Instant::now() - Duration::from_millis(1));
+            .unwrap();
+        force_wait_due(job);
     }
 
     process_due_timers(Instant::now());
@@ -1248,7 +1325,7 @@ async fn queued_cancel_and_deadline_have_one_serialized_winner() {
     let admission = admit_test_execution(id, execution, output).unwrap();
     let (cancelled_id, _output, cancelled_completion) = admission.into_parts();
     assert_eq!(cancel_execution(cancelled_id), CancelResult::Accepted);
-    process_due_timers(Instant::now() + EXECUTION_START_TIMEOUT);
+    process_due_timers(Instant::now() + READINESS_TIMEOUT);
     assert_eq!(
         cancelled_completion.wait().await.unwrap(),
         ExecOutcome::Cancelled

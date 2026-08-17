@@ -32,7 +32,6 @@ mod ffi {
         Dirty,
         DestinationExists,
         OpenFailed,
-        LockFailed,
         SaveFailed,
         CloseFailed,
         HistoryFailed,
@@ -206,7 +205,7 @@ mod ffi {
 
         fn native_state_may_be_ready();
 
-        fn native_action_wake_failed(status: i32);
+        fn native_action_wake_failed();
 
         fn take_execution_step(job_id: u64) -> Box<NativeExecStep>;
 
@@ -312,8 +311,8 @@ fn native_state_may_be_ready() {
     scheduler::native_state_may_be_ready();
 }
 
-fn native_action_wake_failed(status: i32) {
-    scheduler::wake_failed(status);
+fn native_action_wake_failed() {
+    scheduler::wake_failed();
 }
 
 fn take_execution_step(job_id: u64) -> Box<NativeExecStep> {

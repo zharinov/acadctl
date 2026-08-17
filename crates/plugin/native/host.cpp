@@ -194,6 +194,8 @@ private:
 
   bool lispFunctionsDefined(AcApDocument* document) const;
 
+  bool applicationContextBlocked(AcApDocument* target = nullptr) const;
+
   acadctl::NativeActionResult open(rust::Str path);
 
   acadctl::NativeActionResult save(AcApDocument* document, rust::Str path);
@@ -1070,7 +1072,7 @@ void scheduleNextNativeAction() {
   const int status = acadctl_wake_native_actions();
 
   if (status != 0) {
-    acadctl::native_action_wake_failed(status);
+    acadctl::native_action_wake_failed();
   }
 }
 
@@ -1264,7 +1266,24 @@ bool ObjectArxBridge::lispFunctionsDefined(AcApDocument* document) const {
          subscription->lispFunctionsDefined;
 }
 
+bool ObjectArxBridge::applicationContextBlocked(AcApDocument* target) const {
+  AcApDocument* active = acDocManager->mdiActiveDocument();
+
+  if (active &&
+      (acDocManager->curDocument() != active || !active->isQuiescent() ||
+       acDocManager->inputPending(active) > 0)) {
+    return true;
+  }
+
+  return target && target != active &&
+         (!target->isQuiescent() || acDocManager->inputPending(target) > 0);
+}
+
 acadctl::NativeActionResult ObjectArxBridge::open(rust::Str path) {
+  if (applicationContextBlocked()) {
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
+  }
+
   const AcString drawingPath(path.data(), AcString::Utf8,
                              static_cast<Adesk::UInt32>(path.size()));
   AcApDocManager::DocOpenParams parameters{};
@@ -1316,12 +1335,15 @@ acadctl::NativeActionResult ObjectArxBridge::save(AcApDocument* document,
                         static_cast<Adesk::UInt32>(path.size()))
              : AcString(document->fileName());
 
+  if (applicationContextBlocked(document)) {
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
+  }
+
   const Acad::ErrorStatus lockStatus = acDocManager->lockDocument(
       document, AcAp::kXWrite, nullptr, nullptr, false);
 
   if (lockStatus != Acad::eOk) {
-    return nativeFailure(acadctl::NativeActionResultKind::LockFailed,
-                         lockStatus);
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
   }
 
   AcApDocument* active = acDocManager->mdiActiveDocument();
@@ -1372,6 +1394,10 @@ acadctl::NativeActionResult ObjectArxBridge::close(AcApDocument* document,
 
   if (dbmod != 0 && !discard) {
     return result(acadctl::NativeActionResultKind::Dirty);
+  }
+
+  if (applicationContextBlocked(document)) {
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
   }
 
   if (discard) {

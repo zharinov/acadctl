@@ -153,7 +153,7 @@ impl Exec {
         self.cancel_requested
     }
 
-    pub fn start_deadline_pending(&self) -> bool {
+    pub fn readiness_wait_pending(&self) -> bool {
         !self.form_handed_off
             && self.outcome.is_none()
             && !self.cancel_requested

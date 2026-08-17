@@ -9,7 +9,6 @@ use super::operation::HistoryDirection;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     SchedulerStateUnavailable,
-    ScheduleFailed(i32),
     Stopped,
     PluginStopping,
     DrawingNotFound(DrawingId),
@@ -22,7 +21,6 @@ pub enum Error {
     Dirty(DrawingId),
     NotDwg,
     OpenFailed(NativeFailure),
-    LockFailed(NativeFailure),
     SaveFailed(NativeFailure),
     CloseFailed(NativeFailure),
     HistoryFailed {
@@ -40,6 +38,7 @@ pub enum Error {
     ExecBridgeSymbolsClearFailed(NativeFailure),
     ExecBridgeFailed(NativeFailure),
     ExecNotFinished,
+    ReadinessTimedOut(Option<DrawingId>),
     MutationCapacity,
     ExecCapacity,
     NativeMutationStateUnknown,
@@ -56,12 +55,6 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SchedulerStateUnavailable => formatter.write_str("mutation scheduler state is unavailable"),
-            Self::ScheduleFailed(status) => {
-                write!(
-                    formatter,
-                    "AutoCAD could not schedule the operation (status {status})"
-                )
-            }
             Self::Stopped => formatter.write_str("the native operation stopped before completion"),
             Self::PluginStopping => formatter.write_str("the acadctl plugin is stopping"),
             Self::DrawingNotFound(id) => write!(formatter, "Drawing '{id}' is not open."),
@@ -84,9 +77,6 @@ impl fmt::Display for Error {
             Self::NotDwg => formatter.write_str("Only DWG drawings can be saved"),
             Self::OpenFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not open the drawing")
-            }
-            Self::LockFailed(failure) => {
-                failure.fmt_with_context(formatter, "Could not lock the drawing")
             }
             Self::SaveFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not save the drawing")
@@ -134,6 +124,9 @@ impl fmt::Display for Error {
             Self::ExecNotFinished => {
                 formatter.write_str("The native execution ended without a terminal outcome")
             }
+            Self::ReadinessTimedOut(_) => {
+                formatter.write_str("AutoCAD did not become ready within 60 seconds")
+            }
             Self::MutationCapacity => {
                 formatter.write_str("AutoCAD already has the maximum number of pending operations")
             }
@@ -176,6 +169,7 @@ impl Error {
             Self::Dirty(_) => Some(DrawingErrorKind::UnsavedChanges),
             Self::NotQuiescent => Some(DrawingErrorKind::Busy),
             Self::UndoDisabled => Some(DrawingErrorKind::UndoDisabled),
+            Self::ReadinessTimedOut(_) => Some(DrawingErrorKind::ReadinessTimedOut),
             _ => None,
         }
     }
@@ -187,6 +181,7 @@ impl Error {
             | Self::ReadOnly(id)
             | Self::DestinationExists(id)
             | Self::Dirty(id) => Some(*id),
+            Self::ReadinessTimedOut(id) => *id,
             _ => None,
         }
     }

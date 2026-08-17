@@ -17,18 +17,12 @@ mod writer;
 use interrupt::{CancellationReceipt, DiagnosticWait, Interrupts};
 #[cfg(test)]
 use interrupt::{Interrupt, publish_cancel};
-#[cfg(test)]
-use stream::wait_for_response_start_with_timeout;
-use stream::{
-    ControlWait, ResponseStartWait, StdoutWait, wait_for_control, wait_for_response_start,
-    wait_for_stdout,
-};
+use stream::{ControlWait, StdoutWait, wait_for_control, wait_for_stdout};
 use writer::PipeWriter;
 
 use super::{fail, incompatible_message, query_error_message, target::Target};
 
 const EXECUTION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const EXECUTION_RESPONSE_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ResponsePhase {
@@ -99,9 +93,9 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
         receiver.recv().await.map(|message| (message, receiver))
     });
 
-    let response = match wait_for_response_start(client.execute(outbound), &mut interrupts).await {
-        ResponseStartWait::Ready(Ok(response)) => response,
-        ResponseStartWait::Ready(Err(status)) => {
+    let response = match wait_for_control(client.execute(outbound), &mut interrupts).await {
+        ControlWait::Ready(Ok(response)) => response,
+        ControlWait::Ready(Err(status)) => {
             if interrupts.detach_requested() {
                 return detach_exit(&interrupts);
             }
@@ -112,15 +106,7 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
 
             return diagnostic_failure(&mut interrupts, response_start_error(status)).await;
         }
-        ResponseStartWait::TimedOut => {
-            return diagnostic_failure(
-                &mut interrupts,
-                "AutoCAD did not report whether it started the AutoLISP (running it again may execute it twice)"
-                    .into(),
-            )
-            .await;
-        }
-        ResponseStartWait::UnconfirmedDetach => return detach_exit(&interrupts),
+        ControlWait::UnconfirmedDetach => return detach_exit(&interrupts),
     };
 
     ResponseSession::new(

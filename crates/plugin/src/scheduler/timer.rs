@@ -5,9 +5,9 @@ use tokio::sync::Notify;
 use super::native::schedule_native_actions;
 use super::queue::SCHEDULER;
 
-pub(super) const EXECUTION_START_TIMEOUT: Duration = Duration::from_secs(5);
-pub(super) const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(50);
-pub(super) const BUSY_RETRY_MAX: Duration = Duration::from_millis(500);
+pub(super) const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const READINESS_RETRY_INITIAL: Duration = Duration::from_millis(50);
+pub(super) const READINESS_RETRY_MAX: Duration = Duration::from_millis(500);
 
 static TIMERS_CHANGED: Notify = Notify::const_new();
 

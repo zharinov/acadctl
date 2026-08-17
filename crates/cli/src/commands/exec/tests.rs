@@ -316,39 +316,6 @@ async fn acknowledgement_may_arrive_before_the_local_interrupt_event() {
 }
 
 #[tokio::test]
-async fn pre_accept_timeout_stops_after_cancellation() {
-    let (mut ordinary, _ordinary_sender) = Interrupts::test_pair();
-    assert!(matches!(
-        wait_for_response_start_with_timeout(
-            pending::<()>(),
-            &mut ordinary,
-            Duration::from_millis(1),
-        )
-        .await,
-        ResponseStartWait::TimedOut
-    ));
-
-    let (mut cancelled, cancelled_sender) = Interrupts::test_pair();
-    cancelled_sender
-        .send(Interrupt::Cancel { queued: true })
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        wait_for_response_start_with_timeout(
-            async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                7
-            },
-            &mut cancelled,
-            Duration::from_millis(1),
-        )
-        .await,
-        ResponseStartWait::Ready(7)
-    ));
-}
-
-#[tokio::test]
 async fn closed_outbound_cancel_still_interrupts_a_blocked_diagnostic() {
     let stderr_started = Arc::new(AtomicBool::new(false));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
