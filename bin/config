@@ -9,6 +9,13 @@ acadctl_require_command() {
     command -v "$1" >/dev/null 2>&1 || acadctl_fail "$1 not found"
 }
 
+acadctl_trap_cleanup() {
+    trap cleanup EXIT
+    trap 'trap - EXIT HUP INT TERM; cleanup; exit 129' HUP
+    trap 'trap - EXIT HUP INT TERM; cleanup; exit 130' INT
+    trap 'trap - EXIT HUP INT TERM; cleanup; exit 143' TERM
+}
+
 acadctl_configure() {
     case "$(uname -s)" in
         Darwin)
@@ -23,7 +30,6 @@ acadctl_configure() {
 # Variables assigned here are consumed by scripts that source this file.
 # shellcheck disable=SC2034
 acadctl_configure_mac() {
-
     acadctl_autocad_root=${ACAD_DIR:-"/Applications/Autodesk/AutoCAD 2027/AutoCAD 2027.app"}
     acadctl_autocad_identifier=$(plutil -extract CFBundleIdentifier raw \
         "$acadctl_autocad_root/Contents/Info.plist" 2>/dev/null || true)
@@ -75,11 +81,5 @@ acadctl_autocad_series() {
             ;;
     esac
 
-    acadctl_series=R$acadctl_autocad_major.0
-
-    if ! printf '%s\n' "$acadctl_series" | grep -Eq '^R[0-9]+(\.[0-9]+)?$'; then
-        acadctl_fail "invalid AutoCAD series '$acadctl_series'"
-    fi
-
-    printf '%s\n' "$acadctl_series"
+    printf 'R%s.0\n' "$acadctl_autocad_major"
 }

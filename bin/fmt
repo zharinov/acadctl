@@ -17,46 +17,24 @@ require_tools() {
     done
 }
 
-format_rust() {
+format_sources() {
     cargo fmt --all --manifest-path "$repo_root/Cargo.toml"
-}
-
-check_rust() {
-    cargo fmt --all --manifest-path "$repo_root/Cargo.toml" -- --check
-}
-
-format_native() {
     clang-format -i \
         "$repo_root/crates/plugin/native/entry.cpp" \
         "$repo_root/crates/plugin/native/host.cpp" \
         "$repo_root/crates/plugin/native/host.hpp" \
         "$repo_root/crates/rpc/proto/acadctl.proto"
+    shfmt -w -i 4 -ci "$repo_root"/bin/*
 }
 
-check_native() {
+check_sources() {
+    cargo fmt --all --manifest-path "$repo_root/Cargo.toml" -- --check
     clang-format --dry-run --Werror \
         "$repo_root/crates/plugin/native/entry.cpp" \
         "$repo_root/crates/plugin/native/host.cpp" \
         "$repo_root/crates/plugin/native/host.hpp" \
         "$repo_root/crates/rpc/proto/acadctl.proto"
-}
-
-format_shell() {
-    shfmt -w -i 4 -ci \
-        "$repo_root/bin/build" \
-        "$repo_root/bin/ci" \
-        "$repo_root/bin/install" \
-        "$repo_root/bin/fmt" \
-        "$repo_root/bin/config"
-}
-
-check_shell() {
-    shfmt -d -i 4 -ci \
-        "$repo_root/bin/build" \
-        "$repo_root/bin/ci" \
-        "$repo_root/bin/install" \
-        "$repo_root/bin/fmt" \
-        "$repo_root/bin/config"
+    shfmt -d -i 4 -ci "$repo_root"/bin/*
 }
 
 main() {
@@ -64,19 +42,9 @@ main() {
     require_tools
 
     case "${1:-}" in
-        '')
-            format_rust
-            format_native
-            format_shell
-            ;;
-        --check)
-            check_rust
-            check_native
-            check_shell
-            ;;
-        *)
-            usage
-            ;;
+        '') format_sources ;;
+        --check) check_sources ;;
+        *) usage ;;
     esac
 }
 

@@ -25,22 +25,8 @@ require_macos_tools() {
     done
 }
 
-setup_logs() {
-    log_root=$(mktemp -d "${TMPDIR:-/tmp}/acadctl-ci.XXXXXX")
-    step_number=0
-}
-
 cleanup() {
     rm -rf -- "$log_root"
-}
-
-interrupt() {
-    status=$1
-    trap - EXIT HUP INT TERM
-    cleanup
-    echo >&2
-    echo "interrupted" >&2
-    exit "$status"
 }
 
 run_step() {
@@ -69,13 +55,8 @@ run_portable_checks() {
         crates/plugin/native/host.cpp \
         crates/plugin/native/host.hpp \
         crates/rpc/proto/acadctl.proto
-    run_step "format (shell)" shfmt -d -i 4 -ci \
-        bin/build \
-        bin/ci \
-        bin/install \
-        bin/fmt \
-        bin/config
-    run_step "shell" shellcheck bin/build bin/ci bin/install bin/fmt bin/config
+    run_step "format (shell)" shfmt -d -i 4 -ci bin/*
+    run_step "shell" shellcheck bin/*
     run_step "clippy (host)" cargo clippy --quiet \
         --workspace \
         --all-targets \
@@ -164,7 +145,7 @@ run_native_analysis() {
 
 run_macos_checks() {
     require_macos_tools
-    acadctl_configure "$repo_root"
+    acadctl_configure
     configure_macos_paths
     check_macos_inputs
     check_artifacts_exist
@@ -186,11 +167,9 @@ run_macos_checks() {
 main() {
     test "$#" -eq 0 || usage
     require_portable_tools
-    setup_logs
-    trap cleanup EXIT
-    trap 'interrupt 129' HUP
-    trap 'interrupt 130' INT
-    trap 'interrupt 143' TERM
+    log_root=$(mktemp -d "${TMPDIR:-/tmp}/acadctl-ci.XXXXXX")
+    step_number=0
+    acadctl_trap_cleanup
 
     cd "$repo_root"
     run_portable_checks

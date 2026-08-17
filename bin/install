@@ -3,6 +3,9 @@ set -eu
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 
+# shellcheck source=bin/config
+. "$repo_root/bin/config"
+
 usage() {
     echo "usage: $0" >&2
     exit 2
@@ -13,8 +16,7 @@ require_supported_platform() {
         Darwin)
             ;;
         *)
-            echo "acadctl has no plugin installer for this platform" >&2
-            exit 1
+            acadctl_fail "acadctl has no plugin installer for this platform"
             ;;
     esac
 }
@@ -38,53 +40,44 @@ configure_paths() {
 }
 
 preflight() {
-    test -d "$source_bundle" || {
-        echo "plugin not found at $source_bundle; run 'bin/build release'" >&2
-        exit 1
-    }
-    test -x "$source_cli" || {
-        echo "CLI not found at $source_cli; run 'bin/build release'" >&2
-        exit 1
-    }
-    test -d "$plugin_root" || {
-        echo "AutoCAD plugin directory not found at $plugin_root" >&2
-        exit 1
-    }
-    test -d "$cli_root" || {
-        echo "CLI directory not found at $cli_root" >&2
-        exit 1
-    }
+    test -d "$source_bundle" ||
+        acadctl_fail "plugin not found at $source_bundle; run 'bin/build release'"
+    test -x "$source_cli" ||
+        acadctl_fail "CLI not found at $source_cli; run 'bin/build release'"
+    test -d "$plugin_root" ||
+        acadctl_fail "AutoCAD plugin directory not found at $plugin_root"
+    test -d "$cli_root" ||
+        acadctl_fail "CLI directory not found at $cli_root"
+}
+
+restore() {
+    restore_destination=$1
+    restore_previous=$2
+    restore_touched=$3
+    restore_type=$4
+
+    if test "$restore_touched" = true; then
+        case "$restore_type" in
+            directory) rm -rf "$restore_destination" ;;
+            file) rm -f "$restore_destination" ;;
+        esac
+    fi
+    if test -e "$restore_previous"; then
+        mv "$restore_previous" "$restore_destination"
+    fi
 }
 
 cleanup() {
+    rm -rf "$plugin_staging"
     rm -f "$cli_staging"
 
     if test "$installation_committed" = true; then
         rm -rf "$plugin_previous"
         rm -f "$cli_previous"
     else
-        if test "$plugin_touched" = true; then
-            rm -rf "$plugin_destination"
-        fi
-        if test -e "$plugin_previous"; then
-            mv "$plugin_previous" "$plugin_destination"
-        fi
-        if test "$cli_touched" = true; then
-            rm -f "$cli_destination"
-        fi
-        if test -e "$cli_previous"; then
-            mv "$cli_previous" "$cli_destination"
-        fi
+        restore "$plugin_destination" "$plugin_previous" "$plugin_touched" directory
+        restore "$cli_destination" "$cli_previous" "$cli_touched" file
     fi
-
-    rm -rf "$plugin_staging"
-}
-
-interrupt() {
-    status=$1
-    trap - EXIT HUP INT TERM
-    cleanup
-    exit "$status"
 }
 
 install_plugin() {
@@ -113,10 +106,7 @@ main() {
     require_supported_platform
     configure_paths
     preflight
-    trap cleanup EXIT
-    trap 'interrupt 129' HUP
-    trap 'interrupt 130' INT
-    trap 'interrupt 143' TERM
+    acadctl_trap_cleanup
 
     install_plugin
     install_cli

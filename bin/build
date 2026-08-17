@@ -51,13 +51,6 @@ cleanup() {
     rmdir "$lock_dir" 2>/dev/null || true
 }
 
-interrupt() {
-    status=$1
-    trap - EXIT HUP INT TERM
-    cleanup
-    exit "$status"
-}
-
 build_rust() {
     if test "$cargo_profile" = release; then
         MACOSX_DEPLOYMENT_TARGET="$acadctl_deployment_target" \
@@ -114,16 +107,10 @@ build_native_plugin() {
         -o "$build_executable"
 }
 
-stage_cli() {
+publish_artifacts() {
     cp "$rust_target/$acadctl_rust_target/$cargo_profile/acadctl" "$build_cli"
-}
-
-sign_artifacts() {
     codesign --force --sign - "$build_plugin"
     codesign --force --sign - "$build_cli"
-}
-
-publish_artifacts() {
     mkdir -p "$out_root"
     rm -rf "$bundle"
     mv "$build_bundle" "$bundle"
@@ -136,20 +123,15 @@ publish_artifacts() {
 main() {
     test "$#" -le 1 || usage
     select_profile "${1:-}"
-    acadctl_configure "$repo_root"
+    acadctl_configure
     configure_paths
     acquire_build_lock
-    trap cleanup EXIT
-    trap 'interrupt 129' HUP
-    trap 'interrupt 130' INT
-    trap 'interrupt 143' TERM
+    acadctl_trap_cleanup
 
     cd "$repo_root"
     build_rust
     assemble_bundle
     build_native_plugin
-    stage_cli
-    sign_artifacts
     publish_artifacts
 }
 
