@@ -1,9 +1,9 @@
 pub mod close;
 pub mod exec;
 pub mod history;
-pub mod kill;
+pub mod list;
 pub mod open;
-pub mod ps;
+pub mod quit;
 pub mod save;
 pub(crate) mod target;
 

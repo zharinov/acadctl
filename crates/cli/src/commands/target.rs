@@ -36,7 +36,7 @@ impl FromStr for Target {
 
 impl fmt::Display for ParseTargetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected INSTANCE:DRAWING from `acadctl ps`")
+        formatter.write_str("expected INSTANCE:DRAWING from `acadctl list`")
     }
 }
 

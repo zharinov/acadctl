@@ -14,7 +14,7 @@ const ABOUT: &str = r#"Command line utility to control AutoCAD
 
 Examples:
 
-$ acadctl ps
+$ acadctl list
 6A84:36C8  *  rw  foo.dwg
 6A84:91B2  .  ro  bar.dwg
 
@@ -38,7 +38,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List instances and drawings.
-    Ps {
+    List {
         /// Show the full path of named drawings.
         #[arg(long)]
         long: bool,
@@ -55,7 +55,7 @@ enum Command {
     },
     /// Save changes.
     Save {
-        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        /// INSTANCE:DRAWING target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
 
@@ -65,19 +65,19 @@ enum Command {
     },
     /// Undo the previous action.
     Undo {
-        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        /// INSTANCE:DRAWING target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
     },
     /// Redo the previous action.
     Redo {
-        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        /// INSTANCE:DRAWING target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
     },
     /// Close a drawing.
     Close {
-        /// INSTANCE:DRAWING target shown by `acadctl ps`.
+        /// INSTANCE:DRAWING target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
 
@@ -90,7 +90,7 @@ enum Command {
     /// Execute an AutoLISP script.
     Exec(ExecArgs),
     /// Stop an instance.
-    Kill {
+    Quit {
         /// AutoCAD instance to stop when more than one is running.
         #[arg(value_name = "INSTANCE")]
         instance: Option<acadctl_rpc::InstanceId>,
@@ -109,7 +109,7 @@ enum Command {
 
 #[derive(Args)]
 struct EvalArgs {
-    /// INSTANCE:DRAWING target shown by `acadctl ps`.
+    /// INSTANCE:DRAWING target shown by `acadctl list`.
     #[arg(value_name = "TARGET")]
     target: Target,
 
@@ -133,7 +133,7 @@ struct EvalArgs {
 
 #[derive(Args)]
 struct ExecArgs {
-    /// INSTANCE:DRAWING target shown by `acadctl ps`.
+    /// INSTANCE:DRAWING target shown by `acadctl list`.
     #[arg(value_name = "TARGET")]
     target: Target,
 
@@ -172,7 +172,7 @@ async fn main() -> ExitCode {
     };
 
     match cli.command {
-        Command::Ps { long } => commands::ps::run(long).await,
+        Command::List { long } => commands::list::run(long).await,
         Command::Open { path, instance } => commands::open::run(path, instance).await,
         Command::Save { target, path } => commands::save::run(target, path).await,
         Command::Undo { target } => {
@@ -198,7 +198,7 @@ async fn main() -> ExitCode {
             )
             .await
         }
-        Command::Kill { instance, force } => commands::kill::run(instance, force).await,
+        Command::Quit { instance, force } => commands::quit::run(instance, force).await,
         Command::Help { command } => print_help(command),
     }
 }
@@ -220,7 +220,7 @@ fn report_parse_error(error: clap::Error) -> ExitCode {
             let value = error_context(&error, ContextKind::InvalidValue).unwrap_or_default();
 
             if argument.contains("TARGET") {
-                eprintln!("Invalid target '{value}': expected INSTANCE:DRAWING from acadctl ps.");
+                eprintln!("Invalid target '{value}': expected INSTANCE:DRAWING from acadctl list.");
             } else if argument.contains("INSTANCE") {
                 eprintln!("Invalid instance '{value}': expected 4–8 hexadecimal digits.");
             } else {
@@ -358,13 +358,23 @@ mod tests {
         let help = Cli::command().render_help().to_string();
 
         assert!(help.starts_with("Command line utility to control AutoCAD\n"));
-        assert!(help.contains("$ acadctl ps\n6A84:36C8  *  rw  foo.dwg"));
+        assert!(help.contains("$ acadctl list\n6A84:36C8  *  rw  foo.dwg"));
         assert!(help.contains("$ acadctl exec 6A84:36C8 <<'LISP'"));
         assert!(help.contains("$ acadctl eval 6A84:36C8 '(square 7)'\n49"));
         assert!(!help.contains("--file script.lsp"));
         assert!(!help.contains("document"));
         assert!(!help.contains("process"));
         assert!(!help.contains("pid"));
+    }
+
+    #[test]
+    fn exposes_list_and_quit_command_names() {
+        let command = Cli::command();
+
+        assert!(command.find_subcommand("list").is_some());
+        assert!(command.find_subcommand("quit").is_some());
+        assert!(command.find_subcommand("ps").is_none());
+        assert!(command.find_subcommand("kill").is_none());
     }
 
     #[test]

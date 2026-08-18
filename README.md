@@ -9,7 +9,7 @@ Runs on MacOS, contributions for Windows are welcome.
 Examples:
 
 ```sh
-$ acadctl ps
+$ acadctl list
 6A84:36C8  *  rw  foo.dwg
 6A84:91B2  .  ro  bar.dwg
 ```
@@ -30,7 +30,7 @@ $ acadctl eval 6A84:36C8 '(square 7)'
 
 ## What works
 
-- `acadctl ps`: list drawings currently open in AutoCAD.
+- `acadctl list`: list drawings currently open in AutoCAD.
 - `acadctl open`, `acadctl save`, `acadctl close`
 - `acadctl undo` and `acadctl redo`
 - `acadctl exec` and `acadctl eval` for running AutoLISP.
