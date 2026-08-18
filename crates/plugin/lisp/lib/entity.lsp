@@ -670,11 +670,14 @@
                    found))
 
           (setq xdata-apps
-                '(lambda (data / apps pair)
+                '(lambda (data / apps pair subgroup)
                    (foreach pair data
-                     (if (and (= (car pair) xdata-group-code)
-                              (eq (type (car (cadr pair))) 'STR))
-                       (setq apps (cons (car (cadr pair)) apps))))
+                     (if (= (car pair) xdata-group-code)
+                       (foreach subgroup (cdr pair)
+                         (if (eq (type (car subgroup)) 'STR)
+                           (setq
+                             apps
+                             (cons (car subgroup) apps))))))
                    (reverse apps)))
 
           (setq outcome
