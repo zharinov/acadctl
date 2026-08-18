@@ -142,6 +142,7 @@ fn inspection_library_files_define_only_their_public_entry_points() {
         ("group.lsp", &["actl:groups"][..]),
         ("layer.lsp", &["actl:layers"][..]),
         ("order.lsp", &["actl:order"][..]),
+        ("summary.lsp", &["actl:summary"][..]),
     ];
 
     for (file, expected) in cases {
