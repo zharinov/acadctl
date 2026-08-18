@@ -211,7 +211,7 @@ impl ValuePrinter {
             AtomState::Symbol(_) if text.is_empty() => self.poll_output(),
             AtomState::Symbol(mut state) => {
                 if state.is_empty() {
-                    self.before_value()?;
+                    self.before_symbol_value()?;
                 }
 
                 state.push(text);
@@ -440,6 +440,15 @@ impl ValuePrinter {
         };
 
         self.layout.line(separator, self.lists.len())
+    }
+
+    fn before_symbol_value(&mut self) -> Result<(), PrintError> {
+        if self.lists.last() == Some(&ListState::Empty) {
+            *self.lists.last_mut().expect("checked list exists") = ListState::Values;
+            return Ok(());
+        }
+
+        self.before_value()
     }
 
     fn require_no_atom(&self) -> Result<(), PrintError> {
