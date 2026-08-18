@@ -39,7 +39,12 @@ struct ResponseSession {
     interrupts: Interrupts,
 }
 
-pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMode) -> ExitCode {
+pub async fn run(
+    target: Target,
+    source: crate::source::SourceSpec,
+    mode: ExecMode,
+    force: bool,
+) -> ExitCode {
     let source_mode = if mode == ExecMode::Eval {
         crate::source::SourceMode::Eval
     } else {
@@ -76,6 +81,7 @@ pub async fn run(target: Target, source: crate::source::SourceSpec, mode: ExecMo
             mode,
             source_name,
             source_bytes,
+            force,
         ))),
     };
 

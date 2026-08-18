@@ -43,7 +43,7 @@ pub async fn run(path: PathBuf, instance_id: Option<InstanceId>) -> ExitCode {
         Err(error) => return fail(error),
     };
 
-    println!("{instance_id}:{drawing_id}");
+    println!("{instance_id}{drawing_id}");
     ExitCode::SUCCESS
 }
 

@@ -164,6 +164,8 @@ private:
 
   acadctl::NativeActionResult open(rust::Str path);
 
+  acadctl::NativeActionResult switchTo(AcApDocument* document);
+
   acadctl::NativeActionResult save(AcApDocument* document, rust::Str path);
 
   acadctl::NativeActionResult close(AcApDocument* document, bool discard);
@@ -206,6 +208,7 @@ private:
     std::size_t documentToken;
     std::size_t databaseToken;
     std::size_t previousActiveToken;
+    std::size_t previousActiveDatabaseToken;
     Kind kind;
     bool restorePreviousActive;
     acadctl::NativeActionResult dispatchResult;
@@ -1130,6 +1133,18 @@ void ObjectArxBridge::processNextAction() {
   case acadctl::NativeActionKind::Open:
     actionResult = open(action->open_path());
     break;
+  case acadctl::NativeActionKind::Switch:
+    if (AcApDocument* target = document(action->document_token())) {
+      actionResult =
+          matchesDatabase(target, action->database_token())
+              ? switchTo(target)
+              : result(
+                    acadctl::NativeActionResultKind::DrawingGenerationChanged);
+    } else {
+      actionResult = result(acadctl::NativeActionResultKind::DrawingGone);
+    }
+
+    break;
   case acadctl::NativeActionKind::Save:
     if (AcApDocument* target = document(action->document_token())) {
       actionResult =
@@ -1342,6 +1357,31 @@ acadctl::NativeActionResult ObjectArxBridge::save(AcApDocument* document,
                              status);
 }
 
+acadctl::NativeActionResult ObjectArxBridge::switchTo(AcApDocument* document) {
+  if (applicationContextBlocked(document)) {
+    return result(acadctl::NativeActionResultKind::NotQuiescent);
+  }
+
+  if (acDocManager->mdiActiveDocument() == document &&
+      acDocManager->curDocument() == document) {
+    return result(acadctl::NativeActionResultKind::Success);
+  }
+
+  const Acad::ErrorStatus status =
+      acDocManager->activateDocument(document, false);
+
+  if (status == Acad::eOk && (acDocManager->mdiActiveDocument() != document ||
+                              acDocManager->curDocument() != document)) {
+    return nativeFailure(acadctl::NativeActionResultKind::SwitchFailed,
+                         Acad::eInvalidContext);
+  }
+
+  return status == Acad::eOk
+             ? result(acadctl::NativeActionResultKind::Success)
+             : nativeFailure(acadctl::NativeActionResultKind::SwitchFailed,
+                             status);
+}
+
 acadctl::NativeActionResult ObjectArxBridge::close(AcApDocument* document,
                                                    bool discard) {
   AcDbDatabase* database = document->database();
@@ -1414,6 +1454,24 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     return false;
   }
 
+  AcApDocument* previousActive = acDocManager->mdiActiveDocument();
+
+  if (!previousActive) {
+    failure =
+        nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
+                      Acad::eNoDocument);
+
+    return false;
+  }
+
+  const bool forceDocumentContext = action.force_document_context();
+
+  if (target != previousActive && !forceDocumentContext) {
+    failure = result(acadctl::NativeActionResultKind::NotActive);
+
+    return false;
+  }
+
   if (kind == DocContextDispatch::Kind::ExecDriver) {
     if (!lispFunctionsDefined(target)) {
       failure = bridgeFailure(acadctl::NativeActionResultKind::ExecBridgeFailed,
@@ -1429,16 +1487,6 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     }
   }
 
-  AcApDocument* previousActive = acDocManager->mdiActiveDocument();
-
-  if (!previousActive) {
-    failure =
-        nativeFailure(acadctl::NativeActionResultKind::DocumentContextFailed,
-                      Acad::eNoDocument);
-
-    return false;
-  }
-
   if (acDocManager->curDocument() != previousActive ||
       !previousActive->isQuiescent()) {
     failure = result(acadctl::NativeActionResultKind::NotQuiescent);
@@ -1452,7 +1500,8 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     return false;
   }
 
-  const bool restorePreviousActive = previousActive != target;
+  const bool restorePreviousActive =
+      forceDocumentContext && previousActive != target;
   const int pendingInput = acDocManager->inputPending(target);
 
   if (pendingInput > 0) {
@@ -1468,12 +1517,17 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
     return false;
   }
 
+  const std::size_t previousActiveToken = static_cast<std::size_t>(
+      reinterpret_cast<std::uintptr_t>(previousActive));
+  const std::size_t previousActiveDatabaseToken = static_cast<std::size_t>(
+      reinterpret_cast<std::uintptr_t>(previousActive->database()));
+
   documentContextDispatch_.emplace(DocContextDispatch{
       action.job_id(),
       action.document_token(),
       action.database_token(),
-      static_cast<std::size_t>(
-          reinterpret_cast<std::uintptr_t>(previousActive)),
+      previousActiveToken,
+      previousActiveDatabaseToken,
       kind,
       restorePreviousActive,
       result(acadctl::NativeActionResultKind::Success),
@@ -1497,15 +1551,20 @@ bool ObjectArxBridge::queueDocumentContextDispatch(
       acadctl::NativeActionResultKind::DocumentContextFailed, scheduleStatus);
 
   Acad::ErrorStatus restoreStatus = Acad::eOk;
+  AcApDocument* restorablePreviousActive = document(previousActiveToken);
 
   if (restorePreviousActive &&
-      acDocManager->mdiActiveDocument() != previousActive) {
-    restoreStatus = acDocManager->activateDocument(previousActive, false);
+      !matchesDatabase(restorablePreviousActive, previousActiveDatabaseToken)) {
+    restoreStatus = Acad::eNoDocument;
+  } else if (restorePreviousActive &&
+             acDocManager->mdiActiveDocument() != restorablePreviousActive) {
+    restoreStatus =
+        acDocManager->activateDocument(restorablePreviousActive, false);
   }
 
   if (restoreStatus != Acad::eOk ||
-      acDocManager->mdiActiveDocument() != previousActive ||
-      acDocManager->curDocument() != previousActive) {
+      acDocManager->mdiActiveDocument() != restorablePreviousActive ||
+      acDocManager->curDocument() != restorablePreviousActive) {
     failure = nativeFailure(
         acadctl::NativeActionResultKind::DocumentContextRestoreFailed,
         restoreStatus == Acad::eOk ? Acad::eInvalidContext : restoreStatus);
@@ -2196,7 +2255,7 @@ void ObjectArxBridge::finalizeDocumentContextDispatch(void*) {
         bridge->document(dispatch.previousActiveToken);
     Acad::ErrorStatus restoreStatus = Acad::eNoDocument;
 
-    if (previousActive) {
+    if (matchesDatabase(previousActive, dispatch.previousActiveDatabaseToken)) {
       restoreStatus = acDocManager->activateDocument(previousActive, false);
     }
 
@@ -2248,6 +2307,7 @@ void ObjectArxBridge::publishDocumentSnapshot() {
         named,
         acdbGetDbmod(subscription.database) != 0,
         document->isReadOnly(),
+        acDocManager->mdiActiveDocument() == document,
     });
   }
 

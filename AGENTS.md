@@ -4,7 +4,14 @@ Keep C++ and AutoLISP surface minimal. It must be just interface bridge boilerpl
 
 When asked to commit, use semantic commit convention.
 
-During development, interact with AutoCAD via `acadctl` (without sandbox). Don't acess AutoCAD directly (via computer use) without explicit approval. Files in the `./tmp` folder are disposable, never ask my permission to modify them or discard unsaved changes. Assume AutoCAD process is disposable and nobody is doing anything important in AutoCAD during you work on the `acadctl`.
+During development, you have standing approval to:
+
+- Run `bin/install` and replace the installed `acadctl` CLI and plugin.
+- Start, stop, restart, and otherwise control AutoCAD through `acadctl`.
+- Open, modify, save, close, reopen, or discard drawings under `./tmp`.
+- Create, overwrite, move, or delete files under `./tmp`.
+
+Do not ask for confirmation before these actions. Treat AutoCAD processes and all files and unsaved changes under `./tmp` as disposable. This approval does not apply to drawings or files outside `./tmp`. Do not control AutoCAD through computer use without explicit approval.
 
 If drawing close and reopen is sufficient, use it instead of closing and reopening the entire AutoCAD instance.
 

@@ -7,7 +7,7 @@ use crate::ffi::{
 };
 
 use super::error::{Error, NativeFailure};
-use super::operation::{Operation, OperationOutcome};
+use super::operation::{DocumentContextPolicy, Operation, OperationOutcome};
 
 pub(super) enum NativeCommand {
     Open(DrawingPath),
@@ -18,11 +18,12 @@ pub(super) enum NativeCommand {
 }
 
 pub(super) enum NativeDrawingOperation {
+    Switch,
     Save { path: Option<SavePath> },
     Close { discard: bool },
-    Undo,
-    Redo,
-    QueueExecDriver,
+    Undo { context: DocumentContextPolicy },
+    Redo { context: DocumentContextPolicy },
+    QueueExecDriver { context: DocumentContextPolicy },
 }
 
 pub(crate) struct NativeAction {
@@ -43,20 +44,27 @@ impl NativeCommand {
         Self::drawing(target, NativeDrawingOperation::Save { path })
     }
 
+    pub(super) fn switch(target: NativeDocumentKey) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Switch)
+    }
+
     pub(super) fn close(target: NativeDocumentKey, discard: bool) -> Self {
         Self::drawing(target, NativeDrawingOperation::Close { discard })
     }
 
-    pub(super) fn undo(target: NativeDocumentKey) -> Self {
-        Self::drawing(target, NativeDrawingOperation::Undo)
+    pub(super) fn undo(target: NativeDocumentKey, context: DocumentContextPolicy) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Undo { context })
     }
 
-    pub(super) fn redo(target: NativeDocumentKey) -> Self {
-        Self::drawing(target, NativeDrawingOperation::Redo)
+    pub(super) fn redo(target: NativeDocumentKey, context: DocumentContextPolicy) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Redo { context })
     }
 
-    pub(super) fn queue_exec_driver(target: NativeDocumentKey) -> Self {
-        Self::drawing(target, NativeDrawingOperation::QueueExecDriver)
+    pub(super) fn queue_exec_driver(
+        target: NativeDocumentKey,
+        context: DocumentContextPolicy,
+    ) -> Self {
+        Self::drawing(target, NativeDrawingOperation::QueueExecDriver { context })
     }
 
     fn drawing(target: NativeDocumentKey, operation: NativeDrawingOperation) -> Self {
@@ -81,11 +89,12 @@ impl NativeCommand {
 impl NativeDrawingOperation {
     fn kind(&self) -> NativeActionKind {
         match self {
+            Self::Switch => NativeActionKind::Switch,
             Self::Save { .. } => NativeActionKind::Save,
             Self::Close { .. } => NativeActionKind::Close,
-            Self::Undo => NativeActionKind::Undo,
-            Self::Redo => NativeActionKind::Redo,
-            Self::QueueExecDriver => NativeActionKind::QueueExecDriver,
+            Self::Undo { .. } => NativeActionKind::Undo,
+            Self::Redo { .. } => NativeActionKind::Redo,
+            Self::QueueExecDriver { .. } => NativeActionKind::QueueExecDriver,
         }
     }
 }
@@ -167,6 +176,23 @@ impl NativeAction {
             NativeActionState::Idle | NativeActionState::Issued { .. } => {
                 panic!("native action is not save")
             }
+        }
+    }
+
+    pub(crate) fn force_document_context(&self) -> bool {
+        match &self.state {
+            NativeActionState::Issued {
+                command:
+                    NativeCommand::Drawing {
+                        operation:
+                            NativeDrawingOperation::Undo { context }
+                            | NativeDrawingOperation::Redo { context }
+                            | NativeDrawingOperation::QueueExecDriver { context },
+                        ..
+                    },
+                ..
+            } => *context == DocumentContextPolicy::ForceTemporary,
+            NativeActionState::Idle | NativeActionState::Issued { .. } => false,
         }
     }
 
@@ -269,6 +295,10 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
             .drawing_id()
             .map(Error::ReadOnly)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
+        NativeActionResultKind::NotActive => Err(operation
+            .drawing_id()
+            .map(Error::NotActive)
+            .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::Dirty => Err(operation
             .drawing_id()
             .map(Error::Dirty)
@@ -278,6 +308,7 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
             .map(Error::DestinationExists)
             .unwrap_or(Error::UnknownResult(result.kind.repr))),
         NativeActionResultKind::OpenFailed => Err(Error::OpenFailed(failure)),
+        NativeActionResultKind::SwitchFailed => Err(Error::SwitchFailed(failure)),
         NativeActionResultKind::SaveFailed => Err(Error::SaveFailed(failure)),
         NativeActionResultKind::CloseFailed => Err(Error::CloseFailed(failure)),
         NativeActionResultKind::HistoryFailed => {

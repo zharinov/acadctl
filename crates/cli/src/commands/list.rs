@@ -6,11 +6,11 @@ use crate::instance::{Instance, InstanceSnapshot};
 
 use super::{parse_drawing_id, query_error_message};
 
-pub async fn run(long: bool) -> ExitCode {
+pub async fn run() -> ExitCode {
     let snapshot = InstanceSnapshot::discover();
     let instances = snapshot.query_instances().await;
 
-    let rendered = render(&instances, long);
+    let rendered = render(&instances);
 
     for line in rendered.lines {
         println!("{line}");
@@ -33,7 +33,7 @@ struct Rendered {
     diagnostics: Vec<String>,
 }
 
-fn render(instances: &[Instance], long: bool) -> Rendered {
+fn render(instances: &[Instance]) -> Rendered {
     let instance_id_width = instances
         .iter()
         .map(|instance| instance.instance_id.hex_width())
@@ -52,7 +52,7 @@ fn render(instances: &[Instance], long: bool) -> Rendered {
         };
 
         for drawing in drawings {
-            match drawing_line(instance.instance_id, instance_id_width, drawing, long) {
+            match drawing_line(instance.instance_id, instance_id_width, drawing) {
                 Ok(line) => lines.push(line),
                 Err(error) => diagnostics.push(format!(
                     "Drawing inspection failed in AutoCAD instance {}: {error}.",
@@ -69,23 +69,19 @@ fn drawing_line(
     instance_id: InstanceId,
     instance_id_width: usize,
     drawing: &Drawing,
-    long: bool,
 ) -> Result<String, String> {
     let drawing_id = parse_drawing_id(drawing.id)?;
 
     let modified = if drawing.modified { "*" } else { "." };
     let mode = if drawing.read_only { "ro" } else { "rw" };
-    let name = if long {
-        drawing
-            .file_path
-            .as_deref()
-            .unwrap_or(&drawing.display_name)
-    } else {
-        &drawing.display_name
-    };
+    let active = if drawing.active { ">" } else { " " };
+    let name = drawing
+        .file_path
+        .as_deref()
+        .unwrap_or(&drawing.display_name);
 
     Ok(format!(
-        "{instance_id:0instance_id_width$X}{drawing_id}  {modified}  {mode}  {name}"
+        "{active} {instance_id:0instance_id_width$X}{drawing_id}  {modified}  {mode}  {name}"
     ))
 }
 
@@ -101,19 +97,31 @@ mod tests {
         let instances = vec![available(
             0xFA5,
             vec![
-                drawing("32F3", "/Users/me/Projects/House/house.dwg", true, false),
-                drawing("91B2", "/Users/me/Projects/House/house.dwg", false, true),
-                drawing("A04C", "Drawing1", false, false),
+                drawing(
+                    "32F3",
+                    "/Users/me/Projects/House/house.dwg",
+                    true,
+                    false,
+                    true,
+                ),
+                drawing(
+                    "91B2",
+                    "/Users/me/Projects/House/house.dwg",
+                    false,
+                    true,
+                    false,
+                ),
+                drawing("A04C", "Drawing1", false, false, false),
             ],
         )];
 
         assert_eq!(
-            render(&instances, false),
+            render(&instances),
             Rendered {
                 lines: vec![
-                    "0FA532F3  *  rw  house.dwg",
-                    "0FA591B2  .  ro  house.dwg",
-                    "0FA5A04C  .  rw  Drawing1",
+                    "> 0FA532F3  *  rw  /Users/me/Projects/House/house.dwg",
+                    "  0FA591B2  .  ro  /Users/me/Projects/House/house.dwg",
+                    "  0FA5A04C  .  rw  Drawing1",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -124,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn long_listing_uses_full_paths() {
+    fn named_drawings_use_full_paths() {
         let instances = vec![available(
             0x1869F,
             vec![drawing(
@@ -132,89 +140,77 @@ mod tests {
                 "/Users/me/Projects/House/house.dwg",
                 false,
                 false,
+                false,
             )],
         )];
 
         assert_eq!(
-            render(&instances, true).lines,
-            ["1869F32F3  .  rw  /Users/me/Projects/House/house.dwg"]
+            render(&instances).lines,
+            ["  1869F32F3  .  rw  /Users/me/Projects/House/house.dwg"]
         );
     }
 
     #[test]
     fn aligns_instance_ids_to_the_widest_live_value() {
         let instances = vec![
-            available(0xFA5, vec![drawing("32F3", "/a.dwg", false, false)]),
-            available(0x1869F, vec![drawing("91B2", "/b.dwg", false, false)]),
+            available(0xFA5, vec![drawing("32F3", "/a.dwg", false, false, false)]),
+            available(0x1869F, vec![drawing("91B2", "/b.dwg", false, false, true)]),
         ];
 
         assert_eq!(
-            render(&instances, false).lines,
-            ["00FA532F3  .  rw  a.dwg", "1869F91B2  .  rw  b.dwg"]
+            render(&instances).lines,
+            ["  00FA532F3  .  rw  /a.dwg", "> 1869F91B2  .  rw  /b.dwg"]
         );
     }
 
     #[test]
     fn an_empty_listing_is_successful() {
-        assert!(render(&[], false).lines.is_empty());
-        assert!(render(&[available(123, vec![])], false).lines.is_empty());
+        assert!(render(&[]).lines.is_empty());
+        assert!(render(&[available(123, vec![])]).lines.is_empty());
     }
 
     #[test]
     fn preserves_healthy_drawings_and_explains_each_failed_instance() {
         assert_eq!(
-            render(&[failed(123, QueryError::CannotConnect)], false).diagnostics,
+            render(&[failed(123, QueryError::CannotConnect)]).diagnostics,
             ["Plugin unavailable: install it and restart AutoCAD."]
         );
         assert_eq!(
-            render(&[failed(123, QueryError::TimedOut)], false).diagnostics,
+            render(&[failed(123, QueryError::TimedOut)]).diagnostics,
             ["Timeout: plugin did not respond."]
         );
         assert_eq!(
-            render(&[failed(123, QueryError::OutdatedPlugin)], false).diagnostics,
+            render(&[failed(123, QueryError::OutdatedPlugin)]).diagnostics,
             ["Plugin incompatible: update it and restart AutoCAD."]
         );
         assert_eq!(
-            render(
-                &[failed(123, QueryError::RequestFailed(String::new()))],
-                false,
-            )
-            .diagnostics,
+            render(&[failed(123, QueryError::RequestFailed(String::new()))]).diagnostics,
             ["Unknown error."]
         );
         assert_eq!(
-            render(
-                &[failed(
-                    123,
-                    QueryError::RequestFailed(
-                        "failed to decode Protobuf message: Drawing.id: invalid wire type".into(),
-                    ),
-                )],
-                false,
-            )
+            render(&[failed(
+                123,
+                QueryError::RequestFailed(
+                    "failed to decode Protobuf message: Drawing.id: invalid wire type".into(),
+                ),
+            )],)
             .diagnostics,
             ["Plugin incompatible: update it and restart AutoCAD."]
         );
         assert_eq!(
-            render(
-                &[failed(
-                    123,
-                    QueryError::RequestFailed("drawing state is unavailable".into()),
-                )],
-                false,
-            )
+            render(&[failed(
+                123,
+                QueryError::RequestFailed("drawing state is unavailable".into()),
+            )],)
             .diagnostics,
             ["Unknown error."]
         );
 
-        let rendered = render(
-            &[
-                available(123, vec![drawing("32F3", "/a.dwg", false, false)]),
-                failed(456, QueryError::TimedOut),
-            ],
-            false,
-        );
-        assert_eq!(rendered.lines, ["007B32F3  .  rw  a.dwg"]);
+        let rendered = render(&[
+            available(123, vec![drawing("32F3", "/a.dwg", false, false, false)]),
+            failed(456, QueryError::TimedOut),
+        ]);
+        assert_eq!(rendered.lines, ["  007B32F3  .  rw  /a.dwg"]);
         assert_eq!(rendered.diagnostics, ["Timeout: plugin did not respond."]);
     }
 
@@ -232,7 +228,7 @@ mod tests {
         }
     }
 
-    fn drawing(id: &str, path: &str, modified: bool, read_only: bool) -> Drawing {
+    fn drawing(id: &str, path: &str, modified: bool, read_only: bool, active: bool) -> Drawing {
         let file_path = path.contains('/').then(|| path.to_owned());
         let display_name = file_path
             .as_deref()
@@ -246,6 +242,7 @@ mod tests {
             file_path,
             modified,
             read_only,
+            active,
         }
     }
 }

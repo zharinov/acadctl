@@ -5,6 +5,7 @@ pub mod list;
 pub mod open;
 pub mod quit;
 pub mod save;
+pub mod switch;
 pub(crate) mod target;
 
 use std::process::ExitCode;
@@ -20,6 +21,7 @@ type DrawingClient = acadctl_rpc::DrawingServiceClient<Channel>;
 #[derive(Clone, Copy)]
 enum RequestOperation {
     Open,
+    Switch,
     Save,
     Close,
     Undo,
@@ -66,6 +68,10 @@ fn request_error_message(
             return operation.timeout_message(target);
         }
 
+        if kind == acadctl_rpc::DrawingErrorKind::HistoryOutcomeUnknown {
+            return operation.unknown_history_outcome_message(target);
+        }
+
         if let Some(target) = target {
             return drawing_error_message(kind, target);
         }
@@ -83,6 +89,9 @@ fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) ->
             format!("Drawing {target} changed before the operation.")
         }
         DrawingErrorKind::ReadOnly => format!("Drawing {target} is read-only."),
+        DrawingErrorKind::NotActive => {
+            format!("Drawing {target} is not active: use --force to activate it temporarily.")
+        }
         DrawingErrorKind::UnsavedChanges => format!("Drawing {target} has unsaved changes."),
         DrawingErrorKind::NoFileName => {
             format!("Drawing {target} has no filename: use --as FILE.")
@@ -92,6 +101,9 @@ fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) ->
         DrawingErrorKind::DestinationExists => "Destination exists: choose another path.".into(),
         DrawingErrorKind::ReadinessTimedOut => {
             unreachable!("readiness timeouts require operation context")
+        }
+        DrawingErrorKind::HistoryOutcomeUnknown => {
+            unreachable!("unknown history outcomes require operation context")
         }
         DrawingErrorKind::Unspecified => {
             unreachable!("unspecified drawing errors are not rendered")
@@ -103,6 +115,7 @@ impl RequestOperation {
     fn failure_message(self, target: Option<Target>) -> String {
         match (self, target) {
             (Self::Open, _) => "Drawing was not opened.".into(),
+            (Self::Switch, Some(target)) => format!("Drawing {target} was not activated."),
             (Self::Save, Some(target)) => format!("Drawing {target} was not saved."),
             (Self::Close, Some(target)) => format!("Drawing {target} was not closed."),
             (Self::Undo, Some(target)) => format!("Undo was not run for drawing {target}."),
@@ -114,6 +127,9 @@ impl RequestOperation {
     fn timeout_message(self, target: Option<Target>) -> String {
         match (self, target) {
             (Self::Open, _) => "Timeout: drawing was not opened.".into(),
+            (Self::Switch, Some(target)) => {
+                format!("Timeout: drawing {target} was not activated.")
+            }
             (Self::Save, Some(target)) => format!("Timeout: drawing {target} was not saved."),
             (Self::Close, Some(target)) => format!("Timeout: drawing {target} was not closed."),
             (Self::Undo, Some(target)) => {
@@ -123,6 +139,18 @@ impl RequestOperation {
                 format!("Timeout: redo was not run for drawing {target}.")
             }
             _ => "Timeout: operation failed.".into(),
+        }
+    }
+
+    fn unknown_history_outcome_message(self, target: Option<Target>) -> String {
+        match (self, target) {
+            (Self::Undo, Some(target)) => format!(
+                "Undo may have run for drawing {target}: document focus could not be restored. Restart AutoCAD before another mutation; do not retry blindly."
+            ),
+            (Self::Redo, Some(target)) => format!(
+                "Redo may have run for drawing {target}: document focus could not be restored. Restart AutoCAD before another mutation; do not retry blindly."
+            ),
+            _ => "Operation outcome unknown: do not retry blindly.".into(),
         }
     }
 }
@@ -152,6 +180,10 @@ mod tests {
             (
                 acadctl_rpc::DrawingErrorKind::ReadOnly,
                 "Drawing 6A8436C8 is read-only.",
+            ),
+            (
+                acadctl_rpc::DrawingErrorKind::NotActive,
+                "Drawing 6A8436C8 is not active: use --force to activate it temporarily.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::UnsavedChanges,
@@ -190,6 +222,21 @@ mod tests {
         assert_eq!(
             request_error_message(RequestOperation::Open, None, status),
             "Timeout: drawing was not opened."
+        );
+    }
+
+    #[test]
+    fn warns_against_retrying_an_unknown_history_outcome() {
+        let target = "6A8436C8".parse().unwrap();
+        let status = acadctl_rpc::DrawingError {
+            kind: acadctl_rpc::DrawingErrorKind::HistoryOutcomeUnknown as i32,
+            drawing_id: None,
+        }
+        .status(Code::Internal);
+
+        assert_eq!(
+            request_error_message(RequestOperation::Undo, Some(target), status),
+            "Undo may have run for drawing 6A8436C8: document focus could not be restored. Restart AutoCAD before another mutation; do not retry blindly."
         );
     }
 

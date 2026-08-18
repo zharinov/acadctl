@@ -15,10 +15,10 @@ const ABOUT: &str = r#"Command line utility to control AutoCAD
 Examples:
 
 $ acadctl list
-6A8436C8  *  rw  foo.dwg
-6A8491B2  .  ro  bar.dwg
+> 6A8436C8  *  rw  /path/to/foo.dwg
+  6A8491B2  .  ro  /path/to/bar.dwg
 
-`foo.dwg` (6A8436C8) contains unsaved changes while `bar.dwg` (6A8491B2) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
+`foo.dwg` (6A8436C8) is active and contains unsaved changes while `bar.dwg` (6A8491B2) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84). Use `acadctl switch TARGET` to change the active drawing, or pass `--force` to a document-context command to activate its target temporarily.
 
 $ acadctl exec 6A8436C8 <<'LISP'
 (defun square (x)
@@ -38,11 +38,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// List instances and drawings.
-    List {
-        /// Show the full path of named drawings.
-        #[arg(long)]
-        long: bool,
-    },
+    List,
     /// Open a DWG file.
     Open {
         /// DWG file to open.
@@ -52,6 +48,12 @@ enum Command {
         /// AutoCAD instance to use when more than one is running.
         #[arg(long, value_name = "INSTANCE")]
         instance: Option<acadctl_rpc::InstanceId>,
+    },
+    /// Make a drawing active.
+    Switch {
+        /// Hexadecimal target shown by `acadctl list`.
+        #[arg(value_name = "TARGET")]
+        target: Target,
     },
     /// Save changes.
     Save {
@@ -68,12 +70,20 @@ enum Command {
         /// Hexadecimal target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
+
+        /// Temporarily steal document focus, then restore it. May disrupt interactive work.
+        #[arg(long)]
+        force: bool,
     },
     /// Redo the previous action.
     Redo {
         /// Hexadecimal target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
+
+        /// Temporarily steal document focus, then restore it. May disrupt interactive work.
+        #[arg(long)]
+        force: bool,
     },
     /// Close a drawing.
     Close {
@@ -113,6 +123,10 @@ struct EvalArgs {
     #[arg(value_name = "TARGET")]
     target: Target,
 
+    /// Temporarily steal document focus, then restore it. May disrupt interactive work.
+    #[arg(long)]
+    force: bool,
+
     /// AutoLISP expression. Reads stdin when omitted.
     #[arg(
         value_name = "EXPRESSION",
@@ -136,6 +150,10 @@ struct ExecArgs {
     /// Hexadecimal target shown by `acadctl list`.
     #[arg(value_name = "TARGET")]
     target: Target,
+
+    /// Temporarily steal document focus, then restore it. May disrupt interactive work.
+    #[arg(long)]
+    force: bool,
 
     /// AutoLISP script. Reads stdin when omitted.
     #[arg(
@@ -172,14 +190,15 @@ async fn main() -> ExitCode {
     };
 
     match cli.command {
-        Command::List { long } => commands::list::run(long).await,
+        Command::List => commands::list::run().await,
         Command::Open { path, instance } => commands::open::run(path, instance).await,
+        Command::Switch { target } => commands::switch::run(target).await,
         Command::Save { target, path } => commands::save::run(target, path).await,
-        Command::Undo { target } => {
-            commands::history::run(target, commands::history::Direction::Undo).await
+        Command::Undo { target, force } => {
+            commands::history::run(target, commands::history::Direction::Undo, force).await
         }
-        Command::Redo { target } => {
-            commands::history::run(target, commands::history::Direction::Redo).await
+        Command::Redo { target, force } => {
+            commands::history::run(target, commands::history::Direction::Redo, force).await
         }
         Command::Close { target, discard } => commands::close::run(target, discard).await,
         Command::Eval(arguments) => {
@@ -187,6 +206,7 @@ async fn main() -> ExitCode {
                 arguments.target,
                 source_spec(arguments.inline, arguments.file),
                 acadctl_rpc::ExecMode::Eval,
+                arguments.force,
             )
             .await
         }
@@ -195,6 +215,7 @@ async fn main() -> ExitCode {
                 arguments.target,
                 source_spec(arguments.inline, arguments.file),
                 acadctl_rpc::ExecMode::Exec,
+                arguments.force,
             )
             .await
         }
@@ -345,5 +366,39 @@ mod tests {
         };
 
         assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn document_context_commands_accept_force() {
+        for command_name in ["eval", "exec"] {
+            let cli =
+                Cli::try_parse_from(["acadctl", command_name, "--force", "12345678"]).unwrap();
+            let force = match cli.command {
+                Command::Eval(arguments) => arguments.force,
+                Command::Exec(arguments) => arguments.force,
+                _ => unreachable!(),
+            };
+            assert!(force);
+        }
+
+        for command_name in ["undo", "redo"] {
+            let cli =
+                Cli::try_parse_from(["acadctl", command_name, "--force", "12345678"]).unwrap();
+            let force = match cli.command {
+                Command::Undo { force, .. } | Command::Redo { force, .. } => force,
+                _ => unreachable!(),
+            };
+            assert!(force);
+        }
+    }
+
+    #[test]
+    fn switch_requires_a_target() {
+        assert!(Cli::try_parse_from(["acadctl", "switch", "12345678"]).is_ok());
+        let error = match Cli::try_parse_from(["acadctl", "switch"]) {
+            Ok(_) => panic!("switch without a target was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 }

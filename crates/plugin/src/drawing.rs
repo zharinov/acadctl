@@ -20,6 +20,7 @@ pub struct Drawing {
     name: DrawingName,
     pub modified: bool,
     pub read_only: bool,
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +115,7 @@ impl TrackedDrawing {
                 name: DrawingName::from_native(native.name, native.named),
                 modified: native.modified,
                 read_only: native.read_only,
+                active: native.active,
             },
         }
     }
@@ -305,6 +307,7 @@ mod tests {
             named: true,
             modified: false,
             read_only: false,
+            active: false,
         }
     }
 

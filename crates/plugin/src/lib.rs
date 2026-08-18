@@ -7,6 +7,7 @@ mod ffi {
         named: bool,
         modified: bool,
         read_only: bool,
+        active: bool,
     }
 
     #[derive(Debug)]
@@ -14,6 +15,7 @@ mod ffi {
     enum NativeActionKind {
         None,
         Open,
+        Switch,
         Save,
         Close,
         Undo,
@@ -29,9 +31,11 @@ mod ffi {
         DrawingGenerationChanged,
         Unnamed,
         ReadOnly,
+        NotActive,
         Dirty,
         DestinationExists,
         OpenFailed,
+        SwitchFailed,
         SaveFailed,
         CloseFailed,
         HistoryFailed,
@@ -174,6 +178,8 @@ mod ffi {
         fn open_path(self: &NativeAction) -> &str;
 
         fn save_path(self: &NativeAction) -> &str;
+
+        fn force_document_context(self: &NativeAction) -> bool;
 
         fn close_discard(self: &NativeAction) -> bool;
 

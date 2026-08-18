@@ -18,7 +18,9 @@ use super::native::{
     NativeAction, classify_execution_finalization, native_result_requires_quarantine,
     schedule_native_actions,
 };
-use super::operation::{HistoryDirection, Operation, OperationOutcome, Prepared};
+use super::operation::{
+    DocumentContextPolicy, HistoryDirection, Operation, OperationOutcome, Prepared,
+};
 use super::timer::{
     READINESS_RETRY_INITIAL, READINESS_RETRY_MAX, READINESS_TIMEOUT, notify_changed,
 };
@@ -328,6 +330,7 @@ impl MutationScheduler {
         &mut self,
         id: DrawingId,
         execution: Exec,
+        context: DocumentContextPolicy,
         reservation: ExecReservation,
         now: Instant,
     ) -> Result<Admission, Error> {
@@ -346,6 +349,7 @@ impl MutationScheduler {
             let operation = Operation::Execute {
                 id,
                 execution: Box::new(execution),
+                context,
             };
 
             let outcome = match operation.prepare(&self.drawings) {
@@ -378,6 +382,7 @@ impl MutationScheduler {
             operation: Operation::Execute {
                 id,
                 execution: Box::new(execution),
+                context,
             },
             native_target: None,
             wait: WaitState::queued(now),
@@ -589,6 +594,13 @@ pub async fn save(id: DrawingId, path: Option<acadctl_rpc::SavePath>) -> Result<
     }
 }
 
+pub async fn switch(id: DrawingId) -> Result<Drawing, Error> {
+    match submit_operation(Operation::Switch { id }).await? {
+        OperationOutcome::Drawing(drawing) => Ok(drawing),
+        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::SwitchNotPublished),
+    }
+}
+
 pub async fn close(id: DrawingId, discard: bool) -> Result<(), Error> {
     match submit_operation(Operation::Close { id, discard }).await? {
         OperationOutcome::Closed => Ok(()),
@@ -596,16 +608,31 @@ pub async fn close(id: DrawingId, discard: bool) -> Result<(), Error> {
     }
 }
 
-pub async fn undo(id: DrawingId) -> Result<Drawing, Error> {
-    history(id, HistoryDirection::Undo).await
+pub async fn undo(id: DrawingId, force: bool) -> Result<Drawing, Error> {
+    history(id, HistoryDirection::Undo, force).await
 }
 
-pub async fn redo(id: DrawingId) -> Result<Drawing, Error> {
-    history(id, HistoryDirection::Redo).await
+pub async fn redo(id: DrawingId, force: bool) -> Result<Drawing, Error> {
+    history(id, HistoryDirection::Redo, force).await
 }
 
-async fn history(id: DrawingId, direction: HistoryDirection) -> Result<Drawing, Error> {
-    match submit_operation(Operation::History { id, direction }).await? {
+async fn history(
+    id: DrawingId,
+    direction: HistoryDirection,
+    force: bool,
+) -> Result<Drawing, Error> {
+    let context = if force {
+        DocumentContextPolicy::ForceTemporary
+    } else {
+        DocumentContextPolicy::RequireActive
+    };
+    match submit_operation(Operation::History {
+        id,
+        direction,
+        context,
+    })
+    .await?
+    {
         OperationOutcome::Drawing(drawing) => Ok(drawing),
         OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::DrawingGone),
     }
@@ -615,12 +642,18 @@ pub fn admit_execution(
     id: DrawingId,
     execution: Exec,
     output: OutputStream,
+    force: bool,
     reservation: ExecReservation,
 ) -> Result<ExecAdmission, Error> {
+    let context = if force {
+        DocumentContextPolicy::ForceTemporary
+    } else {
+        DocumentContextPolicy::RequireActive
+    };
     let (job_id, receiver, should_wake, immediate) = SCHEDULER
         .lock()
         .map_err(|_| Error::SchedulerStateUnavailable)?
-        .admit_execution(id, execution, reservation, Instant::now())?;
+        .admit_execution(id, execution, context, reservation, Instant::now())?;
 
     if let Some(completion) = immediate {
         finish_completion(completion);

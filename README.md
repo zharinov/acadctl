@@ -10,11 +10,13 @@ Examples:
 
 ```sh
 $ acadctl list
-6A8436C8  *  rw  foo.dwg
-6A8491B2  .  ro  bar.dwg
+> 6A8436C8  *  rw  /path/to/foo.dwg
+  6A8491B2  .  ro  /path/to/bar.dwg
 ```
 
-`foo.dwg` (`6A8436C8`) contains unsaved changes while `bar.dwg` (`6A8491B2`) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
+`foo.dwg` (`6A8436C8`) is active and contains unsaved changes while `bar.dwg` (`6A8491B2`) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
+
+Execution requires the target drawing to be active. Use `acadctl switch TARGET` to activate it persistently, or pass `--force` to `exec`, `eval`, `undo`, or `redo` to activate it temporarily and restore the previously active drawing afterward. This temporarily steals AutoCAD's document focus and may disrupt interactive work.
 
 ```sh
 $ acadctl exec 6A8436C8 <<'LISP'
@@ -32,6 +34,7 @@ $ acadctl eval 6A8436C8 '(square 7)'
 
 - `acadctl list`: list drawings currently open in AutoCAD.
 - `acadctl open`, `acadctl save`, `acadctl close`
+- `acadctl switch`: make a drawing active.
 - `acadctl undo` and `acadctl redo`
 - `acadctl exec` and `acadctl eval` for running AutoLISP.
 - Basic utilities:

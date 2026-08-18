@@ -119,6 +119,22 @@ fn keeps_location_free_failures_concise() {
 }
 
 #[test]
+fn inactive_execution_explains_the_temporary_override() {
+    let failure = ExecFailure {
+        message: "The drawing is not active".into(),
+        form_index: None,
+        location: None,
+        drawing_outcome: DrawingOutcome::NotStarted as i32,
+        drawing_error: acadctl_rpc::DrawingErrorKind::NotActive as i32,
+    };
+
+    assert_eq!(
+        failure_message(&failure, "script.lsp", target()),
+        "Drawing 6A8436C8 is not active: use --force to activate it temporarily. Code was not run."
+    );
+}
+
+#[test]
 fn renders_readiness_timeout_as_one_line() {
     let failure = ExecFailure {
         message: "AutoCAD did not become ready within 60 seconds".into(),

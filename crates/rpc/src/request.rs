@@ -4,7 +4,7 @@ use tonic::{Code, Status};
 
 use crate::{
     CloseRequest, DrawingError, DrawingId, DrawingPath, ExecMode, ExecRequest, HistoryRequest,
-    OpenRequest, SavePath, SaveRequest, SourceName,
+    OpenRequest, SavePath, SaveRequest, SourceName, SwitchRequest,
 };
 
 impl From<DrawingPath> for OpenRequest {
@@ -24,7 +24,16 @@ impl SaveRequest {
     }
 }
 
-impl From<DrawingId> for HistoryRequest {
+impl HistoryRequest {
+    pub fn new(drawing_id: DrawingId, force: bool) -> Self {
+        Self {
+            drawing_id: drawing_id.into(),
+            force,
+        }
+    }
+}
+
+impl From<DrawingId> for SwitchRequest {
     fn from(drawing_id: DrawingId) -> Self {
         Self {
             drawing_id: drawing_id.into(),
@@ -47,12 +56,14 @@ impl ExecRequest {
         mode: ExecMode,
         source_name: SourceName,
         source: Bytes,
+        force: bool,
     ) -> Self {
         Self {
             drawing_id: drawing_id.into(),
             mode: mode as i32,
             source_name: source_name.into_string(),
             source,
+            force,
         }
     }
 }

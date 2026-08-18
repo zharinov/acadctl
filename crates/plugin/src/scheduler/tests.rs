@@ -272,6 +272,7 @@ async fn save_to_a_new_path_requires_the_published_path_and_clean_state() {
         named: true,
         modified: false,
         read_only: false,
+        active: true,
     }]);
     complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
 
@@ -304,14 +305,15 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
     reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
 
-    let undo_waiter = tokio::spawn(undo(id));
+    let undo_waiter = tokio::spawn(undo(id, false));
     tokio::task::yield_now().await;
     let undo_action = take_native_action();
     assert_eq!(undo_action.kind(), NativeActionKind::Undo);
     assert_eq!(undo_action.document_token(), 1);
     assert_eq!(undo_action.database_token(), 101);
+    assert!(!undo_action.force_document_context());
 
-    let redo_waiter = tokio::spawn(redo(id));
+    let redo_waiter = tokio::spawn(redo(id, true));
     tokio::task::yield_now().await;
     assert_eq!(take_native_action().kind(), NativeActionKind::None);
 
@@ -326,6 +328,7 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
     assert_eq!(redo_action.kind(), NativeActionKind::Redo);
     assert_eq!(redo_action.document_token(), 1);
     assert_eq!(redo_action.database_token(), 101);
+    assert!(redo_action.force_document_context());
     replace_drawing_snapshot(vec![drawing(1, 101, false)]);
     complete_native_action(
         redo_action.job_id(),
@@ -336,17 +339,39 @@ async fn drawing_history_actions_share_the_fifo_and_exact_generation() {
 }
 
 #[tokio::test]
+async fn switch_requires_native_activation_and_published_active_state() {
+    let _test = TEST_LOCK.lock().await;
+    let mut inactive = drawing(1, 101, false);
+    inactive.active = false;
+    reset(vec![inactive]);
+    let id = list().unwrap()[0].id;
+
+    let waiter = tokio::spawn(switch(id));
+    tokio::task::yield_now().await;
+    let action = take_native_action();
+    assert_eq!(action.kind(), NativeActionKind::Switch);
+    assert_eq!(action.document_token(), 1);
+    assert!(!action.force_document_context());
+
+    replace_drawing_snapshot(vec![drawing(1, 101, false)]);
+    complete_native_action(action.job_id(), result(NativeActionResultKind::Success));
+
+    assert!(waiter.await.unwrap().unwrap().active);
+    stop();
+}
+
+#[tokio::test]
 async fn drawing_history_fails_closed_on_missing_or_replaced_drawings() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
 
     assert_eq!(
-        undo("DEAD".parse().unwrap()).await,
+        undo("DEAD".parse().unwrap(), false).await,
         Err(Error::DrawingNotFound("DEAD".parse().unwrap()))
     );
 
-    let waiter = tokio::spawn(redo(id));
+    let waiter = tokio::spawn(redo(id, false));
     tokio::task::yield_now().await;
     let action = take_native_action();
     assert_eq!(action.kind(), NativeActionKind::Redo);
@@ -1271,7 +1296,8 @@ async fn detached_execution_retains_its_shared_admission_reservation() {
     let response_reservation = try_reserve_execution().unwrap();
     let (execution, output) =
         Exec::new(ExecMode::Exec, source_name("batch.lsp"), "form".into()).unwrap();
-    let admission = admit_execution(id, execution, output, response_reservation.clone()).unwrap();
+    let admission =
+        admit_execution(id, execution, output, false, response_reservation.clone()).unwrap();
     let (job_id, output, completion) = admission.into_parts();
     drop(output);
     drop(completion);
@@ -1367,7 +1393,7 @@ fn admit_test_execution(
     output: OutputStream,
 ) -> Result<ExecAdmission, Error> {
     let reservation = try_reserve_execution().ok_or(Error::ExecCapacity)?;
-    admit_execution(id, execution, output, reservation)
+    admit_execution(id, execution, output, false, reservation)
 }
 
 fn spawn_test_execution(
@@ -1413,6 +1439,7 @@ fn drawing(
         named: true,
         modified,
         read_only: false,
+        active: true,
     }
 }
 

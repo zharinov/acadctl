@@ -84,6 +84,7 @@ fn drawing_snapshot(
         named: true,
         modified,
         read_only,
+        active: true,
     }
 }
 
@@ -130,6 +131,41 @@ fn list_serializes_a_drawing_snapshot() {
         );
         assert!(listed.drawings[0].modified);
         assert!(listed.drawings[0].read_only);
+        assert!(listed.drawings[0].active);
+    });
+}
+
+#[test]
+fn switch_returns_the_published_active_drawing() {
+    let house = TestDrawingPath::new("switch-house");
+    let mut inactive = drawing_snapshot(1, 101, house.path().as_str(), false, false);
+    inactive.active = false;
+    let (test, drawing_id) = RpcTest::with_drawing(inactive);
+
+    test.block_on(async {
+        let mut client = drawing_client().await;
+        let response =
+            tokio::spawn(async move { client.switch(SwitchRequest::from(drawing_id)).await });
+        let action = next_native_action().await;
+        assert_eq!(action.kind(), crate::ffi::NativeActionKind::Switch);
+        crate::scheduler::replace_drawing_snapshot(vec![drawing_snapshot(
+            1,
+            101,
+            house.path().as_str(),
+            false,
+            false,
+        )]);
+        complete_native_action_success(&action);
+
+        let switched = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner()
+            .drawing
+            .unwrap();
+        assert_eq!(switched.id, drawing_id.into());
+        assert!(switched.active);
     });
 }
 
@@ -214,6 +250,7 @@ fn undo_routes_to_undo_and_returns_the_published_drawing() {
             client
                 .undo(HistoryRequest {
                     drawing_id: drawing_id.into(),
+                    force: false,
                 })
                 .await
         });
@@ -252,6 +289,7 @@ fn redo_routes_to_redo_and_returns_the_published_drawing() {
             client
                 .redo(HistoryRequest {
                     drawing_id: drawing_id.into(),
+                    force: false,
                 })
                 .await
         });
@@ -498,6 +536,55 @@ fn dropping_the_rpc_stream_detaches_without_cancelling_the_job() {
     });
 }
 
+#[test]
+fn execution_force_reaches_the_native_action() {
+    let (test, drawing_id) =
+        RpcTest::with_drawing(drawing_snapshot(1, 101, "/tmp/house.dwg", false, false));
+
+    test.block_on(async {
+        let mut client = execution_client().await;
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(execution_request_with_force(
+                drawing_id,
+                Bytes::from_static(b"form"),
+                true,
+            ))
+            .await
+            .unwrap();
+        let outbound = stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|message| (message, receiver))
+        });
+        let mut response = client.execute(outbound).await.unwrap().into_inner();
+        assert!(matches!(
+            response.message().await.unwrap().unwrap().event,
+            Some(exec_server_event::Event::Accepted(_))
+        ));
+
+        let action = next_native_action().await;
+        assert_eq!(action.kind(), crate::ffi::NativeActionKind::QueueExecDriver);
+        assert!(action.force_document_context());
+        assert_eq!(
+            crate::scheduler::take_execution_step(action.job_id()).kind(),
+            crate::exec::ExecStepKind::BeginUndoGroup
+        );
+        assert!(crate::scheduler::complete_execution_step(
+            action.job_id(),
+            successful_step()
+        ));
+        assert_eq!(
+            crate::scheduler::take_execution_step(action.job_id()).kind(),
+            crate::exec::ExecStepKind::EvaluateForm
+        );
+        assert_eq!(
+            crate::scheduler::cancel_execution(action.job_id()),
+            CancelResult::Accepted
+        );
+        finish_cancelled_execution(&action);
+        drop(sender);
+    });
+}
+
 async fn accept_and_cancel(
     client: &mut acadctl_rpc::ExecServiceClient<tonic::transport::Channel>,
     drawing_id: DrawingId,
@@ -590,12 +677,21 @@ fn finish_cancelled_execution(action: &crate::scheduler::NativeAction) {
 }
 
 fn execution_request(drawing_id: DrawingId, source: Bytes) -> ExecClientMessage {
+    execution_request_with_force(drawing_id, source, false)
+}
+
+fn execution_request_with_force(
+    drawing_id: DrawingId,
+    source: Bytes,
+    force: bool,
+) -> ExecClientMessage {
     ExecClientMessage {
         message: Some(exec_client_message::Message::Request(ExecRequest::new(
             drawing_id,
             RpcExecMode::Exec,
             source_name("<stdin>"),
             source,
+            force,
         ))),
     }
 }

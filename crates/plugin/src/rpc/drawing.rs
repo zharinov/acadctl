@@ -1,7 +1,7 @@
 use acadctl_rpc::{
-    CloseRequest, CloseResponse, Drawing as RpcDrawing, DrawingPathError, DrawingService,
-    HistoryRequest, HistoryResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-    SavePath, SaveRequest, SaveResponse,
+    CloseRequest, CloseResponse, Drawing as RpcDrawing, DrawingError, DrawingErrorKind,
+    DrawingPathError, DrawingService, HistoryRequest, HistoryResponse, ListRequest, ListResponse,
+    OpenRequest, OpenResponse, SavePath, SaveRequest, SaveResponse, SwitchRequest, SwitchResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -31,6 +31,19 @@ impl DrawingService for DrawingRpc {
         }))
     }
 
+    async fn switch(
+        &self,
+        request: Request<SwitchRequest>,
+    ) -> Result<Response<SwitchResponse>, Status> {
+        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
+        let drawing = crate::scheduler::switch(drawing_id)
+            .await
+            .map_err(scheduler_error)?;
+        Ok(Response::new(SwitchResponse {
+            drawing: Some(drawing.into()),
+        }))
+    }
+
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
         let request = request.into_inner();
         let drawing_id = parse_drawing_id(request.drawing_id)?;
@@ -51,10 +64,11 @@ impl DrawingService for DrawingRpc {
         &self,
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
-        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
-        let drawing = crate::scheduler::undo(drawing_id)
+        let request = request.into_inner();
+        let drawing_id = parse_drawing_id(request.drawing_id)?;
+        let drawing = crate::scheduler::undo(drawing_id, request.force)
             .await
-            .map_err(scheduler_error)?;
+            .map_err(history_error)?;
         Ok(Response::new(HistoryResponse {
             drawing: Some(drawing.into()),
         }))
@@ -64,10 +78,11 @@ impl DrawingService for DrawingRpc {
         &self,
         request: Request<HistoryRequest>,
     ) -> Result<Response<HistoryResponse>, Status> {
-        let drawing_id = parse_drawing_id(request.into_inner().drawing_id)?;
-        let drawing = crate::scheduler::redo(drawing_id)
+        let request = request.into_inner();
+        let drawing_id = parse_drawing_id(request.drawing_id)?;
+        let drawing = crate::scheduler::redo(drawing_id, request.force)
             .await
-            .map_err(scheduler_error)?;
+            .map_err(history_error)?;
         Ok(Response::new(HistoryResponse {
             drawing: Some(drawing.into()),
         }))
@@ -94,6 +109,7 @@ impl From<crate::drawing::Drawing> for RpcDrawing {
             file_path: drawing.file_path().map(|path| path.as_str().to_owned()),
             modified: drawing.modified,
             read_only: drawing.read_only,
+            active: drawing.active,
         }
     }
 }
@@ -109,4 +125,19 @@ fn drawing_path_status(error: DrawingPathError) -> Status {
         | DrawingPathError::AlreadyExists(_) => "The drawing path is invalid",
     };
     Status::invalid_argument(message)
+}
+
+fn history_error(error: crate::scheduler::Error) -> Status {
+    if matches!(
+        error,
+        crate::scheduler::Error::DocumentContextRestoreFailed(_)
+    ) {
+        DrawingError {
+            kind: DrawingErrorKind::HistoryOutcomeUnknown as i32,
+            drawing_id: None,
+        }
+        .status(tonic::Code::Internal)
+    } else {
+        scheduler_error(error)
+    }
 }

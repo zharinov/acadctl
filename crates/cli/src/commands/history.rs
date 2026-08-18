@@ -10,15 +10,23 @@ pub enum Direction {
     Redo,
 }
 
-pub async fn run(target: Target, direction: Direction) -> ExitCode {
+pub async fn run(target: Target, direction: Direction, force: bool) -> ExitCode {
     let mut client = match super::connect_drawings(target.instance_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
 
     let response = match direction {
-        Direction::Undo => client.undo(HistoryRequest::from(target.drawing_id)).await,
-        Direction::Redo => client.redo(HistoryRequest::from(target.drawing_id)).await,
+        Direction::Undo => {
+            client
+                .undo(HistoryRequest::new(target.drawing_id, force))
+                .await
+        }
+        Direction::Redo => {
+            client
+                .redo(HistoryRequest::new(target.drawing_id, force))
+                .await
+        }
     };
 
     let response = match response {

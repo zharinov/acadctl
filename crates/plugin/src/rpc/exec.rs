@@ -79,6 +79,7 @@ impl ExecService for ExecRpc {
             mode,
             source_name,
             source,
+            force,
         } = request;
 
         let validation_source_name = source_name.clone();
@@ -102,6 +103,7 @@ impl ExecService for ExecRpc {
             drawing_id,
             execution,
             output,
+            force,
             reservation.clone(),
         ) {
             Ok(admission) => admission,
@@ -318,6 +320,7 @@ struct ValidatedExecRequest {
     mode: ExecMode,
     source_name: SourceName,
     source: bytes::Bytes,
+    force: bool,
 }
 
 impl TryFrom<ExecRequest> for ValidatedExecRequest {
@@ -345,6 +348,7 @@ impl TryFrom<ExecRequest> for ValidatedExecRequest {
             mode,
             source_name,
             source: request.source,
+            force: request.force,
         })
     }
 }

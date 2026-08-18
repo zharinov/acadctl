@@ -14,8 +14,8 @@ pub(crate) use native::NativeAction;
 pub(crate) use queue::{
     CancelResult, ExecReservation, MutationJobId, admit_execution, cancel_execution, close,
     complete_execution_native_action, complete_native_action, list, open, redo,
-    replace_drawing_snapshot, save, start, stop, take_native_action, try_claim_native_action_wake,
-    try_reserve_execution, undo, wake_failed,
+    replace_drawing_snapshot, save, start, stop, switch, take_native_action,
+    try_claim_native_action_wake, try_reserve_execution, undo, wake_failed,
 };
 pub(crate) use timer::{drive_timers, native_state_may_be_ready};
 

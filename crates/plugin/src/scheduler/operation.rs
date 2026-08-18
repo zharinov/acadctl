@@ -11,6 +11,9 @@ pub(super) enum Operation {
     Open {
         path: DrawingPath,
     },
+    Switch {
+        id: DrawingId,
+    },
     Save {
         id: DrawingId,
         path: Option<SavePath>,
@@ -22,10 +25,12 @@ pub(super) enum Operation {
     History {
         id: DrawingId,
         direction: HistoryDirection,
+        context: DocumentContextPolicy,
     },
     Execute {
         id: DrawingId,
         execution: Box<Exec>,
+        context: DocumentContextPolicy,
     },
 }
 
@@ -33,6 +38,12 @@ pub(super) enum Operation {
 pub(crate) enum HistoryDirection {
     Undo,
     Redo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentContextPolicy {
+    RequireActive,
+    ForceTemporary,
 }
 
 pub(super) enum OperationOutcome {
@@ -53,6 +64,10 @@ impl Operation {
                 || Prepared::Native(NativeCommand::open(path.clone())),
                 |target| Prepared::Immediate(Ok(OperationOutcome::Drawing(target.drawing))),
             ),
+            Operation::Switch { id } => match drawings.find_by_id(*id) {
+                Some(target) => Prepared::Native(NativeCommand::switch(target.native_key)),
+                None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
+            },
             Operation::Save { id, path } => match drawings.find_by_id(*id) {
                 Some(target) => Self::prepare_save(*id, path.as_ref(), target),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
@@ -64,14 +79,22 @@ impl Operation {
                 Some(target) => Prepared::Native(NativeCommand::close(target.native_key, *discard)),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
-            Operation::History { id, direction } => match drawings.find_by_id(*id) {
+            Operation::History {
+                id,
+                direction,
+                context,
+            } => match drawings.find_by_id(*id) {
                 Some(target) => Prepared::Native(match direction {
-                    HistoryDirection::Undo => NativeCommand::undo(target.native_key),
-                    HistoryDirection::Redo => NativeCommand::redo(target.native_key),
+                    HistoryDirection::Undo => NativeCommand::undo(target.native_key, *context),
+                    HistoryDirection::Redo => NativeCommand::redo(target.native_key, *context),
                 }),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
-            Operation::Execute { id, execution } => match drawings.find_by_id(*id) {
+            Operation::Execute {
+                id,
+                execution,
+                context,
+            } => match drawings.find_by_id(*id) {
                 Some(_) if execution.outcome().is_some() => {
                     Prepared::Immediate(Ok(OperationOutcome::Exec(
                         execution
@@ -80,9 +103,10 @@ impl Operation {
                             .clone(),
                     )))
                 }
-                Some(target) => {
-                    Prepared::Native(NativeCommand::queue_exec_driver(target.native_key))
-                }
+                Some(target) => Prepared::Native(NativeCommand::queue_exec_driver(
+                    target.native_key,
+                    *context,
+                )),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
         }
@@ -124,6 +148,20 @@ impl Operation {
                 .find_by_path(path)
                 .map(|target| OperationOutcome::Drawing(target.drawing))
                 .ok_or(Error::OpenNotPublished),
+            Operation::Switch { id } => {
+                let expected = native_target.ok_or(Error::DrawingGone)?;
+                let target = drawings.find_by_id(*id).ok_or(Error::DrawingGone)?;
+
+                if target.native_key != expected {
+                    return Err(Error::DrawingGenerationChanged);
+                }
+
+                if !target.drawing.active {
+                    return Err(Error::SwitchNotPublished);
+                }
+
+                Ok(OperationOutcome::Drawing(target.drawing))
+            }
             Operation::Save { id, path } => {
                 let target = drawings
                     .find_by_id(*id)
@@ -178,7 +216,8 @@ impl Operation {
     pub(super) fn drawing_id(&self) -> Option<DrawingId> {
         match self {
             Self::Open { .. } => None,
-            Self::Save { id, .. }
+            Self::Switch { id }
+            | Self::Save { id, .. }
             | Self::Close { id, .. }
             | Self::History { id, .. }
             | Self::Execute { id, .. } => Some(*id),
@@ -258,18 +297,22 @@ impl Operation {
     fn execution(&self) -> Option<&Exec> {
         match self {
             Self::Execute { execution, .. } => Some(execution),
-            Self::Open { .. } | Self::Save { .. } | Self::Close { .. } | Self::History { .. } => {
-                None
-            }
+            Self::Open { .. }
+            | Self::Switch { .. }
+            | Self::Save { .. }
+            | Self::Close { .. }
+            | Self::History { .. } => None,
         }
     }
 
     fn execution_mut(&mut self) -> Option<&mut Exec> {
         match self {
             Self::Execute { execution, .. } => Some(execution),
-            Self::Open { .. } | Self::Save { .. } | Self::Close { .. } | Self::History { .. } => {
-                None
-            }
+            Self::Open { .. }
+            | Self::Switch { .. }
+            | Self::Save { .. }
+            | Self::Close { .. }
+            | Self::History { .. } => None,
         }
     }
 }

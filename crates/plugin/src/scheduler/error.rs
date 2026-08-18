@@ -14,6 +14,7 @@ pub enum Error {
     DrawingNotFound(DrawingId),
     DrawingGone,
     DrawingGenerationChanged,
+    NotActive(DrawingId),
     Unnamed(DrawingId),
     ReadOnly(DrawingId),
     DestinationExists(DrawingId),
@@ -21,6 +22,7 @@ pub enum Error {
     Dirty(DrawingId),
     NotDwg,
     OpenFailed(NativeFailure),
+    SwitchFailed(NativeFailure),
     SaveFailed(NativeFailure),
     CloseFailed(NativeFailure),
     HistoryFailed {
@@ -28,6 +30,7 @@ pub enum Error {
         failure: NativeFailure,
     },
     OpenNotPublished,
+    SwitchNotPublished,
     SaveNotPublished,
     CloseNotPublished,
     NotQuiescent,
@@ -61,6 +64,7 @@ impl fmt::Display for Error {
             Self::DrawingGone => formatter.write_str("The drawing is no longer open"),
             Self::DrawingGenerationChanged => formatter
                 .write_str("The drawing was replaced before AutoCAD could perform the operation"),
+            Self::NotActive(id) => write!(formatter, "Drawing '{id}' is not active."),
             Self::Unnamed(id) => write!(
                 formatter,
                 "Drawing '{id}' has no file name; use --as FILE."
@@ -78,6 +82,9 @@ impl fmt::Display for Error {
             Self::OpenFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not open the drawing")
             }
+            Self::SwitchFailed(failure) => {
+                failure.fmt_with_context(formatter, "Could not switch to the drawing")
+            }
             Self::SaveFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not save the drawing")
             }
@@ -93,6 +100,8 @@ impl fmt::Display for Error {
             ),
             Self::OpenNotPublished => formatter
                 .write_str("AutoCAD opened the drawing but did not publish its drawing state"),
+            Self::SwitchNotPublished => formatter
+                .write_str("AutoCAD switched drawings but did not publish the active drawing"),
             Self::SaveNotPublished => {
                 formatter.write_str("AutoCAD completed the save but still reports unsaved changes")
             }
@@ -163,6 +172,7 @@ impl Error {
         match self {
             Self::DrawingNotFound(_) | Self::DrawingGone => Some(DrawingErrorKind::NotOpen),
             Self::DrawingGenerationChanged => Some(DrawingErrorKind::Replaced),
+            Self::NotActive(_) => Some(DrawingErrorKind::NotActive),
             Self::Unnamed(_) => Some(DrawingErrorKind::NoFileName),
             Self::ReadOnly(_) => Some(DrawingErrorKind::ReadOnly),
             Self::DestinationExists(_) => Some(DrawingErrorKind::DestinationExists),
@@ -177,6 +187,7 @@ impl Error {
     pub const fn drawing_id(&self) -> Option<DrawingId> {
         match self {
             Self::DrawingNotFound(id)
+            | Self::NotActive(id)
             | Self::Unnamed(id)
             | Self::ReadOnly(id)
             | Self::DestinationExists(id)
@@ -192,6 +203,7 @@ impl Error {
             Self::SchedulerStateUnavailable
                 | Self::Stopped
                 | Self::OpenNotPublished
+                | Self::SwitchNotPublished
                 | Self::SaveNotPublished
                 | Self::SavePathUnavailable
                 | Self::CloseNotPublished

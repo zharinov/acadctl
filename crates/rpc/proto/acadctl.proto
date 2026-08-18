@@ -5,6 +5,7 @@ package acadctl;
 service DrawingService {
   rpc List(ListRequest) returns (ListResponse);
   rpc Open(OpenRequest) returns (OpenResponse);
+  rpc Switch(SwitchRequest) returns (SwitchResponse);
   rpc Save(SaveRequest) returns (SaveResponse);
   rpc Undo(HistoryRequest) returns (HistoryResponse);
   rpc Redo(HistoryRequest) returns (HistoryResponse);
@@ -23,6 +24,10 @@ message OpenRequest { string path = 1; }
 
 message OpenResponse { Drawing drawing = 1; }
 
+message SwitchRequest { uint32 drawing_id = 1; }
+
+message SwitchResponse { Drawing drawing = 1; }
+
 message SaveRequest {
   uint32 drawing_id = 1;
   optional string path = 2;
@@ -30,7 +35,10 @@ message SaveRequest {
 
 message SaveResponse { Drawing drawing = 1; }
 
-message HistoryRequest { uint32 drawing_id = 1; }
+message HistoryRequest {
+  uint32 drawing_id = 1;
+  bool force = 2;
+}
 
 message HistoryResponse { Drawing drawing = 1; }
 
@@ -53,6 +61,7 @@ message ExecRequest {
   ExecMode mode = 2;
   string source_name = 3;
   bytes source = 4;
+  bool force = 5;
 }
 
 enum ExecMode {
@@ -136,6 +145,8 @@ enum DrawingErrorKind {
   DRAWING_ERROR_KIND_UNDO_DISABLED = 7;
   DRAWING_ERROR_KIND_DESTINATION_EXISTS = 8;
   DRAWING_ERROR_KIND_READINESS_TIMED_OUT = 9;
+  DRAWING_ERROR_KIND_NOT_ACTIVE = 10;
+  DRAWING_ERROR_KIND_HISTORY_OUTCOME_UNKNOWN = 11;
 }
 
 message Drawing {
@@ -144,4 +155,5 @@ message Drawing {
   optional string file_path = 3;
   bool modified = 4;
   bool read_only = 5;
+  bool active = 6;
 }
