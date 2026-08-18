@@ -15,17 +15,17 @@ const ABOUT: &str = r#"Command line utility to control AutoCAD
 Examples:
 
 $ acadctl list
-6A84:36C8  *  rw  foo.dwg
-6A84:91B2  .  ro  bar.dwg
+6A8436C8  *  rw  foo.dwg
+6A8491B2  .  ro  bar.dwg
 
-`foo.dwg` (6A84:36C8) contains unsaved changes while `bar.dwg` (6A84:91B2) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
+`foo.dwg` (6A8436C8) contains unsaved changes while `bar.dwg` (6A8491B2) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
 
-$ acadctl exec 6A84:36C8 <<'LISP'
+$ acadctl exec 6A8436C8 <<'LISP'
 (defun square (x)
   (* x x))
 LISP
 
-$ acadctl eval 6A84:36C8 '(square 7)'
+$ acadctl eval 6A8436C8 '(square 7)'
 49"#;
 
 #[derive(Parser)]
@@ -55,7 +55,7 @@ enum Command {
     },
     /// Save changes.
     Save {
-        /// INSTANCE:DRAWING target shown by `acadctl list`.
+        /// Hexadecimal target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
 
@@ -65,19 +65,19 @@ enum Command {
     },
     /// Undo the previous action.
     Undo {
-        /// INSTANCE:DRAWING target shown by `acadctl list`.
+        /// Hexadecimal target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
     },
     /// Redo the previous action.
     Redo {
-        /// INSTANCE:DRAWING target shown by `acadctl list`.
+        /// Hexadecimal target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
     },
     /// Close a drawing.
     Close {
-        /// INSTANCE:DRAWING target shown by `acadctl list`.
+        /// Hexadecimal target shown by `acadctl list`.
         #[arg(value_name = "TARGET")]
         target: Target,
 
@@ -109,7 +109,7 @@ enum Command {
 
 #[derive(Args)]
 struct EvalArgs {
-    /// INSTANCE:DRAWING target shown by `acadctl list`.
+    /// Hexadecimal target shown by `acadctl list`.
     #[arg(value_name = "TARGET")]
     target: Target,
 
@@ -133,7 +133,7 @@ struct EvalArgs {
 
 #[derive(Args)]
 struct ExecArgs {
-    /// INSTANCE:DRAWING target shown by `acadctl list`.
+    /// Hexadecimal target shown by `acadctl list`.
     #[arg(value_name = "TARGET")]
     target: Target,
 
@@ -220,7 +220,9 @@ fn report_parse_error(error: clap::Error) -> ExitCode {
             let value = error_context(&error, ContextKind::InvalidValue).unwrap_or_default();
 
             if argument.contains("TARGET") {
-                eprintln!("Invalid target '{value}': expected INSTANCE:DRAWING from acadctl list.");
+                eprintln!(
+                    "Invalid target '{value}': expected 8–12 hexadecimal digits from acadctl list."
+                );
             } else if argument.contains("INSTANCE") {
                 eprintln!("Invalid instance '{value}': expected 4–8 hexadecimal digits.");
             } else {
@@ -297,7 +299,7 @@ mod tests {
         for command_name in ["eval", "exec"] {
             for source in ["-", "-1", "(+ 20 22)"] {
                 let cli =
-                    Cli::try_parse_from(["acadctl", command_name, "1234:5678", source]).unwrap();
+                    Cli::try_parse_from(["acadctl", command_name, "12345678", source]).unwrap();
 
                 let inline = match cli.command {
                     Command::Eval(arguments) => arguments.inline,
@@ -314,7 +316,7 @@ mod tests {
         for command_name in ["eval", "exec"] {
             for flag in ["-f", "--file"] {
                 let cli =
-                    Cli::try_parse_from(["acadctl", command_name, "1234:5678", flag, "script.lsp"])
+                    Cli::try_parse_from(["acadctl", command_name, "12345678", flag, "script.lsp"])
                         .unwrap();
 
                 let file = match cli.command {
@@ -332,7 +334,7 @@ mod tests {
         let result = Cli::try_parse_from([
             "acadctl",
             "exec",
-            "1234:5678",
+            "12345678",
             "(+ 20 22)",
             "-f",
             "script.lsp",

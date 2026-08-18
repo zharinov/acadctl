@@ -10,21 +10,21 @@ Examples:
 
 ```sh
 $ acadctl list
-6A84:36C8  *  rw  foo.dwg
-6A84:91B2  .  ro  bar.dwg
+6A8436C8  *  rw  foo.dwg
+6A8491B2  .  ro  bar.dwg
 ```
 
-`foo.dwg` (`6A84:36C8`) contains unsaved changes while `bar.dwg` (`6A84:91B2`) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
+`foo.dwg` (`6A8436C8`) contains unsaved changes while `bar.dwg` (`6A8491B2`) is open read-only and contains no unsaved changes. They're open in the same AutoCAD instance (6A84).
 
 ```sh
-$ acadctl exec 6A84:36C8 <<'LISP'
+$ acadctl exec 6A8436C8 <<'LISP'
 (defun square (x)
   (* x x))
 LISP
 ```
 
 ```sh
-$ acadctl eval 6A84:36C8 '(square 7)'
+$ acadctl eval 6A8436C8 '(square 7)'
 49
 ```
 

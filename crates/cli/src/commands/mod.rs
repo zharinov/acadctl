@@ -142,28 +142,28 @@ mod tests {
 
     #[test]
     fn translates_plugin_failures_with_the_complete_target() {
-        let target = "6A84:36C8".parse().unwrap();
+        let target = "6A8436C8".parse().unwrap();
 
         for (kind, expected) in [
             (
                 acadctl_rpc::DrawingErrorKind::NotOpen,
-                "Drawing 6A84:36C8 is not open.",
+                "Drawing 6A8436C8 is not open.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::ReadOnly,
-                "Drawing 6A84:36C8 is read-only.",
+                "Drawing 6A8436C8 is read-only.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::UnsavedChanges,
-                "Drawing 6A84:36C8 has unsaved changes.",
+                "Drawing 6A8436C8 has unsaved changes.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::Busy,
-                "Drawing 6A84:36C8 is busy.",
+                "Drawing 6A8436C8 is busy.",
             ),
             (
                 acadctl_rpc::DrawingErrorKind::ReadinessTimedOut,
-                "Timeout: drawing 6A84:36C8 was not saved.",
+                "Timeout: drawing 6A8436C8 was not saved.",
             ),
         ] {
             let status = acadctl_rpc::DrawingError {

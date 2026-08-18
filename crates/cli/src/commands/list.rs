@@ -85,7 +85,7 @@ fn drawing_line(
     };
 
     Ok(format!(
-        "{instance_id:0instance_id_width$X}:{drawing_id}  {modified}  {mode}  {name}"
+        "{instance_id:0instance_id_width$X}{drawing_id}  {modified}  {mode}  {name}"
     ))
 }
 
@@ -111,9 +111,9 @@ mod tests {
             render(&instances, false),
             Rendered {
                 lines: vec![
-                    "0FA5:32F3  *  rw  house.dwg",
-                    "0FA5:91B2  .  ro  house.dwg",
-                    "0FA5:A04C  .  rw  Drawing1",
+                    "0FA532F3  *  rw  house.dwg",
+                    "0FA591B2  .  ro  house.dwg",
+                    "0FA5A04C  .  rw  Drawing1",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -137,7 +137,7 @@ mod tests {
 
         assert_eq!(
             render(&instances, true).lines,
-            ["1869F:32F3  .  rw  /Users/me/Projects/House/house.dwg"]
+            ["1869F32F3  .  rw  /Users/me/Projects/House/house.dwg"]
         );
     }
 
@@ -150,7 +150,7 @@ mod tests {
 
         assert_eq!(
             render(&instances, false).lines,
-            ["00FA5:32F3  .  rw  a.dwg", "1869F:91B2  .  rw  b.dwg"]
+            ["00FA532F3  .  rw  a.dwg", "1869F91B2  .  rw  b.dwg"]
         );
     }
 
@@ -214,7 +214,7 @@ mod tests {
             ],
             false,
         );
-        assert_eq!(rendered.lines, ["007B:32F3  .  rw  a.dwg"]);
+        assert_eq!(rendered.lines, ["007B32F3  .  rw  a.dwg"]);
         assert_eq!(rendered.diagnostics, ["Timeout: plugin did not respond."]);
     }
 

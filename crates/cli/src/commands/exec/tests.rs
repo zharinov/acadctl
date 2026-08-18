@@ -10,7 +10,7 @@ use acadctl_rpc::{DrawingOutcome, ExecCancelDisposition, SourceLocation};
 use super::*;
 
 fn target() -> Target {
-    "6A84:36C8".parse().unwrap()
+    "6A8436C8".parse().unwrap()
 }
 
 struct BlockingWriter {
@@ -114,7 +114,7 @@ fn keeps_location_free_failures_concise() {
 
     assert_eq!(
         failure_message(&failure, "script.lsp", target()),
-        "Drawing 6A84:36C8 is busy. Code was not run."
+        "Drawing 6A8436C8 is busy. Code was not run."
     );
 }
 
