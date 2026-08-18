@@ -11,12 +11,15 @@ use crate::exec::output::{OutputSink, OutputStream};
 use crate::exec::{
     Exec, ExecOutcome, ExecStepResult, NativeExecStep, ValueOutputLease, bound_diagnostic,
 };
-use crate::ffi::{NativeActionResult, NativeActionResultKind, NativeExecFinalizationObservation};
+use crate::ffi::{
+    NativeActionResult, NativeActionResultKind, NativeCaptureResult, NativeCaptureResultKind,
+    NativeExecFinalizationObservation,
+};
 
 use super::error::Error;
 use super::native::{
-    NativeAction, classify_execution_finalization, native_result_requires_quarantine,
-    schedule_native_actions,
+    NativeAction, ViewportCapture, classify_execution_finalization,
+    native_result_requires_quarantine, schedule_native_actions,
 };
 use super::operation::{
     DocumentContextPolicy, HistoryDirection, Operation, OperationOutcome, Prepared,
@@ -583,28 +586,45 @@ impl MutationScheduler {
 pub async fn open(path: DrawingPath) -> Result<Drawing, Error> {
     match submit_operation(Operation::Open { path }).await? {
         OperationOutcome::Drawing(drawing) => Ok(drawing),
-        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::OpenNotPublished),
+        OperationOutcome::Closed | OperationOutcome::Capture(_) | OperationOutcome::Exec(_) => {
+            Err(Error::OpenNotPublished)
+        }
     }
 }
 
 pub async fn save(id: DrawingId, path: Option<acadctl_rpc::SavePath>) -> Result<Drawing, Error> {
     match submit_operation(Operation::Save { id, path }).await? {
         OperationOutcome::Drawing(drawing) => Ok(drawing),
-        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::SaveNotPublished),
+        OperationOutcome::Closed | OperationOutcome::Capture(_) | OperationOutcome::Exec(_) => {
+            Err(Error::SaveNotPublished)
+        }
     }
 }
 
 pub async fn switch(id: DrawingId) -> Result<Drawing, Error> {
     match submit_operation(Operation::Switch { id }).await? {
         OperationOutcome::Drawing(drawing) => Ok(drawing),
-        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::SwitchNotPublished),
+        OperationOutcome::Closed | OperationOutcome::Capture(_) | OperationOutcome::Exec(_) => {
+            Err(Error::SwitchNotPublished)
+        }
     }
 }
 
 pub async fn close(id: DrawingId, discard: bool) -> Result<(), Error> {
     match submit_operation(Operation::Close { id, discard }).await? {
         OperationOutcome::Closed => Ok(()),
-        OperationOutcome::Drawing(_) | OperationOutcome::Exec(_) => Err(Error::CloseNotPublished),
+        OperationOutcome::Drawing(_) | OperationOutcome::Capture(_) | OperationOutcome::Exec(_) => {
+            Err(Error::CloseNotPublished)
+        }
+    }
+}
+
+pub async fn capture(id: DrawingId) -> Result<ViewportCapture, Error> {
+    match submit_operation(Operation::Capture { id, capture: None }).await? {
+        OperationOutcome::Capture(capture) => Ok(capture),
+        OperationOutcome::Drawing(_) | OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(
+            Error::CaptureInvalid("capture operation completed without a frame".into()),
+        ),
     }
 }
 
@@ -634,7 +654,9 @@ async fn history(
     .await?
     {
         OperationOutcome::Drawing(drawing) => Ok(drawing),
-        OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(Error::DrawingGone),
+        OperationOutcome::Closed | OperationOutcome::Capture(_) | OperationOutcome::Exec(_) => {
+            Err(Error::DrawingGone)
+        }
     }
 }
 
@@ -693,7 +715,9 @@ impl ExecCompletion {
     pub async fn wait(self) -> Result<ExecOutcome, Error> {
         match self.receiver.await.map_err(|_| Error::Stopped)?? {
             OperationOutcome::Exec(outcome) => Ok(outcome),
-            OperationOutcome::Drawing(_) | OperationOutcome::Closed => Err(Error::ExecNotFinished),
+            OperationOutcome::Drawing(_)
+            | OperationOutcome::Closed
+            | OperationOutcome::Capture(_) => Err(Error::ExecNotFinished),
         }
     }
 }
@@ -778,6 +802,51 @@ pub fn take_native_action() -> NativeAction {
 pub fn complete_native_action(job_id: MutationJobId, result: NativeActionResult) {
     let quarantine = native_result_requires_quarantine(result.kind);
     complete_native_action_with_quarantine(job_id, result, quarantine);
+}
+
+pub fn complete_native_capture(
+    job_id: MutationJobId,
+    mut result: NativeCaptureResult,
+    pixels: &[u8],
+) {
+    bound_diagnostic(&mut result.detail);
+
+    let mut action_result = NativeActionResult {
+        kind: match result.kind {
+            NativeCaptureResultKind::Success => NativeActionResultKind::Success,
+            NativeCaptureResultKind::DrawingGone => NativeActionResultKind::DrawingGone,
+            NativeCaptureResultKind::DrawingGenerationChanged => {
+                NativeActionResultKind::DrawingGenerationChanged
+            }
+            NativeCaptureResultKind::NotActive => NativeActionResultKind::NotActive,
+            NativeCaptureResultKind::NotQuiescent => NativeActionResultKind::NotQuiescent,
+            NativeCaptureResultKind::Unavailable => NativeActionResultKind::CaptureUnavailable,
+            NativeCaptureResultKind::Invalid => NativeActionResultKind::CaptureInvalid,
+            kind => {
+                result.detail = format!("unknown native capture result ({})", kind.repr);
+                NativeActionResultKind::CaptureInvalid
+            }
+        },
+        native_status: 0,
+        native_detail: result.detail.clone(),
+    };
+
+    if result.kind == NativeCaptureResultKind::Success {
+        let recorded = SCHEDULER.lock().ok().and_then(|mut scheduler| {
+            let job = scheduler
+                .active
+                .as_mut()
+                .filter(|job| job.job_id == job_id)?;
+            Some(job.operation.record_native_capture(&result, pixels))
+        });
+
+        if let Some(Err(error)) = recorded {
+            action_result.kind = NativeActionResultKind::CaptureInvalid;
+            action_result.native_detail = error.to_string();
+        }
+    }
+
+    complete_native_action(job_id, action_result);
 }
 
 fn complete_native_action_with_quarantine(

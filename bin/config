@@ -42,6 +42,7 @@ acadctl_configure_mac() {
     esac
 
     acadctl_sdk_root=${ACAD_SDK_DIR:-"/Library/Developer/Autodesk/ObjectARX $acadctl_autocad_version"}
+    acadctl_atil_include_dir=${ACADCTL_ATIL_INCLUDE_DIR:-}
     acadctl_deployment_target=${MACOSX_DEPLOYMENT_TARGET:-14.0}
     acadctl_arch=${ARCH:-arm64}
 
@@ -56,6 +57,20 @@ acadctl_configure_mac() {
             acadctl_fail "unsupported macOS architecture '$acadctl_arch' (expected arm64 or x86_64)"
             ;;
     esac
+}
+
+acadctl_check_atil_inputs() {
+    test -n "$acadctl_atil_include_dir" || return 0
+
+    for header in Image.h RgbModel.h Size.h; do
+        test -f "$acadctl_atil_include_dir/$header" ||
+            acadctl_fail "ATIL headers not found at $acadctl_atil_include_dir"
+    done
+
+    for library in libAdImaging.dylib libAdIntImgServices.dylib; do
+        test -f "$acadctl_autocad_root/Contents/Frameworks/$library" ||
+            acadctl_fail "AutoCAD ATIL runtime not found at $acadctl_autocad_root"
+    done
 }
 
 acadctl_workspace_version() {

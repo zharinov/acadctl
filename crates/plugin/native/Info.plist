@@ -18,5 +18,7 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
+    <key>AcadctlAtilEnabled</key>
+    <false/>
 </dict>
 </plist>

@@ -5,7 +5,7 @@ use crate::exec::output::OutputSink;
 use crate::exec::{Exec, ExecOutcome, ExecStepResult, NativeExecStep, ValueOutputLease};
 
 use super::error::Error;
-use super::native::NativeCommand;
+use super::native::{NativeCommand, ViewportCapture, interpret_capture};
 
 pub(super) enum Operation {
     Open {
@@ -21,6 +21,10 @@ pub(super) enum Operation {
     Close {
         id: DrawingId,
         discard: bool,
+    },
+    Capture {
+        id: DrawingId,
+        capture: Option<ViewportCapture>,
     },
     History {
         id: DrawingId,
@@ -49,6 +53,7 @@ pub(crate) enum DocumentContextPolicy {
 pub(super) enum OperationOutcome {
     Drawing(Drawing),
     Closed,
+    Capture(ViewportCapture),
     Exec(ExecOutcome),
 }
 
@@ -77,6 +82,16 @@ impl Operation {
                     Prepared::Immediate(Err(Error::Dirty(*id)))
                 }
                 Some(target) => Prepared::Native(NativeCommand::close(target.native_key, *discard)),
+                None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
+            },
+            Operation::Capture { id, capture } => match drawings.find_by_id(*id) {
+                Some(_) if capture.is_some() => Prepared::Immediate(Err(Error::CaptureInvalid(
+                    "capture operation was dispatched more than once".into(),
+                ))),
+                Some(target) if !target.drawing.active => {
+                    Prepared::Immediate(Err(Error::NotActive(*id)))
+                }
+                Some(target) => Prepared::Native(NativeCommand::capture(target.native_key)),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
             Operation::History {
@@ -192,6 +207,19 @@ impl Operation {
 
                 Ok(OperationOutcome::Closed)
             }
+            Operation::Capture { id, capture } => {
+                let expected = native_target.ok_or(Error::DrawingGone)?;
+                let target = drawings.find_by_id(*id).ok_or(Error::DrawingGone)?;
+
+                if target.native_key != expected {
+                    return Err(Error::DrawingGenerationChanged);
+                }
+
+                capture
+                    .take()
+                    .map(OperationOutcome::Capture)
+                    .ok_or_else(|| Error::CaptureInvalid("native capture returned no frame".into()))
+            }
             Operation::History { id, .. } => {
                 let expected = native_target.ok_or(Error::DrawingGone)?;
                 let target = drawings.find_by_id(*id).ok_or(Error::DrawingGone)?;
@@ -219,6 +247,7 @@ impl Operation {
             Self::Switch { id }
             | Self::Save { id, .. }
             | Self::Close { id, .. }
+            | Self::Capture { id, .. }
             | Self::History { id, .. }
             | Self::Execute { id, .. } => Some(*id),
         }
@@ -230,6 +259,21 @@ impl Operation {
 
     pub(super) fn is_execution(&self) -> bool {
         self.execution().is_some()
+    }
+
+    pub(super) fn record_native_capture(
+        &mut self,
+        result: &crate::ffi::NativeCaptureResult,
+        pixels: &[u8],
+    ) -> Result<(), Error> {
+        let Self::Capture { id, capture } = self else {
+            return Err(Error::CaptureInvalid(
+                "native capture completed a different operation".into(),
+            ));
+        };
+
+        *capture = Some(interpret_capture(result, pixels, *id)?);
+        Ok(())
     }
 
     pub(super) fn can_wait_for_readiness(&self) -> bool {
@@ -301,6 +345,7 @@ impl Operation {
             | Self::Switch { .. }
             | Self::Save { .. }
             | Self::Close { .. }
+            | Self::Capture { .. }
             | Self::History { .. } => None,
         }
     }
@@ -312,6 +357,7 @@ impl Operation {
             | Self::Switch { .. }
             | Self::Save { .. }
             | Self::Close { .. }
+            | Self::Capture { .. }
             | Self::History { .. } => None,
         }
     }

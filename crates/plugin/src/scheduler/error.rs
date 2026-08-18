@@ -25,6 +25,8 @@ pub enum Error {
     SwitchFailed(NativeFailure),
     SaveFailed(NativeFailure),
     CloseFailed(NativeFailure),
+    CaptureUnavailable(String),
+    CaptureInvalid(String),
     HistoryFailed {
         direction: HistoryDirection,
         failure: NativeFailure,
@@ -90,6 +92,20 @@ impl fmt::Display for Error {
             }
             Self::CloseFailed(failure) => {
                 failure.fmt_with_context(formatter, "Could not close the drawing")
+            }
+            Self::CaptureUnavailable(detail) => {
+                if detail.is_empty() {
+                    formatter.write_str("The active viewport cannot be captured")
+                } else {
+                    write!(formatter, "The active viewport cannot be captured: {detail}")
+                }
+            }
+            Self::CaptureInvalid(detail) => {
+                if detail.is_empty() {
+                    formatter.write_str("AutoCAD returned an invalid viewport capture")
+                } else {
+                    write!(formatter, "AutoCAD returned an invalid viewport capture: {detail}")
+                }
             }
             Self::HistoryFailed { direction, failure } => failure.fmt_with_context(
                 formatter,
@@ -180,6 +196,8 @@ impl Error {
             Self::NotQuiescent => Some(DrawingErrorKind::Busy),
             Self::UndoDisabled => Some(DrawingErrorKind::UndoDisabled),
             Self::ReadinessTimedOut(_) => Some(DrawingErrorKind::ReadinessTimedOut),
+            Self::CaptureUnavailable(_) => Some(DrawingErrorKind::ViewportUnavailable),
+            Self::CaptureInvalid(_) => Some(DrawingErrorKind::CaptureFailed),
             _ => None,
         }
     }
@@ -207,6 +225,7 @@ impl Error {
                 | Self::SaveNotPublished
                 | Self::SavePathUnavailable
                 | Self::CloseNotPublished
+                | Self::CaptureInvalid(_)
                 | Self::DocumentContextFailed(_)
                 | Self::DocumentContextRestoreFailed(_)
                 | Self::ExecBridgeFinalizationFailed(_)

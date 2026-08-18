@@ -1,10 +1,12 @@
-use acadctl_rpc::{DrawingPath, SavePath};
+use acadctl_rpc::{DrawingId, DrawingPath, SavePath};
 
 use crate::drawing::{DrawingRegistry, NativeDocumentKey};
 use crate::exec::{ExecOutcome, ExecStepResult};
 use crate::ffi::{
-    NativeActionKind, NativeActionResult, NativeActionResultKind, NativeExecFinalizationObservation,
+    NativeActionKind, NativeActionResult, NativeActionResultKind, NativeCaptureResult,
+    NativeCaptureResultKind, NativeExecFinalizationObservation, NativePixelFormat, NativeRowOrder,
 };
+use crate::screenshot::{CapturedFrame, PixelFormat, RowOrder};
 
 use super::error::{Error, NativeFailure};
 use super::operation::{DocumentContextPolicy, Operation, OperationOutcome};
@@ -21,6 +23,7 @@ pub(super) enum NativeDrawingOperation {
     Switch,
     Save { path: Option<SavePath> },
     Close { discard: bool },
+    Capture,
     Undo { context: DocumentContextPolicy },
     Redo { context: DocumentContextPolicy },
     QueueExecDriver { context: DocumentContextPolicy },
@@ -50,6 +53,10 @@ impl NativeCommand {
 
     pub(super) fn close(target: NativeDocumentKey, discard: bool) -> Self {
         Self::drawing(target, NativeDrawingOperation::Close { discard })
+    }
+
+    pub(super) fn capture(target: NativeDocumentKey) -> Self {
+        Self::drawing(target, NativeDrawingOperation::Capture)
     }
 
     pub(super) fn undo(target: NativeDocumentKey, context: DocumentContextPolicy) -> Self {
@@ -92,10 +99,108 @@ impl NativeDrawingOperation {
             Self::Switch => NativeActionKind::Switch,
             Self::Save { .. } => NativeActionKind::Save,
             Self::Close { .. } => NativeActionKind::Close,
+            Self::Capture => NativeActionKind::Capture,
             Self::Undo { .. } => NativeActionKind::Undo,
             Self::Redo { .. } => NativeActionKind::Redo,
             Self::QueueExecDriver { .. } => NativeActionKind::QueueExecDriver,
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ViewportCapture {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) stride: usize,
+    pub(crate) pixel_format: PixelFormat,
+    pub(crate) row_order: RowOrder,
+    pub(crate) realistic_style: bool,
+    pub(crate) pixels: Vec<u8>,
+}
+
+impl ViewportCapture {
+    const MAX_DIMENSION: u32 = 16_384;
+    const MAX_BYTES: usize = 128 * 1024 * 1024;
+
+    pub(crate) fn frame(&self) -> CapturedFrame<'_> {
+        CapturedFrame {
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+            pixel_format: self.pixel_format,
+            row_order: self.row_order,
+            pixels: &self.pixels,
+        }
+    }
+
+    fn from_native(result: &NativeCaptureResult, pixels: &[u8]) -> Result<Self, Error> {
+        let pixel_format = match result.pixel_format {
+            NativePixelFormat::Bgra8 => PixelFormat::Bgra8,
+            NativePixelFormat::Bgrx8 => PixelFormat::Bgrx8,
+            _ => return Err(Error::CaptureInvalid("unknown native pixel format".into())),
+        };
+        let row_order = match result.row_order {
+            NativeRowOrder::TopDown => RowOrder::TopDown,
+            NativeRowOrder::BottomUp => RowOrder::BottomUp,
+            _ => return Err(Error::CaptureInvalid("unknown native row order".into())),
+        };
+
+        if result.width == 0
+            || result.height == 0
+            || result.width > Self::MAX_DIMENSION
+            || result.height > Self::MAX_DIMENSION
+        {
+            return Err(Error::CaptureInvalid(
+                "native capture dimensions are empty or exceed the supported limit".into(),
+            ));
+        }
+
+        let row_bytes = usize::try_from(result.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| Error::CaptureInvalid("native capture dimensions overflow".into()))?;
+        let required_bytes = usize::try_from(result.height)
+            .ok()
+            .and_then(|height| result.stride.checked_mul(height))
+            .ok_or_else(|| Error::CaptureInvalid("native capture dimensions overflow".into()))?;
+
+        if result.stride < row_bytes
+            || required_bytes > Self::MAX_BYTES
+            || pixels.len() != required_bytes
+        {
+            return Err(Error::CaptureInvalid(
+                "native capture stride or buffer length is invalid".into(),
+            ));
+        }
+
+        Ok(Self {
+            width: result.width,
+            height: result.height,
+            stride: result.stride,
+            pixel_format,
+            row_order,
+            realistic_style: result.realistic_style,
+            pixels: pixels.to_vec(),
+        })
+    }
+}
+
+pub(super) fn interpret_capture(
+    result: &NativeCaptureResult,
+    pixels: &[u8],
+    drawing_id: DrawingId,
+) -> Result<ViewportCapture, Error> {
+    match result.kind {
+        NativeCaptureResultKind::Success => ViewportCapture::from_native(result, pixels),
+        NativeCaptureResultKind::DrawingGone => Err(Error::DrawingGone),
+        NativeCaptureResultKind::DrawingGenerationChanged => Err(Error::DrawingGenerationChanged),
+        NativeCaptureResultKind::NotActive => Err(Error::NotActive(drawing_id)),
+        NativeCaptureResultKind::NotQuiescent => Err(Error::NotQuiescent),
+        NativeCaptureResultKind::Unavailable => {
+            Err(Error::CaptureUnavailable(result.detail.clone()))
+        }
+        NativeCaptureResultKind::Invalid => Err(Error::CaptureInvalid(result.detail.clone())),
+        kind => Err(Error::UnknownResult(kind.repr)),
     }
 }
 
@@ -334,6 +439,10 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
             Err(Error::ExecBridgeSymbolsClearFailed(failure))
         }
         NativeActionResultKind::ExecBridgeFailed => Err(Error::ExecBridgeFailed(failure)),
+        NativeActionResultKind::CaptureUnavailable => {
+            Err(Error::CaptureUnavailable(failure.detail))
+        }
+        NativeActionResultKind::CaptureInvalid => Err(Error::CaptureInvalid(failure.detail)),
         kind => Err(Error::UnknownResult(kind.repr)),
     }
 }

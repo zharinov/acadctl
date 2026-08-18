@@ -4,4 +4,5 @@ fn main() {
         .compile("acadctl-plugin-cxxbridge");
 
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=native/host.cpp");
 }

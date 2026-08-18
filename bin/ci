@@ -87,6 +87,7 @@ check_macos_inputs() {
         acadctl_fail "ObjectARX SDK not found at $acadctl_sdk_root"
     test -d "$acadctl_autocad_root/Contents/Frameworks" ||
         acadctl_fail "AutoCAD not found at $acadctl_autocad_root"
+    acadctl_check_atil_inputs
 }
 
 check_artifacts_exist() {
@@ -106,12 +107,24 @@ check_artifacts_current() {
     fi
 }
 
+check_artifact_capture_mode() {
+    artifact_atil_enabled=$(plutil -extract AcadctlAtilEnabled raw \
+        "$plugin/Contents/Info.plist")
+    expected_atil_enabled=false
+    if test -n "$acadctl_atil_include_dir"; then
+        expected_atil_enabled=true
+    fi
+
+    test "$artifact_atil_enabled" = "$expected_atil_enabled" ||
+        acadctl_fail "build artifact ATIL mode does not match ACADCTL_ATIL_INCLUDE_DIR; rebuild with the same environment before 'bin/ci'"
+}
+
 check_entry_point() {
     nm -gU "$executable" | grep -q ' _acrxEntryPoint$'
 }
 
 run_native_analysis() {
-    clang-tidy --quiet \
+    set -- clang-tidy --quiet \
         crates/plugin/native/entry.cpp \
         crates/plugin/native/host.cpp \
         -- \
@@ -141,6 +154,12 @@ run_native_analysis() {
         -Werror \
         -isystem "$acadctl_sdk_root/inc" \
         -isystem "$rust_target/cxxbridge"
+
+    if test -n "$acadctl_atil_include_dir"; then
+        set -- "$@" -DACADCTL_HAS_ATIL -isystem "$acadctl_atil_include_dir"
+    fi
+
+    "$@"
 }
 
 run_macos_checks() {
@@ -150,6 +169,7 @@ run_macos_checks() {
     check_macos_inputs
     check_artifacts_exist
     check_artifacts_current
+    check_artifact_capture_mode
 
     run_step "AutoCAD architecture" lipo \
         "$acadctl_autocad_root/Contents/Frameworks/libacdb.dylib" \

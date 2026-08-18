@@ -50,6 +50,7 @@ cxx = "1.0.199"
 cxx-build = "1.0.199"
 futures-util = "0.3.34"
 hyper-util = { version = "0.1.20", features = ["tokio"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 libc = "0.2.183"
 nanoid = "0.5.0"
 objc2 = "0.6.4"
@@ -57,7 +58,10 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRu
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSPathUtilities", "NSString", "alloc"] }
 prost = "0.14.4"
 protoc-bin-vendored = "3.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"

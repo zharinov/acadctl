@@ -1,13 +1,16 @@
 use acadctl_rpc::{
     CloseRequest, CloseResponse, Drawing as RpcDrawing, DrawingError, DrawingErrorKind,
     DrawingPathError, DrawingService, HistoryRequest, HistoryResponse, ListRequest, ListResponse,
-    OpenRequest, OpenResponse, SavePath, SaveRequest, SaveResponse, SwitchRequest, SwitchResponse,
+    OpenRequest, OpenResponse, SavePath, SaveRequest, SaveResponse, ScreenshotRequest,
+    ScreenshotResponse, SwitchRequest, SwitchResponse,
 };
 use tonic::{Request, Response, Status};
 
 use super::status::{parse_drawing_id, scheduler_error};
 
 pub(super) struct DrawingRpc;
+
+static SCREENSHOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tonic::async_trait]
 impl DrawingService for DrawingRpc {
@@ -99,6 +102,63 @@ impl DrawingService for DrawingRpc {
             .map_err(scheduler_error)?;
         Ok(Response::new(CloseResponse {}))
     }
+
+    async fn screenshot(
+        &self,
+        request: Request<ScreenshotRequest>,
+    ) -> Result<Response<ScreenshotResponse>, Status> {
+        let request = request.into_inner();
+        let drawing_id = parse_drawing_id(request.drawing_id)?;
+        let crop = request
+            .crop
+            .map_or(crate::screenshot::NormalizedCrop::FULL, |crop| {
+                crate::screenshot::NormalizedCrop {
+                    left: crop.left,
+                    top: crop.top,
+                    right: crop.right,
+                    bottom: crop.bottom,
+                }
+            });
+        crop.validate().map_err(|_| {
+            Status::invalid_argument("Crop edges must be finite, ordered, and between zero and one")
+        })?;
+        let screenshot = SCREENSHOT.lock().await;
+        let capture = crate::scheduler::capture(drawing_id)
+            .await
+            .map_err(scheduler_error)?;
+        let realistic_style = capture.realistic_style;
+        let encoded = tokio::task::spawn_blocking(move || {
+            let _screenshot = screenshot;
+            crate::screenshot::encode_png(capture.frame(), crop)
+        })
+        .await
+        .map_err(|_| Status::internal("The viewport image processor stopped unexpectedly"))?
+        .map_err(|error| {
+            if matches!(error, crate::screenshot::ScreenshotError::InvalidCrop) {
+                Status::invalid_argument(
+                    "Crop edges must be finite, ordered, and between zero and one",
+                )
+            } else {
+                Status::internal("The viewport image could not be processed")
+            }
+        })?;
+
+        let warnings = if realistic_style {
+            vec![
+                "Realistic visual style may capture only the viewport background on some drawings."
+                    .into(),
+            ]
+        } else {
+            vec![]
+        };
+
+        Ok(Response::new(ScreenshotResponse {
+            png: encoded.png,
+            width: encoded.width,
+            height: encoded.height,
+            warnings,
+        }))
+    }
 }
 
 impl From<crate::drawing::Drawing> for RpcDrawing {
@@ -135,6 +195,7 @@ fn history_error(error: crate::scheduler::Error) -> Status {
         DrawingError {
             kind: DrawingErrorKind::HistoryOutcomeUnknown as i32,
             drawing_id: None,
+            detail: String::new(),
         }
         .status(tonic::Code::Internal)
     } else {

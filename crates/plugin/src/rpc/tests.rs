@@ -338,6 +338,7 @@ fn close_reports_typed_unsaved_changes() {
             Some(DrawingError {
                 kind: DrawingErrorKind::UnsavedChanges as i32,
                 drawing_id: Some(drawing_id.into()),
+                detail: String::new(),
             })
         );
     });

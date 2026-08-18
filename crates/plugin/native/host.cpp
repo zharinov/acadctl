@@ -6,11 +6,22 @@
 #include "acedCmdNF.h"
 #include "acedads.h"
 #include "acestext.h"
+#include "acgs.h"
 #include "acutads.h"
 #include "adscodes.h"
 #include "dbhandle.h"
 #include "dbmain.h"
+#include "gs.h"
 #include "rxregsvc.h"
+#ifdef ACADCTL_HAS_ATIL
+#include "Image.h"
+#include "RgbModel.h"
+#include "Size.h"
+#include "acutmem.h"
+#include "dbobjptr.h"
+#include "dbvisualstyle.h"
+#include "dbxutil.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -49,7 +60,12 @@ const ACHAR kErrorSymbol[] = ACRX_T("actl:*bridge-error*");
 const ACHAR kErrnoSymbol[] = ACRX_T("actl:*bridge-errno*");
 const ACHAR kValueSymbol[] = ACRX_T("actl:*bridge-value*");
 const ACHAR kPendingStatus[] = ACRX_T("pending");
+#ifdef ACADCTL_HAS_ATIL
+const ACHAR kRealisticVisualStyle[] = ACRX_T("Realistic");
+#endif
 constexpr std::size_t kValueChunkCaptureUnits = 4096;
+constexpr int kMaximumCaptureDimension = 16384;
+constexpr std::size_t kMaximumCaptureBytes = std::size_t{128} * 1024 * 1024;
 
 class NativeActionCallbackLease final {
 public:
@@ -135,6 +151,14 @@ acadctl::NativeActionResult nativeFailure(acadctl::NativeActionResultKind kind,
 acadctl::NativeActionResult bridgeFailure(acadctl::NativeActionResultKind kind,
                                           int status);
 
+struct ViewportCaptureResult {
+  acadctl::NativeCaptureResult metadata;
+  std::vector<std::uint8_t> pixels;
+};
+
+ViewportCaptureResult captureResult(acadctl::NativeCaptureResultKind kind,
+                                    const char* detail = "");
+
 int acadctlAdvanceExecution() noexcept;
 int acadctlOutputEvent() noexcept;
 int undefineLispFunctions();
@@ -169,6 +193,8 @@ private:
   acadctl::NativeActionResult save(AcApDocument* document, rust::Str path);
 
   acadctl::NativeActionResult close(AcApDocument* document, bool discard);
+
+  ViewportCaptureResult capture(AcApDocument* document);
 
   bool queueDocumentContextDispatch(const acadctl::NativeAction& action,
                                     acadctl::NativeActionResult& failure);
@@ -383,6 +409,13 @@ acadctl::NativeActionResult nativeFailure(acadctl::NativeActionResultKind kind,
 acadctl::NativeActionResult bridgeFailure(acadctl::NativeActionResultKind kind,
                                           int status) {
   return {kind, status, rust::String()};
+}
+
+ViewportCaptureResult captureResult(acadctl::NativeCaptureResultKind kind,
+                                    const char* detail) {
+  return {{kind, 0, 0, 0, acadctl::NativePixelFormat::Invalid,
+           acadctl::NativeRowOrder::Invalid, false, rust::String(detail)},
+          {}};
 }
 
 acadctl::NativeExecStepResult stepSuccess() {
@@ -778,6 +811,33 @@ bool getIntegerSystemVariable(const ACHAR* name, int& value, int& status) {
   return true;
 }
 
+#ifdef ACADCTL_HAS_ATIL
+bool isRealisticVisualStyle() {
+  const AcDbObjectId visualStyleId = acdbGetViewportVisualStyle();
+  AcDbObjectPointer<AcDbVisualStyle> visualStyle(visualStyleId, AcDb::kForRead);
+  if (visualStyle.openStatus() == Acad::eOk &&
+      visualStyle->type() == AcGiVisualStyle::kRealistic) {
+    return true;
+  }
+
+  resbuf result{};
+  if (acedGetVar(ACRX_T("VSCURRENT"), &result) != RTNORM ||
+      result.restype != RTSTR || !result.resval.rstring) {
+    return false;
+  }
+
+  const std::size_t expectedLength =
+      std::char_traits<ACHAR>::length(kRealisticVisualStyle);
+  const bool realistic =
+      std::char_traits<ACHAR>::length(result.resval.rstring) ==
+          expectedLength &&
+      std::char_traits<ACHAR>::compare(
+          result.resval.rstring, kRealisticVisualStyle, expectedLength) == 0;
+  acutDelString(result.resval.rstring);
+  return realistic;
+}
+#endif
+
 UndoGroupState observeUndoGroup(int& status) {
   int undoControl = 0;
 
@@ -1169,6 +1229,25 @@ void ObjectArxBridge::processNextAction() {
     }
 
     break;
+  case acadctl::NativeActionKind::Capture: {
+    ViewportCaptureResult captured =
+        captureResult(acadctl::NativeCaptureResultKind::DrawingGone);
+    if (AcApDocument* target = document(action->document_token())) {
+      captured =
+          matchesDatabase(target, action->database_token())
+              ? capture(target)
+              : captureResult(
+                    acadctl::NativeCaptureResultKind::DrawingGenerationChanged);
+    }
+
+    refreshDocumentSnapshot();
+    const rust::Slice<const std::uint8_t> pixels(captured.pixels.data(),
+                                                 captured.pixels.size());
+    acadctl::complete_native_capture(action->job_id(),
+                                     std::move(captured.metadata), pixels);
+    scheduleNextNativeAction();
+    return;
+  }
   case acadctl::NativeActionKind::Undo:
   case acadctl::NativeActionKind::Redo:
   case acadctl::NativeActionKind::QueueExecDriver:
@@ -1247,6 +1326,166 @@ bool ObjectArxBridge::applicationContextBlocked(AcApDocument* target) const {
 
   return target && target != active &&
          (!target->isQuiescent() || acDocManager->inputPending(target) > 0);
+}
+
+ViewportCaptureResult ObjectArxBridge::capture(AcApDocument* document) {
+  if (applicationContextBlocked(document)) {
+    return captureResult(acadctl::NativeCaptureResultKind::NotQuiescent);
+  }
+
+  if (document != acDocManager->mdiActiveDocument()) {
+    return captureResult(acadctl::NativeCaptureResultKind::NotActive);
+  }
+
+  int viewport = 0;
+  int viewportStatus = RTERROR;
+  if (!getIntegerSystemVariable(ACRX_T("CVPORT"), viewport, viewportStatus) ||
+      viewport <= 0) {
+    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                         "the active viewport number is unavailable");
+  }
+
+  AcGsView* const view = acgsGetCurrent3dAcGsView(viewport);
+  if (view) {
+#ifdef ACADCTL_HAS_ATIL
+    int left = 0;
+    int bottom = 0;
+    int right = 0;
+    int top = 0;
+    if (!acgsGetViewportInfo(viewport, left, bottom, right, top)) {
+      return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                           "the active viewport bounds are unavailable");
+    }
+
+    const std::int64_t widthValue =
+        static_cast<std::int64_t>(right) - static_cast<std::int64_t>(left);
+    const std::int64_t heightValue =
+        static_cast<std::int64_t>(top) - static_cast<std::int64_t>(bottom);
+    if (widthValue <= 0 || heightValue <= 0) {
+      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                           "the active viewport dimensions are invalid");
+    }
+    if (widthValue > kMaximumCaptureDimension ||
+        heightValue > kMaximumCaptureDimension) {
+      return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                           "the active viewport is too large; resize the "
+                           "AutoCAD window and retry");
+    }
+
+    const int width = static_cast<int>(widthValue);
+    const int height = static_cast<int>(heightValue);
+    const int stride =
+        Atil::DataModel::bytesPerRow(width, Atil::DataModelAttributes::k32);
+    if (stride < width * 4) {
+      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                           "ATIL returned an invalid capture stride");
+    }
+
+    const std::size_t byteCount =
+        static_cast<std::size_t>(stride) * static_cast<std::size_t>(height);
+    if (byteCount == 0 ||
+        byteCount > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                           "the active viewport capture dimensions overflow");
+    }
+    if (byteCount > kMaximumCaptureBytes) {
+      return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                           "the active viewport is too large; resize the "
+                           "AutoCAD window and retry");
+    }
+
+    ViewportCaptureResult captured =
+        captureResult(acadctl::NativeCaptureResultKind::Success);
+    try {
+      captured.pixels.resize(byteCount);
+      Atil::RgbModel model(Atil::RgbModelAttributes::k4Channels,
+                           Atil::DataModelAttributes::kBlueGreenRedAlpha);
+      const Atil::Size size(width, height);
+      Atil::Image image(captured.pixels.data(), static_cast<int>(byteCount),
+                        stride, size, &model);
+      view->getSnapShot(&image, AcGsDCPoint(0, 0));
+    } catch (...) {
+      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                           "ATIL could not capture the active viewport");
+    }
+
+    captured.metadata.width = static_cast<std::uint32_t>(width);
+    captured.metadata.height = static_cast<std::uint32_t>(height);
+    captured.metadata.stride = static_cast<std::size_t>(stride);
+    captured.metadata.pixel_format = acadctl::NativePixelFormat::Bgra8;
+    captured.metadata.row_order = acadctl::NativeRowOrder::BottomUp;
+    captured.metadata.realistic_style = isRealisticVisualStyle();
+    return captured;
+#else
+    return captureResult(
+        acadctl::NativeCaptureResultKind::Unavailable,
+        "3D viewport capture requires official ATIL headers at build time");
+#endif
+  }
+
+  std::unique_ptr<AcGsScreenShot> screenShot(acgsGetScreenShot(viewport));
+  if (!screenShot) {
+    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                         "AutoCAD did not provide a 2D viewport capture");
+  }
+
+  int width = 0;
+  int height = 0;
+  int depth = 0;
+  if (!screenShot->getSize(width, height, depth)) {
+    return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                         "AutoCAD returned invalid 2D capture metadata");
+  }
+
+  if (width <= 0 || height <= 0 || depth != 32) {
+    return captureResult(
+        acadctl::NativeCaptureResultKind::Invalid,
+        "the 2D capture dimensions or pixel depth are invalid");
+  }
+  if (width > kMaximumCaptureDimension || height > kMaximumCaptureDimension) {
+    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                         "the active viewport is too large; resize the AutoCAD "
+                         "window and retry");
+  }
+
+  const std::size_t stride = static_cast<std::size_t>(width) * 4;
+  const std::size_t byteCount = stride * static_cast<std::size_t>(height);
+  if (byteCount == 0) {
+    return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                         "the 2D viewport capture dimensions overflow");
+  }
+  if (byteCount > kMaximumCaptureBytes) {
+    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                         "the active viewport is too large; resize the AutoCAD "
+                         "window and retry");
+  }
+
+  ViewportCaptureResult captured =
+      captureResult(acadctl::NativeCaptureResultKind::Success);
+  try {
+    captured.pixels.resize(byteCount);
+  } catch (...) {
+    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                         "memory for the 2D viewport capture is unavailable");
+  }
+
+  for (int row = 0; row < height; ++row) {
+    const void* const scanline = screenShot->getScanline(0, row);
+    if (!scanline) {
+      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                           "AutoCAD returned an invalid 2D capture scanline");
+    }
+
+    std::memcpy(captured.pixels.data() + static_cast<std::size_t>(row) * stride,
+                scanline, stride);
+  }
+
+  captured.metadata.width = static_cast<std::uint32_t>(width);
+  captured.metadata.height = static_cast<std::uint32_t>(height);
+  captured.metadata.stride = stride;
+  captured.metadata.pixel_format = acadctl::NativePixelFormat::Bgrx8;
+  captured.metadata.row_order = acadctl::NativeRowOrder::TopDown;
+  return captured;
 }
 
 acadctl::NativeActionResult ObjectArxBridge::open(rust::Str path) {

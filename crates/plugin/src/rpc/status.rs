@@ -17,9 +17,14 @@ pub(super) fn scheduler_error(error: SchedulerError) -> Status {
     };
 
     if let Some(kind) = error.drawing_error_kind() {
+        let detail = match &error {
+            SchedulerError::CaptureUnavailable(detail) => detail.clone(),
+            _ => String::new(),
+        };
         DrawingError {
             kind: kind as i32,
             drawing_id: error.drawing_id().map(Into::into),
+            detail,
         }
         .status(code)
     } else {
@@ -44,6 +49,7 @@ mod tests {
             Some(DrawingError {
                 kind: DrawingErrorKind::ReadinessTimedOut as i32,
                 drawing_id: Some(id.into()),
+                detail: String::new(),
             })
         );
     }

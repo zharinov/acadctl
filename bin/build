@@ -75,6 +75,10 @@ assemble_bundle() {
         "$build_plugin/Contents/Info.plist"
     plutil -replace CFBundleVersion -string "$package_version" \
         "$build_plugin/Contents/Info.plist"
+    if test -n "$acadctl_atil_include_dir"; then
+        plutil -replace AcadctlAtilEnabled -bool true \
+            "$build_plugin/Contents/Info.plist"
+    fi
     sed \
         -e "s/AppVersion=\"[^\"]*\"/AppVersion=\"$package_version\"/" \
         -e "s/SeriesMin=\"[^\"]*\"/SeriesMin=\"$autocad_series\"/" \
@@ -86,7 +90,7 @@ assemble_bundle() {
 }
 
 build_native_plugin() {
-    clang++ \
+    set -- clang++ \
         -std=c++17 \
         -arch "$acadctl_arch" \
         -mmacosx-version-min="$acadctl_deployment_target" \
@@ -94,17 +98,31 @@ build_native_plugin() {
         -isystem "$acadctl_sdk_root/inc" \
         -isystem "$rust_target/cxxbridge" \
         -L"$acadctl_autocad_root/Contents/Frameworks" \
-        -F"$acadctl_autocad_root/Contents/Frameworks" \
+        -F"$acadctl_autocad_root/Contents/Frameworks"
+
+    if test -n "$acadctl_atil_include_dir"; then
+        set -- "$@" -DACADCTL_HAS_ATIL -isystem "$acadctl_atil_include_dir"
+    fi
+
+    set -- "$@" \
         "$repo_root/crates/plugin/native/entry.cpp" \
         "$repo_root/crates/plugin/native/host.cpp" \
         "$rust_target/$acadctl_rust_target/$cargo_profile/libacadctl_plugin.a" \
         -lacfirst \
         -lacdb \
         -laccore \
-        -lAcPal \
+        -lAcPal
+
+    if test -n "$acadctl_atil_include_dir"; then
+        set -- "$@" -lAdImaging -lAdIntImgServices
+    fi
+
+    set -- "$@" \
         -framework Foundation \
         -lobjc \
         -o "$build_executable"
+
+    "$@"
 }
 
 publish_artifacts() {
@@ -126,6 +144,7 @@ main() {
     test "$#" -le 1 || usage
     select_profile "${1:-}"
     acadctl_configure
+    acadctl_check_atil_inputs
     configure_paths
     acquire_build_lock
     acadctl_trap_cleanup

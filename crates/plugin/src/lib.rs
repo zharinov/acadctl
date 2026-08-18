@@ -18,6 +18,7 @@ mod ffi {
         Switch,
         Save,
         Close,
+        Capture,
         Undo,
         Redo,
         QueueExecDriver,
@@ -46,6 +47,36 @@ mod ffi {
         ExecBridgeFinalizationFailed,
         ExecBridgeSymbolsClearFailed,
         ExecBridgeFailed,
+        CaptureUnavailable,
+        CaptureInvalid,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeCaptureResultKind {
+        Success,
+        DrawingGone,
+        DrawingGenerationChanged,
+        NotActive,
+        NotQuiescent,
+        Unavailable,
+        Invalid,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativePixelFormat {
+        Invalid,
+        Bgra8,
+        Bgrx8,
+    }
+
+    #[derive(Debug)]
+    #[repr(u8)]
+    enum NativeRowOrder {
+        Invalid,
+        TopDown,
+        BottomUp,
     }
 
     #[derive(Debug)]
@@ -107,6 +138,17 @@ mod ffi {
         kind: NativeActionResultKind,
         native_status: i32,
         native_detail: String,
+    }
+
+    struct NativeCaptureResult {
+        kind: NativeCaptureResultKind,
+        width: u32,
+        height: u32,
+        stride: usize,
+        pixel_format: NativePixelFormat,
+        row_order: NativeRowOrder,
+        realistic_style: bool,
+        detail: String,
     }
 
     struct NativeExecStepResult {
@@ -185,6 +227,8 @@ mod ffi {
 
         fn complete_native_action(job_id: u64, result: NativeActionResult);
 
+        fn complete_native_capture(job_id: u64, result: NativeCaptureResult, pixels: &[u8]);
+
         fn complete_execution_native_action(
             job_id: u64,
             result: NativeActionResult,
@@ -259,6 +303,7 @@ mod drawing;
 mod exec;
 mod rpc;
 mod scheduler;
+pub(crate) mod screenshot;
 
 use exec::NativeExecStep;
 use exec::lisp::{LispObservation, LispStatus, NativeDiagnostic};
@@ -279,6 +324,10 @@ fn take_native_action() -> Box<NativeAction> {
 
 fn complete_native_action(job_id: u64, result: ffi::NativeActionResult) {
     scheduler::complete_native_action(job_id, result);
+}
+
+fn complete_native_capture(job_id: u64, result: ffi::NativeCaptureResult, pixels: &[u8]) {
+    scheduler::complete_native_capture(job_id, result, pixels);
 }
 
 fn complete_execution_native_action(

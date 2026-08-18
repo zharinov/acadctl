@@ -10,6 +10,7 @@ service DrawingService {
   rpc Undo(HistoryRequest) returns (HistoryResponse);
   rpc Redo(HistoryRequest) returns (HistoryResponse);
   rpc Close(CloseRequest) returns (CloseResponse);
+  rpc Screenshot(ScreenshotRequest) returns (ScreenshotResponse);
 }
 
 service ExecService {
@@ -48,6 +49,25 @@ message CloseRequest {
 }
 
 message CloseResponse {}
+
+message ScreenshotRequest {
+  uint32 drawing_id = 1;
+  optional ScreenshotCrop crop = 2;
+}
+
+message ScreenshotCrop {
+  double left = 1;
+  double top = 2;
+  double right = 3;
+  double bottom = 4;
+}
+
+message ScreenshotResponse {
+  bytes png = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  repeated string warnings = 4;
+}
 
 message ExecClientMessage {
   oneof message {
@@ -132,6 +152,7 @@ enum DrawingOutcome {
 message DrawingError {
   DrawingErrorKind kind = 1;
   optional uint32 drawing_id = 2;
+  string detail = 3;
 }
 
 enum DrawingErrorKind {
@@ -147,6 +168,8 @@ enum DrawingErrorKind {
   DRAWING_ERROR_KIND_READINESS_TIMED_OUT = 9;
   DRAWING_ERROR_KIND_NOT_ACTIVE = 10;
   DRAWING_ERROR_KIND_HISTORY_OUTCOME_UNKNOWN = 11;
+  DRAWING_ERROR_KIND_VIEWPORT_UNAVAILABLE = 12;
+  DRAWING_ERROR_KIND_CAPTURE_FAILED = 13;
 }
 
 message Drawing {

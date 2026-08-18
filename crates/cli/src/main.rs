@@ -95,6 +95,8 @@ enum Command {
         #[arg(long)]
         discard: bool,
     },
+    /// Capture the active graphics viewport.
+    Screenshot(ScreenshotArgs),
     /// Evaluate an AutoLISP expression.
     Eval(EvalArgs),
     /// Execute an AutoLISP script.
@@ -173,6 +175,21 @@ struct ExecArgs {
     file: Option<PathBuf>,
 }
 
+#[derive(Args)]
+struct ScreenshotArgs {
+    /// Hexadecimal target shown by `acadctl list`. The drawing must be active.
+    #[arg(value_name = "TARGET")]
+    target: Target,
+
+    /// Normalized viewport edges with a top-left origin.
+    #[arg(long, value_name = "LEFT,TOP,RIGHT,BOTTOM")]
+    crop: Option<commands::screenshot::Crop>,
+
+    /// Exact PNG file or an existing directory. Uses managed temporary storage when omitted.
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
 fn source_spec(inline: Option<String>, file: Option<PathBuf>) -> source::SourceSpec {
     match (inline, file) {
         (Some(source), None) => source::SourceSpec::CommandLine(source),
@@ -201,6 +218,9 @@ async fn main() -> ExitCode {
             commands::history::run(target, commands::history::Direction::Redo, force).await
         }
         Command::Close { target, discard } => commands::close::run(target, discard).await,
+        Command::Screenshot(arguments) => {
+            commands::screenshot::run(arguments.target, arguments.crop, arguments.output).await
+        }
         Command::Eval(arguments) => {
             commands::exec::run(
                 arguments.target,

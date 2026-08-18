@@ -5,6 +5,7 @@ pub mod list;
 pub mod open;
 pub mod quit;
 pub mod save;
+pub mod screenshot;
 pub mod switch;
 pub(crate) mod target;
 
@@ -24,6 +25,8 @@ enum RequestOperation {
     Switch,
     Save,
     Close,
+    Screenshot,
+    Execute,
     Undo,
     Redo,
 }
@@ -73,14 +76,19 @@ fn request_error_message(
         }
 
         if let Some(target) = target {
-            return drawing_error_message(kind, target);
+            return drawing_error_message(operation, kind, target, &error.detail);
         }
     }
 
     operation.failure_message(target)
 }
 
-fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) -> String {
+fn drawing_error_message(
+    operation: RequestOperation,
+    kind: acadctl_rpc::DrawingErrorKind,
+    target: Target,
+    detail: &str,
+) -> String {
     use acadctl_rpc::DrawingErrorKind;
 
     match kind {
@@ -89,6 +97,9 @@ fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) ->
             format!("Drawing {target} changed before the operation.")
         }
         DrawingErrorKind::ReadOnly => format!("Drawing {target} is read-only."),
+        DrawingErrorKind::NotActive if matches!(operation, RequestOperation::Screenshot) => {
+            format!("Drawing {target} is not active: use acadctl switch {target} first.")
+        }
         DrawingErrorKind::NotActive => {
             format!("Drawing {target} is not active: use --force to activate it temporarily.")
         }
@@ -105,6 +116,15 @@ fn drawing_error_message(kind: acadctl_rpc::DrawingErrorKind, target: Target) ->
         DrawingErrorKind::HistoryOutcomeUnknown => {
             unreachable!("unknown history outcomes require operation context")
         }
+        DrawingErrorKind::ViewportUnavailable if detail.is_empty() => {
+            format!("The active viewport for drawing {target} is unavailable.")
+        }
+        DrawingErrorKind::ViewportUnavailable => {
+            format!("The active viewport for drawing {target} is unavailable: {detail}.")
+        }
+        DrawingErrorKind::CaptureFailed => {
+            format!("The active viewport for drawing {target} could not be captured.")
+        }
         DrawingErrorKind::Unspecified => {
             unreachable!("unspecified drawing errors are not rendered")
         }
@@ -118,6 +138,10 @@ impl RequestOperation {
             (Self::Switch, Some(target)) => format!("Drawing {target} was not activated."),
             (Self::Save, Some(target)) => format!("Drawing {target} was not saved."),
             (Self::Close, Some(target)) => format!("Drawing {target} was not closed."),
+            (Self::Screenshot, Some(target)) => {
+                format!("Drawing {target} was not captured.")
+            }
+            (Self::Execute, Some(target)) => format!("Code was not run in drawing {target}."),
             (Self::Undo, Some(target)) => format!("Undo was not run for drawing {target}."),
             (Self::Redo, Some(target)) => format!("Redo was not run for drawing {target}."),
             _ => "Operation failed.".into(),
@@ -132,6 +156,12 @@ impl RequestOperation {
             }
             (Self::Save, Some(target)) => format!("Timeout: drawing {target} was not saved."),
             (Self::Close, Some(target)) => format!("Timeout: drawing {target} was not closed."),
+            (Self::Screenshot, Some(target)) => {
+                format!("Timeout: drawing {target} was not captured.")
+            }
+            (Self::Execute, Some(target)) => {
+                format!("Timeout: code was not run in drawing {target}.")
+            }
             (Self::Undo, Some(target)) => {
                 format!("Timeout: undo was not run for drawing {target}.")
             }
@@ -201,6 +231,7 @@ mod tests {
             let status = acadctl_rpc::DrawingError {
                 kind: kind as i32,
                 drawing_id: Some(0x36C8),
+                detail: String::new(),
             }
             .status(Code::FailedPrecondition);
 
@@ -216,6 +247,7 @@ mod tests {
         let status = acadctl_rpc::DrawingError {
             kind: acadctl_rpc::DrawingErrorKind::ReadinessTimedOut as i32,
             drawing_id: None,
+            detail: String::new(),
         }
         .status(Code::DeadlineExceeded);
 
@@ -231,12 +263,29 @@ mod tests {
         let status = acadctl_rpc::DrawingError {
             kind: acadctl_rpc::DrawingErrorKind::HistoryOutcomeUnknown as i32,
             drawing_id: None,
+            detail: String::new(),
         }
         .status(Code::Internal);
 
         assert_eq!(
             request_error_message(RequestOperation::Undo, Some(target), status),
             "Undo may have run for drawing 6A8436C8: document focus could not be restored. Restart AutoCAD before another mutation; do not retry blindly."
+        );
+    }
+
+    #[test]
+    fn preserves_actionable_viewport_guidance() {
+        let target = "6A8436C8".parse().unwrap();
+        let status = acadctl_rpc::DrawingError {
+            kind: acadctl_rpc::DrawingErrorKind::ViewportUnavailable as i32,
+            drawing_id: Some(0x36C8),
+            detail: "3D viewport capture requires official ATIL headers at build time".into(),
+        }
+        .status(Code::FailedPrecondition);
+
+        assert_eq!(
+            request_error_message(RequestOperation::Screenshot, Some(target), status),
+            "The active viewport for drawing 6A8436C8 is unavailable: 3D viewport capture requires official ATIL headers at build time."
         );
     }
 

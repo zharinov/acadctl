@@ -23,8 +23,9 @@ pub use protocol::{
     ExecAccepted, ExecCancelAcknowledgement, ExecCancelDisposition, ExecCancelRequest,
     ExecCancelled, ExecClientMessage, ExecFailure, ExecFinished, ExecMode, ExecOutcome, ExecOutput,
     ExecRequest, ExecServerEvent, ExecSuccess, HistoryRequest, HistoryResponse, ListRequest,
-    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse, SourceLocation,
-    SwitchRequest, SwitchResponse, exec_client_message, exec_outcome, exec_server_event,
+    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse, ScreenshotCrop,
+    ScreenshotRequest, ScreenshotResponse, SourceLocation, SwitchRequest, SwitchResponse,
+    exec_client_message, exec_outcome, exec_server_event,
 };
 pub use source::{SourceName, SourceNameError};
 pub use transport::{Incoming, incoming};

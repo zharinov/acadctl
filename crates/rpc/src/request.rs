@@ -4,7 +4,8 @@ use tonic::{Code, Status};
 
 use crate::{
     CloseRequest, DrawingError, DrawingId, DrawingPath, ExecMode, ExecRequest, HistoryRequest,
-    OpenRequest, SavePath, SaveRequest, SourceName, SwitchRequest,
+    OpenRequest, SavePath, SaveRequest, ScreenshotCrop, ScreenshotRequest, SourceName,
+    SwitchRequest,
 };
 
 impl From<DrawingPath> for OpenRequest {
@@ -46,6 +47,15 @@ impl CloseRequest {
         Self {
             drawing_id: drawing_id.into(),
             discard,
+        }
+    }
+}
+
+impl ScreenshotRequest {
+    pub fn new(drawing_id: DrawingId, crop: Option<ScreenshotCrop>) -> Self {
+        Self {
+            drawing_id: drawing_id.into(),
+            crop,
         }
     }
 }
@@ -94,6 +104,7 @@ mod tests {
         let error = DrawingError {
             kind: DrawingErrorKind::ReadOnly as i32,
             drawing_id: Some(0x36C8),
+            detail: String::new(),
         };
         let status = error.status(Code::FailedPrecondition);
 

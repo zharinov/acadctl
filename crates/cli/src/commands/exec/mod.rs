@@ -391,7 +391,7 @@ fn location_free_failure_message(failure: &ExecFailure, target: Target) -> Strin
     if let Ok(kind) = acadctl_rpc::DrawingErrorKind::try_from(failure.drawing_error)
         && kind != acadctl_rpc::DrawingErrorKind::Unspecified
     {
-        super::drawing_error_message(kind, target)
+        super::drawing_error_message(super::RequestOperation::Execute, kind, target, "")
     } else if failure.message.starts_with("The source ") || failure.message.starts_with("eval ") {
         failure.message.trim_end_matches('.').to_owned()
     } else {

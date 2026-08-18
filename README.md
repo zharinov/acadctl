@@ -30,12 +30,22 @@ $ acadctl eval 6A8436C8 '(square 7)'
 49
 ```
 
+Capture the active graphics viewport as a bounded PNG for visual inspection:
+
+```sh
+$ acadctl screenshot 6A8436C8 --crop 0.2,0.1,0.8,0.65
+{"path":"/tmp/acadctl/screenshots/acadctl-screenshot-20260818T231456.123Z.png","width":614,"height":422,"format":"png","warnings":[]}
+```
+
+Omit `--output` for managed temporary storage, pass an existing directory for a generated filename there, or pass a nonexistent file path for that exact destination. Existing files are never overwritten.
+
 ## What works
 
 - `acadctl list`: list drawings currently open in AutoCAD.
 - `acadctl open`, `acadctl save`, `acadctl close`
 - `acadctl switch`: make a drawing active.
 - `acadctl undo` and `acadctl redo`
+- `acadctl screenshot`: capture and optionally crop the active graphics viewport.
 - `acadctl exec` and `acadctl eval` for running AutoLISP.
 - Basic utilities:
   - `(actl:print value)`: print the value to the console
@@ -46,6 +56,7 @@ $ acadctl eval 6A8436C8 '(square 7)'
 Dependencies:
 
 - AutoCAD and the matching ObjectARX SDK
+- Official matching-version ATIL headers for shaded viewport capture
 - Rust with `cargo`
 - Xcode Command Line Tools
 
@@ -62,8 +73,12 @@ The defaults are AutoCAD 2027 and ObjectARX 2027. Override their paths if needed
 
 ```sh
 ACAD_DIR=/path/to/AutoCAD.app ACAD_SDK_DIR=/path/to/ObjectARX bin/build release
+ACADCTL_ATIL_INCLUDE_DIR=/path/to/ObjectARX/utils/Atil/Inc bin/build release
+ACADCTL_ATIL_INCLUDE_DIR=/path/to/ObjectARX/utils/Atil/Inc bin/ci
 ACAD_PLUGIN_DIR=/path/to/plugins ACADCTL_BIN_DIR=/path/to/bin bin/install
 ```
+
+The AutoCAD 2027 macOS SDK does not include ATIL headers. They are available in the official Windows ObjectARX 2027 SDK and compile against the ATIL runtime shipped inside AutoCAD for Mac. Without `ACADCTL_ATIL_INCLUDE_DIR`, the plugin still captures 2D Wireframe viewports but reports shaded viewport capture as unavailable. Do not copy ATIL headers or runtime libraries into the repository or plugin bundle.
 
 ## License
 
