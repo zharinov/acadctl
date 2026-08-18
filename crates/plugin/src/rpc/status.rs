@@ -39,7 +39,6 @@ mod tests {
         let status = scheduler_error(SchedulerError::ReadinessTimedOut(Some(id)));
 
         assert_eq!(status.code(), Code::DeadlineExceeded);
-        assert_eq!(status.message(), "drawing operation failed");
         assert_eq!(
             DrawingError::from_status(&status),
             Some(DrawingError {

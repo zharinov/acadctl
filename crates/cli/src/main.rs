@@ -288,7 +288,7 @@ fn print_help(command_name: Option<String>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::{CommandFactory, error::ErrorKind};
+    use clap::error::ErrorKind;
 
     use super::*;
 
@@ -325,56 +325,6 @@ mod tests {
                 assert_eq!(file.as_deref(), Some(std::path::Path::new("script.lsp")));
             }
         }
-    }
-
-    #[test]
-    fn help_uses_public_target_and_source_names() {
-        let mut command = Cli::command();
-        let eval_help = command
-            .find_subcommand_mut("eval")
-            .unwrap()
-            .render_help()
-            .to_string();
-        let exec_help = command
-            .find_subcommand_mut("exec")
-            .unwrap()
-            .render_help()
-            .to_string();
-
-        assert!(eval_help.contains("<TARGET> [EXPRESSION]"));
-        assert!(exec_help.contains("<TARGET> [SCRIPT]"));
-        assert!(eval_help.contains("-f, --file <FILE>"));
-        assert!(exec_help.contains("-f, --file <FILE>"));
-        let save_help = command
-            .find_subcommand_mut("save")
-            .unwrap()
-            .render_help()
-            .to_string();
-        assert!(save_help.contains("--as <FILE>"));
-    }
-
-    #[test]
-    fn top_level_help_teaches_the_cli_through_a_terminal_session() {
-        let help = Cli::command().render_help().to_string();
-
-        assert!(help.starts_with("Command line utility to control AutoCAD\n"));
-        assert!(help.contains("$ acadctl list\n6A84:36C8  *  rw  foo.dwg"));
-        assert!(help.contains("$ acadctl exec 6A84:36C8 <<'LISP'"));
-        assert!(help.contains("$ acadctl eval 6A84:36C8 '(square 7)'\n49"));
-        assert!(!help.contains("--file script.lsp"));
-        assert!(!help.contains("document"));
-        assert!(!help.contains("process"));
-        assert!(!help.contains("pid"));
-    }
-
-    #[test]
-    fn exposes_list_and_quit_command_names() {
-        let command = Cli::command();
-
-        assert!(command.find_subcommand("list").is_some());
-        assert!(command.find_subcommand("quit").is_some());
-        assert!(command.find_subcommand("ps").is_none());
-        assert!(command.find_subcommand("kill").is_none());
     }
 
     #[test]

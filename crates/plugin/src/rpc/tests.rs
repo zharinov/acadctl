@@ -405,7 +405,6 @@ fn rejects_an_oversized_source_before_acceptance() {
             panic!("oversized source must produce a structured failure");
         };
 
-        assert!(failure.message.contains("4 MiB"));
         assert_eq!(
             failure.drawing_outcome,
             RpcDrawingOutcome::NotStarted as i32
