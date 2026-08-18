@@ -17,6 +17,8 @@ If drawing close and reopen is sufficient, use it instead of closing and reopeni
 
 Use `acadctl exec` to reload the lisp file instead of rebuilding and reinstalling plugin and restarting AutoCAD.
 
+Use `acadctl` without the sandbox.
+
 Lisp code conventions:
 
 - Only define global functions for public API and bridge entry points.
