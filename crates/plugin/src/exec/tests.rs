@@ -99,32 +99,38 @@ fn eval_requires_exactly_one_form_while_exec_accepts_a_batch() {
 }
 
 #[test]
-fn lisp_sources_are_valid() {
-    fn validate_tree(directory: &std::path::Path) {
+fn bundled_lisp_sources_parse() {
+    fn validate_file(path: &std::path::Path) {
+        let source = std::fs::read_to_string(path).unwrap();
+        if let Err(error) = acadctl_lisp::validate(&source) {
+            panic!(
+                "{}:{}:{}: {}",
+                path.display(),
+                error.line,
+                error.column,
+                error.kind.message()
+            );
+        }
+    }
+
+    fn validate_directory(directory: &std::path::Path) {
         for entry in std::fs::read_dir(directory).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                validate_tree(&path);
+                validate_directory(&path);
             } else if path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("lsp"))
             {
-                let source = std::fs::read_to_string(&path).unwrap();
-                assert!(
-                    acadctl_lisp::validate(&source).is_ok(),
-                    "{}",
-                    path.display()
-                );
+                validate_file(&path);
             }
         }
     }
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    validate_tree(&manifest.join("lisp"));
-
-    let loader = std::fs::read_to_string(manifest.join("native/loader.lsp")).unwrap();
-    assert!(acadctl_lisp::validate(&loader).is_ok());
+    validate_directory(&manifest.join("lisp"));
+    validate_file(&manifest.join("native/loader.lsp"));
 }
 
 #[test]

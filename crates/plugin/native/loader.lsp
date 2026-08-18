@@ -1,28 +1,28 @@
-(setq actl:*loader-directory*
-  (vl-filename-directory (findfile "loader.lsp")))
+((lambda (/ collect directory file files)
+   (setq directory
+         (vl-filename-directory (findfile "loader.lsp")))
 
-(defun actl:_loader-files
-  (directory / entry extension files path)
-  (foreach entry (vl-directory-files directory nil 0)
-    (if (and (/= entry ".") (/= entry ".."))
-      (progn
-        (setq path (strcat directory "/" entry))
-        (cond
-          ((vl-file-directory-p path)
-           (setq files
-                 (append (actl:_loader-files path) files)))
-          ((and (setq extension (vl-filename-extension path))
-                (= (strcase extension) ".LSP"))
-           (setq files (cons path files)))))))
-  files)
+   (setq collect
+         '(lambda (directory / entry extension files path)
+            (foreach entry (vl-directory-files directory nil 0)
+              (if (and (/= entry ".") (/= entry ".."))
+                (progn
+                  (setq path (strcat directory "/" entry))
+                  (cond
+                    ((vl-file-directory-p path)
+                     (setq files
+                           (append
+                             (apply collect (list path))
+                             files)))
+                    ((and (setq extension (vl-filename-extension path))
+                          (= (strcase extension) ".LSP"))
+                     (setq files (cons path files)))))))
+            files))
 
-((lambda (files / file)
-   (setq actl:_loader-files nil)
+   (setq files
+         (apply collect (list (strcat directory "/lisp"))))
    (foreach file (vl-sort files '<)
-     (load file)))
- (actl:_loader-files (strcat actl:*loader-directory* "/lisp")))
+     (load file))
 
-(arxload (strcat actl:*loader-directory* "/acadctl-plugin.bundle"))
-
-(setq actl:*loader-directory* nil)
-(princ)
+   (arxload (strcat directory "/acadctl-plugin.bundle"))
+   (princ)))

@@ -1,9 +1,5 @@
-(defun actl:_ok (fields)
-  (cons 'ok fields))
+(defun actl:ok (value)
+  (cons 'ok value))
 
-(defun actl:_err (code subject message)
-  (list
-    'error
-    (cons 'code code)
-    (cons 'subject subject)
-    (cons 'message message)))
+(defun actl:err (value)
+  (cons 'error value))
