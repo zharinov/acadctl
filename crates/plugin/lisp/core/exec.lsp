@@ -1,4 +1,5 @@
-(defun actl:_drive-execution (/ staged-form)
+(defun actl:_drive-execution (/ expected-form-count staged-form)
+  (setq expected-form-count 1)
   (while (actl:_advance-execution)
     (setq staged-form (read actl:*bridge-staged-form*))
     (if (eq staged-form 'actl:_eval)
@@ -8,7 +9,7 @@
                  '(lambda ()
                     (setq forms
                           (read (strcat "(" actl:*bridge-source* "\n)")))
-                    (if (= (length forms) 1)
+                    (if (= (length forms) expected-form-count)
                       (list 'actl:ok (eval (car forms)))
                       (actl:_invalid-form-span)))
                  '()))

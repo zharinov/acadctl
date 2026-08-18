@@ -7,37 +7,45 @@
    emit-tail
    emit-task
    emit-text
+   first-character-position
+   max-value-depth
+   output-event-codes
    stack
    state
-   task)
+   task
+   text-chunk-size)
+  (setq output-event-codes
+        '((begin-list . 1)
+          (end-list . 2)
+          (dot . 3)
+          (nil . 4)
+          (true . 5)
+          (integer . 6)
+          (real . 7)
+          (begin-string . 8)
+          (string-chunk . 9)
+          (end-string . 10)
+          (begin-symbol . 11)
+          (symbol-chunk . 12)
+          (end-symbol . 13)
+          (entity . 14)
+          (selection-set . 15)
+          (vla-object . 16)
+          (file . 17)
+          (function . 18)
+          (error-object . 19)
+          (object . 20)
+          (cycle . 21)
+          (too-deep . 22)
+          (begin-value . 23)
+          (end-value . 24)))
+  (setq first-character-position 1)
+  (setq text-chunk-size 2048)
+  (setq max-value-depth 4096)
+
   (setq emit-event
         '(lambda (event value / code)
-           (setq code
-                 (cond
-                   ((eq event 'begin-list) 1)
-                   ((eq event 'end-list) 2)
-                   ((eq event 'dot) 3)
-                   ((eq event 'nil) 4)
-                   ((eq event 'true) 5)
-                   ((eq event 'integer) 6)
-                   ((eq event 'real) 7)
-                   ((eq event 'begin-string) 8)
-                   ((eq event 'string-chunk) 9)
-                   ((eq event 'end-string) 10)
-                   ((eq event 'begin-symbol) 11)
-                   ((eq event 'symbol-chunk) 12)
-                   ((eq event 'end-symbol) 13)
-                   ((eq event 'entity) 14)
-                   ((eq event 'selection-set) 15)
-                   ((eq event 'vla-object) 16)
-                   ((eq event 'file) 17)
-                   ((eq event 'function) 18)
-                   ((eq event 'error-object) 19)
-                   ((eq event 'object) 20)
-                   ((eq event 'cycle) 21)
-                   ((eq event 'too-deep) 22)
-                   ((eq event 'begin-value) 23)
-                   ((eq event 'end-value) 24)))
+           (setq code (cdr (assoc event output-event-codes)))
 
            (if code
              (actl:_output-event code value)
@@ -46,25 +54,23 @@
   (setq emit-text
         '(lambda
            (text begin-event chunk-event end-event /
-            chunk-size
             continue
             offset
             part)
-           (setq chunk-size 2048)
            (setq continue
                  (apply emit-event (list begin-event nil)))
            (if continue
              (progn
-               (setq offset 1)
-               (setq part (substr text offset chunk-size))
+               (setq offset first-character-position)
+               (setq part (substr text offset text-chunk-size))
 
                (while (and continue (/= part ""))
                  (setq continue
                        (apply emit-event (list chunk-event part)))
-                 (setq offset (+ offset chunk-size))
+                 (setq offset (+ offset text-chunk-size))
                  (if continue
                    (setq part
-                         (substr text offset chunk-size))))
+                         (substr text offset text-chunk-size))))
 
                (if continue
                  (setq continue
@@ -122,13 +128,12 @@
                    (list 'object (vl-symbol-name value-type)))))))))
 
   (setq emit-item
-        '(lambda (task stack / continue depth max-depth value)
+        '(lambda (task stack / continue depth value)
            (setq value (cadr task))
            (setq depth (caddr task))
-           (setq max-depth 4096)
 
            (if (vl-consp value)
-             (if (>= depth max-depth)
+             (if (>= depth max-value-depth)
                (list
                  (apply emit-event (list 'too-deep nil))
                  stack)
@@ -247,13 +252,13 @@
   (apply emit-event (list 'end-value nil))
   value)
 
-(defun actl:label (text / emit-event)
+(defun actl:label (text / emit-event output-event-codes)
+  (setq output-event-codes
+        '((label . 25)
+          (invalid-label . 26)))
   (setq emit-event
         '(lambda (event value / code)
-           (setq code
-                 (cond
-                   ((eq event 'label) 25)
-                   ((eq event 'invalid-label) 26)))
+           (setq code (cdr (assoc event output-event-codes)))
            (if code
              (actl:_output-event code value)
              (actl:_invalid-output-event))))

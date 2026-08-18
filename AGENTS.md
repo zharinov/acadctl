@@ -5,3 +5,14 @@ Keep C++ and AutoLISP surface minimal. It must be just interface bridge boilerpl
 When asked to commit, use semantic commit convention.
 
 During development, interact with AutoCAD via `acadctl` (without sandbox). Don't acess AutoCAD directly (via computer use) without explicit approval. Files in the `./tmp` folder are disposable, never ask my permission to modify them or discard unsaved changes. Assume AutoCAD process is disposable and nobody is doing anything important in AutoCAD during you work on the `acadctl`.
+
+Lisp code conventions:
+
+- Only define global functions for public API and bridge entry points.
+- Reserve `actl:_*` and `actl:*bridge-*` for the bridge.
+- Keep helpers as local quoted lambdas called with `apply`.
+- Don't return or store local lambdas.
+- Split code by responsibility without creating fake-private globals.
+- Name non-obvious numbers locally.
+- Name DXF group codes and AutoCAD sentinels locally.
+- Keep bridge event codes in a semantic local table.

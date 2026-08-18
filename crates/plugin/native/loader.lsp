@@ -1,10 +1,15 @@
-((lambda (/ collect directory file files)
+((lambda (/ collect directory file files files-and-directories)
    (setq directory
          (vl-filename-directory (findfile "loader.lsp")))
+   (setq files-and-directories 0)
 
    (setq collect
          '(lambda (directory / entry extension files path)
-            (foreach entry (vl-directory-files directory nil 0)
+            (foreach entry
+                     (vl-directory-files
+                       directory
+                       nil
+                       files-and-directories)
               (if (and (/= entry ".") (/= entry ".."))
                 (progn
                   (setq path (strcat directory "/" entry))

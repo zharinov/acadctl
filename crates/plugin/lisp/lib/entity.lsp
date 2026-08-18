@@ -1,4 +1,5 @@
-(defun actl:dxf (subject / outcome)
+(defun actl:dxf (subject / dxf-handle-code outcome)
+  (setq dxf-handle-code 5)
   (if (not (or (eq (type subject) 'STR)
                (eq (type subject) 'ENAME)))
     (actl:err
@@ -20,7 +21,9 @@
                  (cond
                    ((null data)
                     nil)
-                   ((null (setq handle (cdr (assoc 5 data))))
+                   ((null
+                      (setq handle
+                            (cdr (assoc dxf-handle-code data))))
                     (actl:err
                       (list
                         '(code . missing-handle)
@@ -43,6 +46,25 @@
 
 (defun actl:entities
   (source /
+   aci-by-block
+   aci-by-layer
+   dxf-aci-code
+   dxf-block-first-entity-code
+   dxf-color-book-code
+   dxf-control-string-code
+   dxf-dictionary-key-code
+   dxf-entity-name-code
+   dxf-handle-code
+   dxf-hard-pointer-code
+   dxf-layer-code
+   dxf-layout-code
+   dxf-lineweight-code
+   dxf-linetype-code
+   dxf-name-code
+   dxf-owner-code
+   dxf-soft-owner-code
+   dxf-true-color-code
+   dxf-type-code
    entities-from-refs
    entity-item
    handle
@@ -55,7 +77,33 @@
    outcome
    owner-handle
    owner-root
+   lineweight-by-block
+   lineweight-by-layer
+   lineweight-default
    source-entities)
+  (setq aci-by-block 0)
+  (setq aci-by-layer 256)
+  (setq dxf-aci-code 62)
+  (setq dxf-block-first-entity-code -2)
+  (setq dxf-color-book-code 430)
+  (setq dxf-control-string-code 102)
+  (setq dxf-dictionary-key-code 3)
+  (setq dxf-entity-name-code -1)
+  (setq dxf-handle-code 5)
+  (setq dxf-hard-pointer-code 340)
+  (setq dxf-layer-code 8)
+  (setq dxf-layout-code 410)
+  (setq dxf-lineweight-code 370)
+  (setq dxf-linetype-code 6)
+  (setq dxf-name-code 2)
+  (setq dxf-owner-code 330)
+  (setq dxf-soft-owner-code 350)
+  (setq dxf-true-color-code 420)
+  (setq dxf-type-code 0)
+  (setq lineweight-by-block -2)
+  (setq lineweight-by-layer -1)
+  (setq lineweight-default -3)
+
   (setq handle
         '(lambda (subject / data)
            (cond
@@ -63,22 +111,22 @@
               (strcase subject))
              ((and (eq (type subject) 'ENAME)
                    (setq data (entget subject))
-                   (assoc 5 data))
-              (strcase (cdr (assoc 5 data)))))))
+                   (assoc dxf-handle-code data))
+              (strcase (cdr (assoc dxf-handle-code data)))))))
 
   (setq owner-handle
         '(lambda (data / depth owner pair)
            (setq depth 0)
            (foreach pair data
              (cond
-               ((and (= (car pair) 102)
+               ((and (= (car pair) dxf-control-string-code)
                      (/= (cdr pair) "}"))
                 (setq depth (1+ depth)))
-               ((and (= (car pair) 102)
+               ((and (= (car pair) dxf-control-string-code)
                      (= (cdr pair) "}"))
                 (setq depth (1- depth)))
                ((and (= depth 0)
-                     (= (car pair) 330)
+                     (= (car pair) dxf-owner-code)
                      (null owner))
                 (setq owner (cdr pair)))))
            owner))
@@ -97,9 +145,9 @@
            (foreach pair
                     (dictsearch (namedobjdict) "ACAD_LAYOUT")
              (cond
-               ((= (car pair) 3)
+               ((= (car pair) dxf-dictionary-key-code)
                 (setq key (cdr pair)))
-               ((= (car pair) 350)
+               ((= (car pair) dxf-soft-owner-code)
                 (if (and key
                          (= (strcase key) (strcase name)))
                   (setq found (cdr pair)))
@@ -129,7 +177,7 @@
              (setq seen (cons entity seen))
              (setq data (entget entity))
              (if (and data
-                      (= (cdr (assoc 0 data)) "BLOCK_RECORD"))
+                      (= (cdr (assoc dxf-type-code data)) "BLOCK_RECORD"))
                (setq root entity)
                (setq entity
                      (apply owner-handle (list data)))))
@@ -151,19 +199,23 @@
                          owner-root
                          (list (ssname set 0))))
                  (setq data (entget target))
-                 (eq (cdr (assoc 340 data)) layout)
+                 (eq (cdr (assoc dxf-hard-pointer-code data)) layout)
                  (setq block
                        (tblobjname
                          "BLOCK"
-                         (cdr (assoc 2 data))))
+                         (cdr (assoc dxf-name-code data))))
                  (setq block-data (entget block))
-                 (= (cdr (assoc 0 block-data)) "BLOCK")
+                 (= (cdr (assoc dxf-type-code block-data)) "BLOCK")
                  (eq
                    (apply owner-handle (list block-data))
                    target)
                  (eq
                    (type
-                     (setq first (cdr (assoc -2 block-data))))
+                     (setq first
+                           (cdr
+                             (assoc
+                               dxf-block-first-entity-code
+                               block-data))))
                    'ENAME))
              (list target first))))
 
@@ -195,7 +247,7 @@
                          "_X"
                          (list
                            (cons
-                             410
+                             dxf-layout-code
                              (apply
                                literal-pattern
                                (list name))))))
@@ -218,7 +270,7 @@
                            (cond
                              ((null data)
                               (setq done 'failed))
-                             ((= (cdr (assoc 0 data)) "ENDBLK")
+                             ((= (cdr (assoc dxf-type-code data)) "ENDBLK")
                               (setq done T))
                              ((null
                                 (setq root
@@ -261,11 +313,11 @@
                           (dictsearch (namedobjdict) "ACAD_GROUP"))
                     (setq data
                           (dictsearch
-                            (cdr (assoc -1 groups))
+                            (cdr (assoc dxf-entity-name-code groups))
                             (cdr source))))
                 (progn
                   (foreach pair data
-                    (if (= (car pair) 340)
+                    (if (= (car pair) dxf-hard-pointer-code)
                       (setq items (cons (cdr pair) items))))
                   (actl:ok
                     (list
@@ -294,21 +346,23 @@
            (setq data (cdr (assoc 'value (cdr reference))))
            (setq owner
                  (apply owner-handle (list data)))
-           (setq aci (cdr (assoc 62 data)))
-           (setq linetype (cdr (assoc 6 data)))
-           (setq lineweight (cdr (assoc 370 data)))
+           (setq aci (cdr (assoc dxf-aci-code data)))
+           (setq linetype (cdr (assoc dxf-linetype-code data)))
+           (setq lineweight (cdr (assoc dxf-lineweight-code data)))
            (list
              (cons 'handle (cdr (assoc 'handle (cdr reference))))
-             (cons 'type (cdr (assoc 0 data)))
+             (cons 'type (cdr (assoc dxf-type-code data)))
              (cons 'owner-handle (apply handle (list owner)))
-             (cons 'layout (cdr (assoc 410 data)))
-             (cons 'layer (cdr (assoc 8 data)))
+             (cons 'layout (cdr (assoc dxf-layout-code data)))
+             (cons 'layer (cdr (assoc dxf-layer-code data)))
              (cons
                'color-source
                (cond
-                 ((or (assoc 420 data) (assoc 430 data)) 'explicit)
-                 ((or (null aci) (= aci 256)) 'by-layer)
-                 ((= aci 0) 'by-block)
+                 ((or (assoc dxf-true-color-code data)
+                      (assoc dxf-color-book-code data))
+                  'explicit)
+                 ((or (null aci) (= aci aci-by-layer)) 'by-layer)
+                 ((= aci aci-by-block) 'by-block)
                  (T 'explicit)))
              (cons
                'linetype-source
@@ -321,9 +375,11 @@
              (cons
                'lineweight-source
                (cond
-                 ((or (null lineweight) (= lineweight -1)) 'by-layer)
-                 ((= lineweight -2) 'by-block)
-                 ((= lineweight -3) 'default)
+                 ((or (null lineweight)
+                      (= lineweight lineweight-by-layer))
+                  'by-layer)
+                 ((= lineweight lineweight-by-block) 'by-block)
+                 ((= lineweight lineweight-default) 'default)
                  (T 'explicit)))
              (cons 'observed-index index))))
 
@@ -445,16 +501,65 @@
 
 (defun actl:entity
   (subject /
+   aci-by-block
+   aci-by-layer
    color-source
+   dxf-aci-code
+   dxf-color-book-code
+   dxf-control-string-code
+   dxf-extension-dictionary-code
+   dxf-handle-code
+   dxf-layer-code
+   dxf-layout-code
+   dxf-lineweight-code
+   dxf-linetype-code
+   dxf-owner-code
+   dxf-transparency-code
+   dxf-true-color-code
+   dxf-type-code
+   dxf-visibility-code
+   entity-invisible
    extension-dictionary
    handle
-   linetype-source
+   lineweight-by-block
+   lineweight-by-layer
+   lineweight-default
    lineweight-source
+   linetype-source
    outcome
    owner-handle
    reference
+   transparency-by-block
+   transparency-by-layer
+   transparency-method-shift
    transparency-source
+   xdata-group-code
    xdata-apps)
+  (setq aci-by-block 0)
+  (setq aci-by-layer 256)
+  (setq dxf-aci-code 62)
+  (setq dxf-color-book-code 430)
+  (setq dxf-control-string-code 102)
+  (setq dxf-extension-dictionary-code 360)
+  (setq dxf-handle-code 5)
+  (setq dxf-layer-code 8)
+  (setq dxf-layout-code 410)
+  (setq dxf-lineweight-code 370)
+  (setq dxf-linetype-code 6)
+  (setq dxf-owner-code 330)
+  (setq dxf-transparency-code 440)
+  (setq dxf-true-color-code 420)
+  (setq dxf-type-code 0)
+  (setq dxf-visibility-code 60)
+  (setq entity-invisible 1)
+  (setq lineweight-by-block -2)
+  (setq lineweight-by-layer -1)
+  (setq lineweight-default -3)
+  (setq transparency-by-block 1)
+  (setq transparency-by-layer 0)
+  (setq transparency-method-shift -24)
+  (setq xdata-group-code -3)
+
   (setq reference (actl:dxf subject))
   (if (or (null reference) (eq (car reference) 'error))
     reference
@@ -466,38 +571,41 @@
                   (strcase subject))
                  ((and (eq (type subject) 'ENAME)
                        (setq data (entget subject))
-                       (assoc 5 data))
-                  (strcase (cdr (assoc 5 data)))))))
+                       (assoc dxf-handle-code data))
+                  (strcase
+                    (cdr (assoc dxf-handle-code data)))))))
 
       (setq owner-handle
             '(lambda (data / depth owner pair)
                (setq depth 0)
                (foreach pair data
                  (cond
-                   ((and (= (car pair) 102)
+                   ((and (= (car pair) dxf-control-string-code)
                          (/= (cdr pair) "}"))
                     (setq depth (1+ depth)))
-                   ((and (= (car pair) 102)
+                   ((and (= (car pair) dxf-control-string-code)
                          (= (cdr pair) "}"))
                     (setq depth (1- depth)))
                    ((and (= depth 0)
-                         (= (car pair) 330)
+                         (= (car pair) dxf-owner-code)
                          (null owner))
                     (setq owner (cdr pair)))))
                owner))
 
       (setq color-source
             '(lambda (data / aci)
-               (setq aci (cdr (assoc 62 data)))
+               (setq aci (cdr (assoc dxf-aci-code data)))
                (cond
-                 ((or (assoc 420 data) (assoc 430 data)) 'explicit)
-                 ((or (null aci) (= aci 256)) 'by-layer)
-                 ((= aci 0) 'by-block)
+                 ((or (assoc dxf-true-color-code data)
+                      (assoc dxf-color-book-code data))
+                  'explicit)
+                 ((or (null aci) (= aci aci-by-layer)) 'by-layer)
+                 ((= aci aci-by-block) 'by-block)
                  (T 'explicit))))
 
       (setq linetype-source
             '(lambda (data / value)
-               (setq value (cdr (assoc 6 data)))
+               (setq value (cdr (assoc dxf-linetype-code data)))
                (cond
                  ((or (null value) (= (strcase value) "BYLAYER"))
                   'by-layer)
@@ -506,98 +614,129 @@
 
       (setq lineweight-source
             '(lambda (data / value)
-               (setq value (cdr (assoc 370 data)))
+               (setq value (cdr (assoc dxf-lineweight-code data)))
                (cond
-                 ((or (null value) (= value -1)) 'by-layer)
-                 ((= value -2) 'by-block)
-                 ((= value -3) 'default)
+                 ((or (null value)
+                      (= value lineweight-by-layer))
+                  'by-layer)
+                 ((= value lineweight-by-block) 'by-block)
+                 ((= value lineweight-default) 'default)
                  (T 'explicit))))
 
       (setq transparency-source
-            '(lambda (data / method value)
-               (setq value (cdr (assoc 440 data)))
-               (if value
-                 (setq method (lsh value -24)))
-               (cond
-                 ((or (null method) (= method 0)) 'by-layer)
-                 ((= method 1) 'by-block)
-                 (T 'explicit))))
+                '(lambda (data / method value)
+                   (setq value
+                         (cdr (assoc dxf-transparency-code data)))
+                   (if value
+                     (setq method
+                           (lsh value transparency-method-shift)))
+                   (cond
+                     ((or (null method)
+                          (= method transparency-by-layer))
+                      'by-layer)
+                     ((= method transparency-by-block) 'by-block)
+                     (T 'explicit))))
 
-      (setq extension-dictionary
-            '(lambda (data / active found pair)
-               (foreach pair data
-                 (cond
-                   ((and (= (car pair) 102)
-                         (= (cdr pair) "{ACAD_XDICTIONARY"))
-                    (setq active T))
-                   ((and active (= (car pair) 360))
-                    (setq found T))
-                   ((and active
-                         (= (car pair) 102)
-                         (= (cdr pair) "}"))
-                    (setq active nil))))
-               found))
+          (setq extension-dictionary
+                '(lambda (data / active found pair)
+                   (foreach pair data
+                     (cond
+                       ((and (= (car pair) dxf-control-string-code)
+                             (= (cdr pair) "{ACAD_XDICTIONARY"))
+                        (setq active T))
+                       ((and active
+                             (= (car pair)
+                                dxf-extension-dictionary-code))
+                        (setq found T))
+                       ((and active
+                             (= (car pair) dxf-control-string-code)
+                             (= (cdr pair) "}"))
+                        (setq active nil))))
+                   found))
 
-      (setq xdata-apps
-            '(lambda (data / apps pair)
-               (foreach pair data
-                 (if (and (= (car pair) -3)
-                          (eq (type (car (cadr pair))) 'STR))
-                   (setq apps (cons (car (cadr pair)) apps))))
-               (reverse apps)))
+          (setq xdata-apps
+                '(lambda (data / apps pair)
+                   (foreach pair data
+                     (if (and (= (car pair) xdata-group-code)
+                              (eq (type (car (cadr pair))) 'STR))
+                       (setq apps (cons (car (cadr pair)) apps))))
+                   (reverse apps)))
 
-      (setq outcome
-            (vl-catch-all-apply
-              '(lambda (/ data full object-handle owner)
-                 (setq object-handle
-                       (cdr (assoc 'handle (cdr reference))))
-                 (setq data
-                       (cdr (assoc 'value (cdr reference))))
-                 (setq full
-                       (entget (handent object-handle) '("*")))
-                 (setq owner
-                       (apply owner-handle (list data)))
+          (setq outcome
+                (vl-catch-all-apply
+                  '(lambda (/ data full object-handle owner)
+                     (setq object-handle
+                           (cdr (assoc 'handle (cdr reference))))
+                     (setq data
+                           (cdr (assoc 'value (cdr reference))))
+                     (setq full
+                           (entget (handent object-handle) '("*")))
+                     (setq owner
+                           (apply owner-handle (list data)))
 
-                 (list
-                   (cons 'handle object-handle)
-                   (cons 'type (cdr (assoc 0 data)))
-                   (cons 'owner-handle (apply handle (list owner)))
-                   (cons 'layout (cdr (assoc 410 data)))
-                   (cons 'layer (cdr (assoc 8 data)))
-                   (cons 'visible (not (eq (cdr (assoc 60 data)) 1)))
-                   (cons 'color-source (apply color-source (list data)))
-                   (cons 'aci (cdr (assoc 62 data)))
-                   (cons 'true-color (cdr (assoc 420 data)))
-                   (cons 'color-book (cdr (assoc 430 data)))
-                   (cons
-                     'linetype-source
-                     (apply linetype-source (list data)))
-                   (cons 'linetype (cdr (assoc 6 data)))
-                   (cons
-                     'lineweight-source
-                     (apply lineweight-source (list data)))
-                   (cons 'lineweight (cdr (assoc 370 data)))
-                   (cons
-                     'transparency-source
-                     (apply transparency-source (list data)))
-                   (cons 'transparency (cdr (assoc 440 data)))
-                   (cons
-                     'extension-dictionary
-                     (apply extension-dictionary (list data)))
-                   (cons
-                     'xdata-applications
-                     (apply xdata-apps (list full)))))
-              '()))
+                     (list
+                       (cons 'handle object-handle)
+                       (cons 'type (cdr (assoc dxf-type-code data)))
+                       (cons
+                         'owner-handle
+                         (apply handle (list owner)))
+                       (cons
+                         'layout
+                         (cdr (assoc dxf-layout-code data)))
+                       (cons 'layer (cdr (assoc dxf-layer-code data)))
+                       (cons
+                         'visible
+                         (not
+                           (eq
+                             (cdr (assoc dxf-visibility-code data))
+                             entity-invisible)))
+                       (cons
+                         'color-source
+                         (apply color-source (list data)))
+                       (cons 'aci (cdr (assoc dxf-aci-code data)))
+                       (cons
+                         'true-color
+                         (cdr (assoc dxf-true-color-code data)))
+                       (cons
+                         'color-book
+                         (cdr (assoc dxf-color-book-code data)))
+                       (cons
+                         'linetype-source
+                         (apply linetype-source (list data)))
+                       (cons
+                         'linetype
+                         (cdr (assoc dxf-linetype-code data)))
+                       (cons
+                         'lineweight-source
+                         (apply lineweight-source (list data)))
+                       (cons
+                         'lineweight
+                         (cdr (assoc dxf-lineweight-code data)))
+                       (cons
+                         'transparency-source
+                         (apply transparency-source (list data)))
+                       (cons
+                         'transparency
+                         (cdr (assoc dxf-transparency-code data)))
+                       (cons
+                         'extension-dictionary
+                         (apply extension-dictionary (list data)))
+                       (cons
+                         'xdata-applications
+                         (apply xdata-apps (list full)))))
+                  '()))
 
-      (if (vl-catch-all-error-p outcome)
-        (actl:err
-          (list
-            '(code . read-failed)
-            (cons 'subject subject)
-            (cons 'message (vl-catch-all-error-message outcome))))
-        (actl:ok outcome)))))
+          (if (vl-catch-all-error-p outcome)
+            (actl:err
+              (list
+                '(code . read-failed)
+                (cons 'subject subject)
+                (cons 'message (vl-catch-all-error-message outcome))))
+            (actl:ok outcome)))))
 
-(defun actl:xdata (subject applications / outcome reference)
+(defun actl:xdata
+  (subject applications / outcome reference xdata-group-code)
+  (setq xdata-group-code -3)
   (if (not
         (or
           (eq applications 'all)
@@ -629,7 +768,7 @@
                                '("*")
                                applications)))
                      (foreach pair data
-                       (if (= (car pair) -3)
+                       (if (= (car pair) xdata-group-code)
                          (setq value (cons pair value))))
                      (actl:ok
                        (list

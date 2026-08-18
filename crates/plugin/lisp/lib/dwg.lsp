@@ -1,8 +1,10 @@
-(defun actl:dwg (/ outcome)
+(defun actl:dwg (/ drawing-is-titled outcome paper-space-viewport)
+  (setq drawing-is-titled 1)
+  (setq paper-space-viewport 1)
   (setq outcome
         (vl-catch-all-apply
           '(lambda (/ name path)
-             (if (= (getvar "DWGTITLED") 1)
+             (if (= (getvar "DWGTITLED") drawing-is-titled)
                (progn
                  (setq name (getvar "DWGNAME"))
                  (setq path
@@ -16,7 +18,7 @@
                (cons 'measurement (getvar "MEASUREMENT"))
                (cons 'layout (getvar "CTAB"))
                (cons 'space
-                     (if (= (getvar "CVPORT") 1)
+                     (if (= (getvar "CVPORT") paper-space-viewport)
                        'paper
                        'model))
                (cons 'current-layer (getvar "CLAYER"))
