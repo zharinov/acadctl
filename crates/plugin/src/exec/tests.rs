@@ -138,6 +138,7 @@ fn inspection_library_files_define_only_their_public_entry_points() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let cases = [
         ("dict.lsp", &["actl:dict", "actl:extdict"][..]),
+        ("geom.lsp", &["actl:geom"][..]),
         ("group.lsp", &["actl:groups"][..]),
         ("layer.lsp", &["actl:layers"][..]),
         ("order.lsp", &["actl:order"][..]),
