@@ -134,6 +134,29 @@ fn bundled_lisp_sources_parse() {
 }
 
 #[test]
+fn inspection_library_files_define_only_their_public_entry_points() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cases = [
+        ("dict.lsp", &["actl:dict", "actl:extdict"][..]),
+        ("group.lsp", &["actl:groups"][..]),
+        ("layer.lsp", &["actl:layers"][..]),
+        ("order.lsp", &["actl:order"][..]),
+    ];
+
+    for (file, expected) in cases {
+        let source = std::fs::read_to_string(manifest.join("lisp/lib").join(file)).unwrap();
+        let definitions = source
+            .lines()
+            .filter_map(|line| line.strip_prefix("(defun "))
+            .map(|line| line.split_whitespace().next().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(acadctl_lisp::validate(&source).unwrap(), expected.len());
+        assert_eq!(definitions, expected, "unexpected definitions in {file}");
+    }
+}
+
+#[test]
 fn yields_exact_forms_then_commits() {
     let mut execution = Exec::new(
         ExecMode::Exec,
