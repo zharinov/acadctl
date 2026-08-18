@@ -136,7 +136,7 @@
                 (setq malformed T))))
            (if (or malformed entity (null active))
              (actl:err
-               (list "The stored draw-order mapping is malformed"))
+               "The stored draw-order mapping is malformed")
              (actl:ok
                (list
                  (cons 'items (reverse items)))))))
@@ -162,10 +162,9 @@
                      item-index))
                (setq output
                      (actl:err
-                       (list
-                         (strcat
-                           "Draw-order entry is outside the requested scope: "
-                           (cdr (assoc 'entity-handle entry))))))))
+                       (strcat
+                         "Draw-order entry is outside the requested scope: "
+                         (cdr (assoc 'entity-handle entry)))))))
            (if (and output (eq (car output) 'error))
              output
              (progn
@@ -182,10 +181,9 @@
                  (if (assoc sort-handle seen)
                    (setq output
                          (actl:err
-                           (list
-                             (strcat
-                               "Draw-order sort handle is ambiguous: "
-                               sort-handle))))
+                           (strcat
+                             "Draw-order sort handle is ambiguous: "
+                             sort-handle)))
                    (progn
                      (setq seen (cons (cons sort-handle T) seen))
                      (setq effective
@@ -241,7 +239,7 @@
                (T
                 (setq order-result
                       (actl:err
-                        (list "Expected model or a layout")))))
+                        "Expected model or a layout"))))
              (if (and (null order-result) (null layout-name))
                (setq order-result 'absent))
              (if (and (null order-result) layout-name)
@@ -269,8 +267,7 @@
                  (if (null block)
                    (setq order-result
                          (actl:err
-                           (list
-                             "Layout ownership data is inconsistent"))))))
+                           "Layout ownership data is inconsistent")))))
              (if (null order-result)
                (progn
                  (setq block-reference (actl:dxf block))
@@ -278,8 +275,7 @@
                    ((null block-reference)
                     (setq order-result
                           (actl:err
-                            (list
-                              "The layout block record is unavailable"))))
+                            "The layout block record is unavailable")))
                    ((eq (car block-reference) 'error)
                     (setq order-result block-reference))
                    (T
@@ -318,8 +314,7 @@
                    ((/= (cdr (assoc 'type table)) "SORTENTSTABLE")
                     (setq order-result
                           (actl:err
-                            (list
-                              "ACAD_SORTENTS is not a SORTENTSTABLE")))))))
+                            "ACAD_SORTENTS is not a SORTENTSTABLE"))))))
              (if (null order-result)
                (progn
                  (setq table-reference
@@ -328,7 +323,7 @@
                    ((null table-reference)
                     (setq order-result
                           (actl:err
-                            (list "The draw-order table is unavailable"))))
+                            "The draw-order table is unavailable")))
                    ((eq (car table-reference) 'error)
                     (setq order-result table-reference)))))
              (if (null order-result)
@@ -366,8 +361,7 @@
           '()))
   (if (vl-catch-all-error-p outcome)
     (actl:err
-      (list
-        (strcat
-          "Could not inspect draw order: "
-          (vl-catch-all-error-message outcome))))
+      (strcat
+        "Could not inspect draw order: "
+        (vl-catch-all-error-message outcome)))
     outcome))

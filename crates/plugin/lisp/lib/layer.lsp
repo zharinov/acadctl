@@ -144,7 +144,7 @@
                      (if reference
                        reference
                        (actl:err
-                         (list "A layer table record is unavailable"))))
+                         "A layer table record is unavailable")))
                (setq records
                      (cons
                        (cdr (assoc 'value (cdr reference)))
@@ -185,8 +185,7 @@
           '()))
   (if (vl-catch-all-error-p outcome)
     (actl:err
-      (list
-        (strcat
-          "Could not inspect layers: "
-          (vl-catch-all-error-message outcome))))
+      (strcat
+        "Could not inspect layers: "
+        (vl-catch-all-error-message outcome)))
     outcome))

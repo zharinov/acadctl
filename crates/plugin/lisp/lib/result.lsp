@@ -1,5 +1,5 @@
 (defun actl:ok (value)
   (cons 'ok value))
 
-(defun actl:err (value)
-  (cons 'error value))
+(defun actl:err (message)
+  (list 'error message))

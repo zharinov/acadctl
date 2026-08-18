@@ -11,10 +11,9 @@
               result)
              (T
               (actl:err
-                (list
-                  (strcat
-                    "Could not summarize the drawing: "
-                    unavailable)))))))
+                (strcat
+                  "Could not summarize the drawing: "
+                  unavailable))))))
 
   (setq seed-counts
         '(lambda (names / counts name)
@@ -243,8 +242,7 @@
 
                   (if malformed
                     (actl:err
-                      (list
-                        "Could not summarize the drawing: inspection facts are malformed"))
+                      "Could not summarize the drawing: inspection facts are malformed")
                     (progn
                       (setq layer-counts
                             (vl-sort layer-counts
@@ -296,8 +294,7 @@
 
   (if (vl-catch-all-error-p outcome)
     (actl:err
-      (list
-        (strcat
-          "Could not summarize the drawing: "
-          (vl-catch-all-error-message outcome))))
+      (strcat
+        "Could not summarize the drawing: "
+        (vl-catch-all-error-message outcome)))
     outcome))

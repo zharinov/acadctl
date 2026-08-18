@@ -2,7 +2,7 @@
   (setq dxf-handle-code 5)
   (if (not (or (eq (type subject) 'STR)
                (eq (type subject) 'ENAME)))
-    (actl:err (list "Expected a handle string or entity name"))
+    (actl:err "Expected a handle string or entity name")
     (progn
       (setq ename
             (if (eq (type subject) 'STR)
@@ -18,18 +18,17 @@
           (cond
             ((vl-catch-all-error-p outcome)
              (actl:err
-               (list
-                 (strcat
-                   "Could not read the object: "
-                   (vl-catch-all-error-message outcome)))))
+               (strcat
+                 "Could not read the object: "
+                 (vl-catch-all-error-message outcome))))
             ((null outcome)
-             (actl:err (list "The object is unavailable")))
+             (actl:err "The object is unavailable"))
             (T
              (setq data outcome)
              (if (null
                    (setq handle
                          (cdr (assoc dxf-handle-code data))))
-               (actl:err (list "The object has no DXF handle"))
+               (actl:err "The object has no DXF handle")
                (actl:ok
                  (list
                    (cons 'handle (strcase handle))
@@ -177,7 +176,7 @@
   (setq layout-error
         '(lambda (requested)
            (actl:err
-             (list "Layout ownership data is inconsistent"))))
+             "Layout ownership data is inconsistent")))
 
   (setq layout-start
         '(lambda (layout set / block block-data data first target)
@@ -324,7 +323,7 @@
                   (cons 'items source))))
              (T
               (actl:err
-                (list "Expected model, a layout, a group, a pickset, or references"))))))
+                "Expected model, a layout, a group, a pickset, or references")))))
 
   (setq entity-item
         '(lambda (reference index / aci data linetype lineweight owner)
@@ -377,19 +376,18 @@
                ((null reference)
                 (setq state
                       (actl:err
-                        (list
-                          (if (and
-                                (eq (type source) 'LIST)
-                                (eq (car source) 'group)
-                                (eq (type (cdr source)) 'STR))
-                            (strcat
-                              "Could not read member "
-                              (itoa index)
-                              " of group "
-                              (cdr source))
-                            (strcat
-                              "Could not read reference at index "
-                              (itoa index)))))))
+                        (if (and
+                              (eq (type source) 'LIST)
+                              (eq (car source) 'group)
+                              (eq (type (cdr source)) 'STR))
+                          (strcat
+                            "Could not read member "
+                            (itoa index)
+                            " of group "
+                            (cdr source))
+                          (strcat
+                            "Could not read reference at index "
+                            (itoa index))))))
                ((eq (car reference) 'error)
                 (setq state reference))
                (T
@@ -411,10 +409,9 @@
   (cond
     ((vl-catch-all-error-p outcome)
      (actl:err
-       (list
-         (strcat
-           "Could not collect entities: "
-           (vl-catch-all-error-message outcome)))))
+       (strcat
+         "Could not collect entities: "
+         (vl-catch-all-error-message outcome))))
     ((or (null outcome) (eq (car outcome) 'error))
      outcome)
     (T
@@ -426,15 +423,14 @@
                source)))
      (if (vl-catch-all-error-p outcome)
        (actl:err
-         (list
-           (strcat
-             "Could not inspect an entity reference: "
-             (vl-catch-all-error-message outcome))))
+         (strcat
+           "Could not inspect an entity reference: "
+           (vl-catch-all-error-message outcome)))
        outcome))))
 
 (defun actl:find (filter / index item items less output result set)
   (if (not (or (null filter) (eq (type filter) 'LIST)))
-    (actl:err (list "Expected a DXF filter list"))
+    (actl:err "Expected a DXF filter list")
     (progn
       (setq less
             '(lambda (left right / a b)
@@ -461,10 +457,9 @@
 
       (if (vl-catch-all-error-p set)
         (actl:err
-          (list
-            (strcat
-              "Could not apply the DXF filter: "
-              (vl-catch-all-error-message set))))
+          (strcat
+            "Could not apply the DXF filter: "
+            (vl-catch-all-error-message set)))
         (if (null set)
           (actl:ok (list (cons 'items nil)))
           (progn
@@ -722,10 +717,9 @@
 
           (if (vl-catch-all-error-p outcome)
             (actl:err
-              (list
-                (strcat
-                  "Could not inspect the object: "
-                  (vl-catch-all-error-message outcome))))
+              (strcat
+                "Could not inspect the object: "
+                (vl-catch-all-error-message outcome)))
             (actl:ok outcome)))))
 
 (defun actl:xdata
@@ -741,7 +735,7 @@
               '(lambda (application)
                  (eq (type application) 'STR))
               applications))))
-    (actl:err (list "Expected all or a list of application names"))
+    (actl:err "Expected all or a list of application names")
     (progn
       (setq reference (actl:dxf subject))
       (if (or (null reference) (eq (car reference) 'error))
@@ -776,8 +770,7 @@
 
             (if (vl-catch-all-error-p outcome)
               (actl:err
-                (list
-                  (strcat
-                    "Could not read XData: "
-                    (vl-catch-all-error-message outcome))))
+                (strcat
+                  "Could not read XData: "
+                  (vl-catch-all-error-message outcome)))
               outcome)))))))

@@ -17,14 +17,12 @@
         '(lambda (name entity / data member members value)
            (if (null (setq data (entget entity)))
              (actl:err
-               (list
-                 (strcat "Could not read group " name)))
+               (strcat "Could not read group " name))
              (if (/= (cdr (assoc dxf-type-code data)) "GROUP")
                (actl:err
-                 (list
-                   (strcat
-                     "Dictionary entry is not a group: "
-                     name)))
+                 (strcat
+                   "Dictionary entry is not a group: "
+                   name))
                (progn
                (foreach value data
                  (if (= (car value) dxf-hard-pointer-code)
@@ -36,10 +34,9 @@
                        (setq members (cons member members))))))
                (if (eq members 'error)
                  (actl:err
-                   (list
-                     (strcat
-                       "Could not resolve a member of group "
-                       name)))
+                   (strcat
+                     "Could not resolve a member of group "
+                     name))
                  (actl:ok
                    (list
                      (cons 'name name)
@@ -90,8 +87,7 @@
   (setq outcome (vl-catch-all-apply collect '()))
   (if (vl-catch-all-error-p outcome)
     (actl:err
-      (list
-        (strcat
-          "Could not inspect groups: "
-          (vl-catch-all-error-message outcome))))
+      (strcat
+        "Could not inspect groups: "
+        (vl-catch-all-error-message outcome)))
     outcome))

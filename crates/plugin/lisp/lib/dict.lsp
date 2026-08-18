@@ -35,9 +35,9 @@
 
   (cond
     ((not (apply string-list-p (list path)))
-     (actl:err (list "Expected a list of dictionary keys")))
+     (actl:err "Expected a list of dictionary keys"))
     ((not (and (eq (type depth) 'INT) (>= depth 0)))
-     (actl:err (list "Expected a nonnegative integer depth")))
+     (actl:err "Expected a nonnegative integer depth"))
     (T
      (setq dictionary-p
            '(lambda (object-type)
@@ -49,7 +49,7 @@
               (setq reference (actl:dxf subject))
               (cond
                 ((null reference)
-                 (actl:err (list "A dictionary entry is unavailable")))
+                 (actl:err "A dictionary entry is unavailable"))
                 ((eq (car reference) 'error) reference)
                 (T reference))))
 
@@ -80,7 +80,7 @@
                      (setq malformed T)))))
               (if (or key (null active)) (setq malformed T))
               (if malformed
-                (actl:err (list "Dictionary entries are malformed"))
+                (actl:err "Dictionary entries are malformed")
                 (vl-sort
                   entries
                   '(lambda (left right)
@@ -98,13 +98,12 @@
                         (apply
                           dictionary-p
                           (list (cdr (assoc dxf-type-code data)))))
-                    (actl:err (list "The selected object is not a dictionary"))
+                    (actl:err "The selected object is not a dictionary")
                     (if (member handle visited)
                       (actl:err
-                        (list
-                          (strcat
-                            "Dictionary traversal revisited handle "
-                            handle)))
+                        (strcat
+                          "Dictionary traversal revisited handle "
+                          handle))
                       (progn
                         (setq visited (cons handle visited))
                         (setq entries (apply collect-entries (list data)))
@@ -177,8 +176,7 @@
                     (if (null current)
                       (setq state
                             (actl:err
-                              (list
-                                "A dictionary path entry has no object reference")))
+                              "A dictionary path entry has no object reference"))
                       (progn
                         (setq reference
                               (apply read-object (list current)))
@@ -197,10 +195,9 @@
                                             (cdr reference))))))))
                             (setq state
                                   (actl:err
-                                    (list
-                                      (strcat
-                                        "Dictionary path entry is not a dictionary: "
-                                        key))))))))))
+                                    (strcat
+                                      "Dictionary path entry is not a dictionary: "
+                                      key)))))))))
                 (setq keys (cdr keys)))
               (cond
                 ((eq state 'absent) nil)
@@ -220,10 +217,9 @@
              '()))
      (if (vl-catch-all-error-p outcome)
        (actl:err
-         (list
-           (strcat
-             "Could not inspect the dictionary: "
-             (vl-catch-all-error-message outcome))))
+         (strcat
+           "Could not inspect the dictionary: "
+           (vl-catch-all-error-message outcome)))
        outcome))))
 
 (defun actl:extdict
@@ -255,7 +251,7 @@
   (setq dxf-type-code 0)
 
   (if (not (and (eq (type depth) 'INT) (>= depth 0)))
-    (actl:err (list "Expected a nonnegative integer depth"))
+    (actl:err "Expected a nonnegative integer depth")
     (progn
       (setq reference (actl:dxf subject))
       (if (or (null reference) (eq (car reference) 'error))
@@ -282,7 +278,7 @@
 
           (cond
             ((or malformed active)
-             (actl:err (list "The extension dictionary reference is malformed")))
+             (actl:err "The extension dictionary reference is malformed"))
             ((null marker) nil)
             (T
              (setq dictionary-p
@@ -296,7 +292,7 @@
                       (cond
                         ((null result)
                          (actl:err
-                           (list "A dictionary entry is unavailable")))
+                           "A dictionary entry is unavailable"))
                         ((eq (car result) 'error) result)
                         (T result))))
 
@@ -329,7 +325,7 @@
                              (setq invalid T)))))
                       (if (or key (null active)) (setq invalid T))
                       (if invalid
-                        (actl:err (list "Dictionary entries are malformed"))
+                        (actl:err "Dictionary entries are malformed")
                         (vl-sort
                           entries
                           '(lambda (left right)
@@ -352,14 +348,12 @@
                                     (cdr
                                       (assoc dxf-type-code data)))))
                             (actl:err
-                              (list
-                                "The selected object is not a dictionary"))
+                              "The selected object is not a dictionary")
                             (if (member handle visited)
                               (actl:err
-                                (list
-                                  (strcat
-                                    "Dictionary traversal revisited handle "
-                                    handle)))
+                                (strcat
+                                  "Dictionary traversal revisited handle "
+                                  handle))
                               (progn
                                 (setq visited (cons handle visited))
                                 (setq entries
@@ -442,8 +436,7 @@
                      (list dictionary depth)))
              (if (vl-catch-all-error-p outcome)
                (actl:err
-                 (list
-                   (strcat
-                     "Could not inspect the extension dictionary: "
-                     (vl-catch-all-error-message outcome))))
+                 (strcat
+                   "Could not inspect the extension dictionary: "
+                   (vl-catch-all-error-message outcome)))
                outcome))))))))

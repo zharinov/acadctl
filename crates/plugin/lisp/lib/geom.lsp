@@ -69,7 +69,7 @@
                value
                (if pair 'stored 'default))
              (actl:err
-               (list "The entity has a malformed extrusion normal")))))
+               "The entity has a malformed extrusion normal"))))
 
   (setq common
         '(lambda (kind)
@@ -86,7 +86,7 @@
                       (apply point-value-p (list start))
                       (apply point-value-p (list end))))
              (actl:err
-               (list "The LINE has malformed or missing endpoints"))
+               "The LINE has malformed or missing endpoints")
              (actl:ok
                (append
                  (apply common (list 'line))
@@ -100,7 +100,7 @@
            (setq position (cdr (assoc dxf-start-code data)))
            (if (not (apply point-value-p (list position)))
              (actl:err
-               (list "The POINT has a malformed or missing position"))
+               "The POINT has a malformed or missing position")
              (actl:ok
                (append
                  (apply common (list 'point))
@@ -117,16 +117,16 @@
            (cond
              ((not (apply point-value-p (list center)))
               (actl:err
-                (list "The CIRCLE has a malformed or missing center")))
+                "The CIRCLE has a malformed or missing center"))
              ((not (and
                      (apply number-value-p (list radius))
                      (> radius 0.0)))
               (actl:err
-                (list "The CIRCLE has a malformed or invalid radius")))
+                "The CIRCLE has a malformed or invalid radius"))
              ((eq (car normal-result) 'error) normal-result)
              ((null ename)
               (actl:err
-                (list "The CIRCLE has no entity coordinate system")))
+                "The CIRCLE has no entity coordinate system"))
              (T
               (setq normal (car normal-result))
               (setq center-wcs (trans center ename 0))
@@ -154,21 +154,21 @@
            (cond
              ((not (apply point-value-p (list center)))
               (actl:err
-                (list "The ARC has a malformed or missing center")))
+                "The ARC has a malformed or missing center"))
              ((not (and
                      (apply number-value-p (list radius))
                      (> radius 0.0)))
               (actl:err
-                (list "The ARC has a malformed or invalid radius")))
+                "The ARC has a malformed or invalid radius"))
              ((not (and
                      (apply number-value-p (list start-angle))
                      (apply number-value-p (list end-angle))))
               (actl:err
-                (list "The ARC has malformed or missing angles")))
+                "The ARC has malformed or missing angles"))
              ((eq (car normal-result) 'error) normal-result)
              ((null ename)
               (actl:err
-                (list "The ARC has no entity coordinate system")))
+                "The ARC has no entity coordinate system"))
              (T
               (setq normal (car normal-result))
               (setq center-wcs (trans center ename 0))
@@ -233,27 +233,25 @@
                   (< count 0))
               (setq state
                     (actl:err
-                      (list
-                        "The LWPOLYLINE has a malformed or missing vertex count"))))
+                      "The LWPOLYLINE has a malformed or missing vertex count")))
              ((not (eq (type flags) 'INT))
               (setq state
                     (actl:err
-                      (list "The LWPOLYLINE has malformed flags"))))
+                      "The LWPOLYLINE has malformed flags")))
              ((not (apply number-value-p (list elevation)))
               (setq state
                     (actl:err
-                      (list "The LWPOLYLINE has a malformed elevation"))))
+                      "The LWPOLYLINE has a malformed elevation")))
              ((not (and
                      (apply point-value-p (list normal))
                      (/= (distance '(0.0 0.0 0.0) normal) 0.0)))
               (setq state
                     (actl:err
-                      (list "The LWPOLYLINE has a malformed extrusion normal"))))
+                      "The LWPOLYLINE has a malformed extrusion normal")))
              ((null ename)
               (setq state
                     (actl:err
-                      (list
-                        "The LWPOLYLINE has no entity coordinate system")))))
+                      "The LWPOLYLINE has no entity coordinate system"))))
 
            (if (null state)
              (progn
@@ -285,8 +283,7 @@
                (if (or malformed (/= count (length raw-vertices)))
                  (setq state
                        (actl:err
-                         (list
-                           "The LWPOLYLINE has malformed vertex records"))))))
+                         "The LWPOLYLINE has malformed vertex records")))))
 
            (if (null state)
              (progn
@@ -303,8 +300,7 @@
                             (apply number-value-p (list bulge))))
                    (setq state
                          (actl:err
-                           (list
-                             "The LWPOLYLINE has malformed vertex coordinates or bulges")))
+                           "The LWPOLYLINE has malformed vertex coordinates or bulges"))
                    (progn
                      (setq position-ocs
                            (list
@@ -363,8 +359,7 @@
                    (if (= chord 0.0)
                      (setq state
                            (actl:err
-                             (list
-                               "The LWPOLYLINE has a curved segment with coincident endpoints")))
+                             "The LWPOLYLINE has a curved segment with coincident endpoints"))
                      (progn
                        (setq midpoint-x
                              (/ (+ (car from-ocs) (car to-ocs)) 2.0))
@@ -440,10 +435,9 @@
              ((= entity-type "LWPOLYLINE") (apply polyline-record '()))
              (T
               (actl:err
-                (list
-                  (strcat
-                    "Unsupported geometry type: "
-                    (if entity-type entity-type "unknown"))))))))
+                (strcat
+                  "Unsupported geometry type: "
+                  (if entity-type entity-type "unknown")))))))
 
   (setq reference (actl:dxf subject))
   (cond
@@ -454,8 +448,7 @@
            (vl-catch-all-apply inspect (list (cdr reference))))
      (if (vl-catch-all-error-p outcome)
        (actl:err
-         (list
-           (strcat
-             "Could not inspect geometry: "
-             (vl-catch-all-error-message outcome))))
+         (strcat
+           "Could not inspect geometry: "
+           (vl-catch-all-error-message outcome)))
        outcome))))
