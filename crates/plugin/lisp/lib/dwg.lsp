@@ -38,7 +38,7 @@
   (if (vl-catch-all-error-p outcome)
     (actl:err
       (list
-        '(code . read-failed)
-        '(subject . drawing)
-        (cons 'message (vl-catch-all-error-message outcome))))
+        (strcat
+          "Could not inspect the drawing: "
+          (vl-catch-all-error-message outcome))))
     (actl:ok outcome)))
