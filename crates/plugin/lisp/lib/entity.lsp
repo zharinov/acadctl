@@ -758,6 +758,7 @@
   (if (not
         (or
           (eq applications 'all)
+          (null applications)
           (and
             (eq (type applications) 'LIST)
             (vl-every
@@ -773,31 +774,38 @@
       (setq reference (actl:dxf subject))
       (if (or (null reference) (eq (car reference) 'error))
         reference
-        (progn
-          (setq outcome
-                (vl-catch-all-apply
-                  '(lambda (/ data object-handle pair value)
-                     (setq object-handle
-                           (cdr (assoc 'handle (cdr reference))))
-                     (setq data
-                           (entget
-                             (handent object-handle)
-                             (if (eq applications 'all)
-                               '("*")
-                               applications)))
-                     (foreach pair data
-                       (if (= (car pair) xdata-group-code)
-                         (setq value (cons pair value))))
-                     (actl:ok
-                       (list
-                         (cons 'handle object-handle)
-                         (cons 'value (reverse value)))))
-                  '()))
+        (if (null applications)
+          (actl:ok
+            (list
+              (cons
+                'handle
+                (cdr (assoc 'handle (cdr reference))))
+              (cons 'value nil)))
+          (progn
+            (setq outcome
+                  (vl-catch-all-apply
+                    '(lambda (/ data object-handle pair value)
+                       (setq object-handle
+                             (cdr (assoc 'handle (cdr reference))))
+                       (setq data
+                             (entget
+                               (handent object-handle)
+                               (if (eq applications 'all)
+                                 '("*")
+                                 applications)))
+                       (foreach pair data
+                         (if (= (car pair) xdata-group-code)
+                           (setq value (cons pair value))))
+                       (actl:ok
+                         (list
+                           (cons 'handle object-handle)
+                           (cons 'value (reverse value)))))
+                    '()))
 
-          (if (vl-catch-all-error-p outcome)
-            (actl:err
-              (list
-                '(code . read-failed)
-                (cons 'subject subject)
-                (cons 'message (vl-catch-all-error-message outcome))))
-            outcome))))))
+            (if (vl-catch-all-error-p outcome)
+              (actl:err
+                (list
+                  '(code . read-failed)
+                  (cons 'subject subject)
+                  (cons 'message (vl-catch-all-error-message outcome))))
+              outcome)))))))
