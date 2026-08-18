@@ -384,13 +384,27 @@
              (cons 'observed-index index))))
 
   (setq entities-from-refs
-        '(lambda (refs / index item items reference state)
+        '(lambda (refs source / index item items reference state)
            (setq index 0)
            (while (and refs (null state))
              (setq reference (actl:dxf (car refs)))
              (cond
                ((null reference)
-                (setq state 'absent))
+                (setq state
+                      (actl:err
+                        (list
+                          (if (and
+                                (eq (type source) 'LIST)
+                                (eq (car source) 'group)
+                                (eq (type (cdr source)) 'STR))
+                            (strcat
+                              "Could not read member "
+                              (itoa index)
+                              " of group "
+                              (cdr source))
+                            (strcat
+                              "Could not read reference at index "
+                              (itoa index)))))))
                ((eq (car reference) 'error)
                 (setq state reference))
                (T
@@ -401,7 +415,6 @@
                 (setq refs (cdr refs)))))
 
            (cond
-             ((eq state 'absent) nil)
              (state state)
              (T
               (actl:ok
@@ -423,7 +436,9 @@
      (setq outcome
            (vl-catch-all-apply
              entities-from-refs
-             (list (cdr (assoc 'items (cdr outcome))))))
+             (list
+               (cdr (assoc 'items (cdr outcome)))
+               source)))
      (if (vl-catch-all-error-p outcome)
        (actl:err
          (list
