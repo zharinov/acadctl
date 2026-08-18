@@ -46,10 +46,15 @@
    entities-from-refs
    entity-item
    handle
+   layout-error
    layout-entities
    layout-name
+   layout-reference
+   layout-start
+   literal-pattern
    outcome
    owner-handle
+   owner-root
    source-entities)
   (setq handle
         '(lambda (subject / data)
@@ -87,22 +92,157 @@
                  (setq found candidate))))
            found))
 
-  ;; Reading layout records through ACAD_LAYOUT can set DBMOD. Group 410
-  ;; identifies layout membership without causing that AutoCAD side effect.
+  (setq layout-reference
+        '(lambda (name / found key pair)
+           (foreach pair
+                    (dictsearch (namedobjdict) "ACAD_LAYOUT")
+             (cond
+               ((= (car pair) 3)
+                (setq key (cdr pair)))
+               ((= (car pair) 350)
+                (if (and key
+                         (= (strcase key) (strcase name)))
+                  (setq found (cdr pair)))
+                (setq key nil))))
+           found))
+
+  (setq literal-pattern
+        '(lambda (value / character index result)
+           (setq index 1)
+           (setq result "")
+           (while (<= index (strlen value))
+             (setq character (substr value index 1))
+             (setq result
+                   (strcat
+                     result
+                     (if (wcmatch character "[A-Za-z0-9]")
+                       character
+                       (strcat "`" character))))
+             (setq index (1+ index)))
+           result))
+
+  (setq owner-root
+        '(lambda (entity / data root seen)
+           (while (and entity
+                       (null root)
+                       (not (member entity seen)))
+             (setq seen (cons entity seen))
+             (setq data (entget entity))
+             (if (and data
+                      (= (cdr (assoc 0 data)) "BLOCK_RECORD"))
+               (setq root entity)
+               (setq entity
+                     (apply owner-handle (list data)))))
+           root))
+
+  (setq layout-error
+        '(lambda (requested)
+           (actl:err
+             (list
+               '(code . read-failed)
+               (cons 'subject requested)
+               '(message . "Layout ownership data is inconsistent")))))
+
+  (setq layout-start
+        '(lambda (layout set / block block-data data first target)
+           (if (and
+                 (setq target
+                       (apply
+                         owner-root
+                         (list (ssname set 0))))
+                 (setq data (entget target))
+                 (eq (cdr (assoc 340 data)) layout)
+                 (setq block
+                       (tblobjname
+                         "BLOCK"
+                         (cdr (assoc 2 data))))
+                 (setq block-data (entget block))
+                 (= (cdr (assoc 0 block-data)) "BLOCK")
+                 (eq
+                   (apply owner-handle (list block-data))
+                   target)
+                 (eq
+                   (type
+                     (setq first (cdr (assoc -2 block-data))))
+                   'ENAME))
+             (list target first))))
+
+  ;; The layout dictionary supplies identity without reading the LAYOUT
+  ;; object. Entity ownership selects the layout and preserves its chain.
   (setq layout-entities
-        '(lambda (requested / current data items name)
+        '(lambda
+           (requested /
+            current
+            data
+            done
+            items
+            layout
+            name
+            observed
+            root
+            seen
+            set
+            start
+            target)
            (if (setq name (apply layout-name (list requested)))
-             (progn
-               (setq current (entnext))
-               (while current
-                 (setq data (entget current))
-                 (if (and (cdr (assoc 410 data))
-                          (= (cdr (assoc 410 data)) name))
-                   (setq items (cons current items)))
-                 (setq current (entnext current)))
-               (actl:ok
-                 (list
-                   (cons 'items (reverse items))))))))
+             (if (null
+                   (setq layout
+                         (apply layout-reference (list name))))
+               (apply layout-error (list requested))
+               (progn
+                 (setq set
+                       (ssget
+                         "_X"
+                         (list
+                           (cons
+                             410
+                             (apply
+                               literal-pattern
+                               (list name))))))
+                 (if (null set)
+                   (actl:ok (list (cons 'items nil)))
+                   (progn
+                     (setq start
+                           (apply layout-start (list layout set)))
+                     (if start
+                       (progn
+                         (setq target (car start))
+                         (setq current (cadr start)))
+                       (setq done 'failed))
+                     (while (and current (null done))
+                       (if (member current seen)
+                         (setq done 'failed)
+                         (progn
+                           (setq seen (cons current seen))
+                           (setq data (entget current))
+                           (cond
+                             ((null data)
+                              (setq done 'failed))
+                             ((= (cdr (assoc 0 data)) "ENDBLK")
+                              (setq done T))
+                             ((null
+                                (setq root
+                                      (apply
+                                        owner-root
+                                        (list current))))
+                              (setq done 'failed))
+                             ((not (eq root target))
+                              (setq done T))
+                             (T
+                              (setq items (cons current items))
+                              (if (ssmemb current set)
+                                (setq observed
+                                      (1+
+                                        (if observed observed 0))))
+                              (setq current (entnext current)))))))
+                     (if (or (eq done 'failed)
+                             (/=
+                               (if observed observed 0)
+                               (sslength set)))
+                       (apply layout-error (list requested))
+                       (actl:ok
+                         (list
+                           (cons 'items (reverse items))))))))))))
 
   (setq source-entities
         '(lambda (source / data groups index items pair)
