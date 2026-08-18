@@ -5,10 +5,10 @@ pub(crate) use crate::ffi::{
 
 mod diagnostic;
 mod io;
-pub(crate) mod label;
 pub(crate) mod lisp;
 mod outcome;
 pub mod output;
+pub(crate) mod println;
 mod state;
 pub mod value;
 

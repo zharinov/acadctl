@@ -27,15 +27,15 @@ pub(crate) enum OutputEventCode {
     TooDeep = 22,
     BeginValue = 23,
     EndValue = 24,
-    Label = 25,
-    InvalidLabel = 26,
+    Println = 25,
+    InvalidPrintln = 26,
 }
 
 pub(crate) enum OutputEvent<'a> {
     BeginValue,
     EndValue,
-    Label(&'a str),
-    InvalidLabel,
+    Println(&'a str),
+    InvalidPrintln,
     Value(ValueEvent<'a>),
 }
 
@@ -73,8 +73,8 @@ impl OutputEventCode {
         Self::TooDeep,
         Self::BeginValue,
         Self::EndValue,
-        Self::Label,
-        Self::InvalidLabel,
+        Self::Println,
+        Self::InvalidPrintln,
     ];
 
     fn decode<'a>(self, payload: Payload<'a>) -> Result<OutputEvent<'a>, ProtocolViolation> {
@@ -109,8 +109,8 @@ impl OutputEventCode {
             (Self::TooDeep, Payload::Nil) => Ok(Value(ValueEvent::TooDeep)),
             (Self::BeginValue, Payload::Nil) => Ok(OutputEvent::BeginValue),
             (Self::EndValue, Payload::Nil) => Ok(OutputEvent::EndValue),
-            (Self::Label, Payload::String(text)) => Ok(OutputEvent::Label(text)),
-            (Self::InvalidLabel, Payload::Nil) => Ok(OutputEvent::InvalidLabel),
+            (Self::Println, Payload::String(text)) => Ok(OutputEvent::Println(text)),
+            (Self::InvalidPrintln, Payload::Nil) => Ok(OutputEvent::InvalidPrintln),
 
             _ => Err(ProtocolViolation),
         }
@@ -157,8 +157,8 @@ mod tests {
             Ok(OutputEvent::Value(ValueEvent::Cycle))
         ));
         assert!(matches!(
-            output_event(OutputEventCode::Label as i32, Payload::String("x")),
-            Ok(OutputEvent::Label("x"))
+            output_event(OutputEventCode::Println as i32, Payload::String("x")),
+            Ok(OutputEvent::Println("x"))
         ));
     }
 }

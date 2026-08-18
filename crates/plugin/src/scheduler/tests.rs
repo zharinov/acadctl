@@ -472,7 +472,7 @@ async fn routes_the_eval_value_only_after_commit_and_only_once() {
 }
 
 #[tokio::test]
-async fn routes_print_and_label_only_to_the_active_form() {
+async fn routes_print_and_println_only_to_the_active_form() {
     let _test = TEST_LOCK.lock().await;
     reset(vec![drawing(1, 101, false)]);
     let id = list().unwrap()[0].id;
@@ -497,7 +497,7 @@ async fn routes_print_and_label_only_to_the_active_form() {
     let mut port = begin_form_output(action.job_id(), 1, 101);
     assert!(port.claimed());
     assert_eq!(
-        port.write(Ok(OutputEvent::Label("layers"))),
+        port.write(Ok(OutputEvent::Println("layers"))),
         WriteResult::Continue
     );
     assert_eq!(
@@ -529,7 +529,7 @@ async fn routes_print_and_label_only_to_the_active_form() {
     while let Some(chunk) = output.next_chunk().await {
         rendered.push_str(&chunk);
     }
-    assert_eq!(rendered, "--- layers ---\n12\n");
+    assert_eq!(rendered, "layers\n12\n");
     stop();
 }
 

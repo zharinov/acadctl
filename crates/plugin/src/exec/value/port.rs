@@ -1,4 +1,4 @@
-use super::super::{ValueBridgeFailure, ValueOutputLease, label};
+use super::super::{ValueBridgeFailure, ValueOutputLease, println};
 use super::event::{OutputEvent, ProtocolViolation};
 use super::printer::{PrintError, ValuePrinter};
 
@@ -97,8 +97,8 @@ impl NativeOutputPort {
         match event {
             OutputEvent::BeginValue => self.begin_value(),
             OutputEvent::EndValue => self.end_value(),
-            OutputEvent::Label(text) => self.label(text),
-            OutputEvent::InvalidLabel => self.fail(WriteResult::InvalidSequence),
+            OutputEvent::Println(text) => self.println(text),
+            OutputEvent::InvalidPrintln => self.fail(WriteResult::InvalidSequence),
             OutputEvent::Value(event) => self.value(event),
         }
     }
@@ -167,7 +167,7 @@ impl NativeOutputPort {
         }
     }
 
-    fn label(&mut self, text: &str) -> WriteResult {
+    fn println(&mut self, text: &str) -> WriteResult {
         if self.mode != OutputPortMode::Form || self.printer.is_some() {
             return self.fail(WriteResult::InvalidSequence);
         }
@@ -175,7 +175,7 @@ impl NativeOutputPort {
         let Some(lease) = &self.lease else {
             return self.fail(WriteResult::Inactive);
         };
-        let result = label::write(&lease.output_sink(), text);
+        let result = println::write(&lease.output_sink(), text);
         if result == WriteResult::Continue {
             result
         } else {
@@ -263,13 +263,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn form_port_orders_labels_and_repeated_values() {
+    async fn form_port_orders_lines_and_repeated_values() {
         let (io, stream) = execution_io();
         let terminal = io.output_sink();
         let mut port = NativeOutputPort::form(lease(&io, ValueOutputKind::Form));
 
         assert_eq!(
-            port.write(Ok(OutputEvent::Label("layers"))),
+            port.write(Ok(OutputEvent::Println("layers"))),
             WriteResult::Continue
         );
         for value in [1, 2] {
@@ -287,11 +287,11 @@ mod tests {
         assert_eq!(port.finish(), WriteResult::Continue);
         assert_eq!(io.close_value_output(ValueOutputKind::Form), None);
         terminal.finish();
-        assert_eq!(collect(stream).await, "--- layers ---\n1\n2\n");
+        assert_eq!(collect(stream).await, "layers\n1\n2\n");
     }
 
     #[test]
-    fn eval_port_requires_exactly_one_value_and_rejects_labels() {
+    fn eval_port_requires_exactly_one_value_and_rejects_println() {
         let (missing, _stream) = execution_io();
         let port = NativeOutputPort::eval_value(lease(&missing, ValueOutputKind::EvalValue));
         assert_eq!(port.finish(), WriteResult::InvalidSequence);
@@ -300,15 +300,15 @@ mod tests {
             Some(ValueBridgeFailure::MissingValue)
         );
 
-        let (labeled, _stream) = execution_io();
-        let mut port = NativeOutputPort::eval_value(lease(&labeled, ValueOutputKind::EvalValue));
+        let (explicit, _stream) = execution_io();
+        let mut port = NativeOutputPort::eval_value(lease(&explicit, ValueOutputKind::EvalValue));
         assert_eq!(
-            port.write(Ok(OutputEvent::Label("invalid"))),
+            port.write(Ok(OutputEvent::Println("invalid"))),
             WriteResult::InvalidSequence
         );
         assert_eq!(port.finish(), WriteResult::InvalidSequence);
         assert_eq!(
-            labeled.close_value_output(ValueOutputKind::EvalValue),
+            explicit.close_value_output(ValueOutputKind::EvalValue),
             Some(ValueBridgeFailure::InvalidSequence)
         );
     }

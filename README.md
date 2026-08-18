@@ -36,7 +36,7 @@ $ acadctl eval 6A8436C8 '(square 7)'
 - `acadctl exec` and `acadctl eval` for running AutoLISP.
 - Basic utilities:
   - `(actl:print value)`: print the value to the console
-  - `(actl:label "FOO")`: print the `--- FOO ---` label for debug
+  - `(actl:println "FOO")`: print a string followed by a newline
 
 ## Build on macOS
 

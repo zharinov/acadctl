@@ -252,10 +252,10 @@
   (apply emit-event (list 'end-value nil))
   value)
 
-(defun actl:label (text / emit-event output-event-codes)
+(defun actl:println (text / emit-event output-event-codes)
   (setq output-event-codes
-        '((label . 25)
-          (invalid-label . 26)))
+        '((println . 25)
+          (invalid-println . 26)))
   (setq emit-event
         '(lambda (event value / code)
            (setq code (cdr (assoc event output-event-codes)))
@@ -264,8 +264,8 @@
              (actl:_invalid-output-event))))
 
   (if (eq (type text) 'STR)
-    (apply emit-event (list 'label text))
-    (apply emit-event (list 'invalid-label nil)))
+    (apply emit-event (list 'println text))
+    (apply emit-event (list 'invalid-println nil)))
   nil)
 
 (defun actl:_emit-retained-value (/ outcome value)
