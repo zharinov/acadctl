@@ -1,3 +1,6 @@
+#include <functional>
+
+#include "AcDbLMgr.h"
 #include "AcString.h"
 #include "acadctl-plugin/src/lib.rs.h"
 #include "accmd.h"
@@ -9,8 +12,12 @@
 #include "acgs.h"
 #include "acutads.h"
 #include "adscodes.h"
+#include "dbapserv.h"
+#include "dbents.h"
 #include "dbhandle.h"
 #include "dbmain.h"
+#include "dbobjptr.h"
+#include "dbsymtb.h"
 #include "gs.h"
 #include "rxregsvc.h"
 #ifdef ACADCTL_HAS_ATIL
@@ -18,12 +25,12 @@
 #include "RgbModel.h"
 #include "Size.h"
 #include "acutmem.h"
-#include "dbobjptr.h"
 #include "dbvisualstyle.h"
 #include "dbxutil.h"
 #endif
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -194,7 +201,8 @@ private:
 
   acadctl::NativeActionResult close(AcApDocument* document, bool discard);
 
-  ViewportCaptureResult capture(AcApDocument* document);
+  ViewportCaptureResult capture(AcApDocument* document,
+                                const acadctl::NativeAction& action);
 
   bool queueDocumentContextDispatch(const acadctl::NativeAction& action,
                                     acadctl::NativeActionResult& failure);
@@ -414,7 +422,8 @@ acadctl::NativeActionResult bridgeFailure(acadctl::NativeActionResultKind kind,
 ViewportCaptureResult captureResult(acadctl::NativeCaptureResultKind kind,
                                     const char* detail) {
   return {{kind, 0, 0, 0, acadctl::NativePixelFormat::Invalid,
-           acadctl::NativeRowOrder::Invalid, false, rust::String(detail)},
+           acadctl::NativeRowOrder::Invalid, false, 0, 0, 0, 0,
+           rust::String(detail)},
           {}};
 }
 
@@ -809,6 +818,198 @@ bool getIntegerSystemVariable(const ACHAR* name, int& value, int& status) {
   value = integerValue(&result);
 
   return true;
+}
+
+bool setShortSystemVariable(const ACHAR* name, short value) {
+  resbuf setting{};
+  setting.restype = RTSHORT;
+  setting.resval.rint = value;
+  return acedSetVar(name, &setting) == RTNORM;
+}
+
+bool getRealSystemVariable(const ACHAR* name, double& value) {
+  resbuf result{};
+  if (acedGetVar(name, &result) != RTNORM || result.restype != RTREAL) {
+    return false;
+  }
+
+  value = result.resval.rreal;
+  return true;
+}
+
+struct EditorViewObservation {
+  AcGePoint3d center;
+  double size;
+  AcGePoint3d target;
+  AcGePoint3d direction;
+  double twist;
+  double lensLength;
+};
+
+bool observeEditorView(EditorViewObservation& view) {
+  resbuf center{};
+  resbuf target{};
+  resbuf direction{};
+  if (acedGetVar(ACRX_T("VIEWCTR"), &center) != RTNORM ||
+      (center.restype != RTPOINT && center.restype != RT3DPOINT) ||
+      acedGetVar(ACRX_T("TARGET"), &target) != RTNORM ||
+      target.restype != RT3DPOINT ||
+      acedGetVar(ACRX_T("VIEWDIR"), &direction) != RTNORM ||
+      direction.restype != RT3DPOINT ||
+      !getRealSystemVariable(ACRX_T("VIEWSIZE"), view.size) ||
+      !getRealSystemVariable(ACRX_T("VIEWTWIST"), view.twist) ||
+      !getRealSystemVariable(ACRX_T("LENSLENGTH"), view.lensLength)) {
+    return false;
+  }
+  view.center = AcGePoint3d(center.resval.rpoint[0], center.resval.rpoint[1],
+                            center.resval.rpoint[2]);
+  view.direction =
+      AcGePoint3d(direction.resval.rpoint[0], direction.resval.rpoint[1],
+                  direction.resval.rpoint[2]);
+  view.target = AcGePoint3d(target.resval.rpoint[0], target.resval.rpoint[1],
+                            target.resval.rpoint[2]);
+  return true;
+}
+
+Acad::ErrorStatus layoutIdForBlock(AcDbObjectId blockId,
+                                   AcDbObjectId& layoutId) {
+  AcDbBlockTableRecordPointer block(blockId, AcDb::kForRead);
+  if (block.openStatus() != Acad::eOk) {
+    return block.openStatus();
+  }
+
+  layoutId = block->getLayoutId();
+  return layoutId.isNull() ? Acad::eNullObjectId : Acad::eOk;
+}
+
+Acad::ErrorStatus activeLayoutId(AcDbDatabase* database,
+                                 AcDbObjectId& layoutId) {
+  AcDbLayoutManager* const layouts =
+      acdbHostApplicationServices()->layoutManager();
+  if (!layouts) {
+    return Acad::eNullObjectPointer;
+  }
+
+  return layoutIdForBlock(layouts->getActiveLayoutBTRId(database), layoutId);
+}
+
+Acad::ErrorStatus modelLayoutId(AcDbDatabase* database,
+                                AcDbObjectId& layoutId) {
+  AcDbBlockTablePointer blocks(database, AcDb::kForRead);
+  if (blocks.openStatus() != Acad::eOk) {
+    return blocks.openStatus();
+  }
+
+  AcDbObjectId modelBlock;
+  const Acad::ErrorStatus status = blocks->getAt(ACDB_MODEL_SPACE, modelBlock);
+  return status == Acad::eOk ? layoutIdForBlock(modelBlock, layoutId) : status;
+}
+
+AcGsView* currentGsView(int viewport) {
+  if (AcGsView* const shaded = acgsGetCurrent3dAcGsView(viewport)) {
+    return shaded;
+  }
+  return acgsGetCurrentAcGsView(viewport);
+}
+
+bool nearlyEqual(double left, double right) {
+  const double scale = std::max({1.0, std::abs(left), std::abs(right)});
+  return std::abs(left - right) <= scale * 1.0e-9;
+}
+
+int boundedPixelDimension(double worldSpan, double scale, int policyLimit,
+                          std::int64_t viewportLimit) {
+  const double scaled = worldSpan * scale;
+  const double tolerance = std::max(1.0, std::abs(scaled)) * 1.0e-9;
+  const double roundedDown = std::floor(scaled + tolerance);
+  const std::int64_t bounded = std::min<std::int64_t>(
+      {std::max<std::int64_t>(1, static_cast<std::int64_t>(roundedDown)),
+       policyLimit, viewportLimit});
+  return static_cast<int>(bounded);
+}
+
+bool sameEditorView(const EditorViewObservation& left,
+                    const EditorViewObservation& right) {
+  return nearlyEqual(left.center.x, right.center.x) &&
+         nearlyEqual(left.center.y, right.center.y) &&
+         nearlyEqual(left.center.z, right.center.z) &&
+         nearlyEqual(left.size, right.size) &&
+         nearlyEqual(left.target.x, right.target.x) &&
+         nearlyEqual(left.target.y, right.target.y) &&
+         nearlyEqual(left.target.z, right.target.z) &&
+         nearlyEqual(left.direction.x, right.direction.x) &&
+         nearlyEqual(left.direction.y, right.direction.y) &&
+         nearlyEqual(left.direction.z, right.direction.z) &&
+         nearlyEqual(left.twist, right.twist) &&
+         nearlyEqual(left.lensLength, right.lensLength);
+}
+
+Acad::ErrorStatus snapshotCurrentEditorView(AcDbObjectId viewportId,
+                                            int viewportNumber,
+                                            AcDbViewTableRecord& view) {
+  AcDbObjectPointer<AcDbViewport> floatingViewport(viewportId, AcDb::kForRead);
+  if (floatingViewport.openStatus() == Acad::eOk) {
+    return view.setParametersFromViewport(viewportId);
+  }
+  AcDbViewportTableRecordPointer tiledViewport(viewportId, AcDb::kForRead);
+  if (tiledViewport.openStatus() != Acad::eOk) {
+    return tiledViewport.openStatus();
+  }
+  EditorViewObservation observed{};
+  AcGsView* const gsView = currentGsView(viewportNumber);
+  int left = 0;
+  int bottom = 0;
+  int right = 0;
+  int top = 0;
+  if (!gsView || !observeEditorView(observed) ||
+      !acgsGetViewportInfo(viewportNumber, left, bottom, right, top) ||
+      right <= left || top <= bottom) {
+    return Acad::eInvalidContext;
+  }
+  view.setIsPaperspaceView(false);
+  view.setCenterPoint(AcGePoint2d(observed.center.x, observed.center.y));
+  view.setHeight(observed.size);
+  view.setWidth(observed.size * static_cast<double>(right - left) /
+                static_cast<double>(top - bottom));
+  view.setTarget(observed.target);
+  view.setViewDirection(AcGeVector3d(observed.direction.x, observed.direction.y,
+                                     observed.direction.z));
+  view.setViewTwist(observed.twist);
+  view.setLensLength(observed.lensLength);
+  view.setPerspectiveEnabled(gsView->isPerspective());
+  view.setFrontClipEnabled(gsView->isFrontClipped());
+  view.setBackClipEnabled(gsView->isBackClipped());
+  view.setFrontClipDistance(gsView->frontClip());
+  view.setBackClipDistance(gsView->backClip());
+  view.setFrontClipAtEye(tiledViewport->frontClipAtEye());
+  return Acad::eOk;
+}
+
+Acad::ErrorStatus setCurrentEditorView(AcDbViewTableRecord& view,
+                                       AcDbObjectId viewportId,
+                                       int viewportNumber) {
+  AcDbObjectPointer<AcDbViewport> floatingViewport(viewportId, AcDb::kForRead);
+  AcDbViewport* viewport = nullptr;
+  if (floatingViewport.openStatus() == Acad::eOk) {
+    viewport = floatingViewport.object();
+  } else {
+    AcDbViewportTableRecordPointer tiledViewport(viewportId, AcDb::kForRead);
+    if (tiledViewport.openStatus() != Acad::eOk) {
+      return tiledViewport.openStatus();
+    }
+  }
+  const Acad::ErrorStatus status = acedSetCurrentView(&view, viewport);
+  if (status != Acad::eOk) {
+    return status;
+  }
+  acedUpdateDisplay();
+  if (AcGsView* const gsView = currentGsView(viewportNumber)) {
+    gsView->update(GS::eSync);
+  } else {
+    return Acad::eNullObjectPointer;
+  }
+  acedUpdateDisplay();
+  return Acad::eOk;
 }
 
 #ifdef ACADCTL_HAS_ATIL
@@ -1235,7 +1436,7 @@ void ObjectArxBridge::processNextAction() {
     if (AcApDocument* target = document(action->document_token())) {
       captured =
           matchesDatabase(target, action->database_token())
-              ? capture(target)
+              ? capture(target, *action)
               : captureResult(
                     acadctl::NativeCaptureResultKind::DrawingGenerationChanged);
     }
@@ -1328,70 +1529,390 @@ bool ObjectArxBridge::applicationContextBlocked(AcApDocument* target) const {
          (!target->isQuiescent() || acDocManager->inputPending(target) > 0);
 }
 
-ViewportCaptureResult ObjectArxBridge::capture(AcApDocument* document) {
+ViewportCaptureResult
+ObjectArxBridge::capture(AcApDocument* document,
+                         const acadctl::NativeAction& action) {
   if (applicationContextBlocked(document)) {
     return captureResult(acadctl::NativeCaptureResultKind::NotQuiescent);
   }
 
-  if (document != acDocManager->mdiActiveDocument()) {
-    return captureResult(acadctl::NativeCaptureResultKind::NotActive);
+  const double minX = action.capture_min_x();
+  const double minY = action.capture_min_y();
+  const double maxX = action.capture_max_x();
+  const double maxY = action.capture_max_y();
+  const std::uint32_t maxLongEdge = action.capture_max_long_edge();
+  if (!std::isfinite(minX) || !std::isfinite(minY) || !std::isfinite(maxX) ||
+      !std::isfinite(maxY) || minX >= maxX || minY >= maxY ||
+      maxLongEdge == 0 || maxLongEdge > 1024) {
+    return captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                         "the model-space WCS region or resolution is invalid");
+  }
+
+  AcApDocument* const previousActive = acDocManager->mdiActiveDocument();
+  AcDbDatabase* const previousDatabase =
+      previousActive ? previousActive->database() : nullptr;
+  const std::size_t previousActiveToken = static_cast<std::size_t>(
+      reinterpret_cast<std::uintptr_t>(previousActive));
+  const std::size_t previousDatabaseToken = static_cast<std::size_t>(
+      reinterpret_cast<std::uintptr_t>(previousDatabase));
+  const bool activatedTarget = previousActive != document;
+  bool contextChanged = false;
+  bool layoutChanged = false;
+  bool originalTilemode = false;
+  AcDbObjectId originalLayout;
+  AcDbObjectId modelLayout;
+  AcDbObjectId originalViewport;
+  AcDbObjectId modelViewport;
+  int originalViewportNumber = 0;
+  int modelViewportNumber = 0;
+  AcDbViewTableRecord originalContextView;
+  AcDbViewTableRecord modelContextView;
+  bool originalContextViewSaved = false;
+  bool modelContextViewSaved = false;
+  std::optional<EditorViewObservation> originalEditorView;
+  AcGsView* modelView = nullptr;
+  const char* restoreFailure = nullptr;
+  bool documentLocked = false;
+
+  const auto restore = [&]() -> bool {
+    bool restored = true;
+    const auto recordStep = [&](bool succeeded, const char* detail) {
+      if (!succeeded && !restoreFailure) {
+        restoreFailure = detail;
+      }
+      restored = succeeded && restored;
+      return succeeded;
+    };
+
+    if (modelContextViewSaved) {
+      AcDbObjectId currentLayout;
+      const bool modelContextStillActive =
+          acDocManager->mdiActiveDocument() == document &&
+          activeLayoutId(document->database(), currentLayout) == Acad::eOk &&
+          currentLayout == modelLayout &&
+          acedActiveViewportId() == modelViewport;
+      const bool modelViewRestored =
+          modelContextStillActive &&
+          setCurrentEditorView(modelContextView, modelViewport,
+                               modelViewportNumber) == Acad::eOk;
+      recordStep(modelViewRestored,
+                 "the temporary Model view could not be restored");
+    }
+
+    if (acDocManager->mdiActiveDocument() == document && layoutChanged) {
+      const bool tilemodeSet =
+          setShortSystemVariable(ACRX_T("TILEMODE"), originalTilemode ? 1 : 0);
+      int restoredTilemode = -1;
+      int tilemodeStatus = RTERROR;
+      AcDbObjectId restoredLayoutId;
+      bool layoutRestored =
+          tilemodeSet &&
+          getIntegerSystemVariable(ACRX_T("TILEMODE"), restoredTilemode,
+                                   tilemodeStatus) &&
+          restoredTilemode == (originalTilemode ? 1 : 0) &&
+          activeLayoutId(document->database(), restoredLayoutId) == Acad::eOk &&
+          restoredLayoutId == originalLayout;
+      if (!layoutRestored && !originalTilemode) {
+        AcDbLayoutManager* const layouts =
+            acdbHostApplicationServices()->layoutManager();
+        if (layouts) {
+          layouts->setCurrentLayoutId(originalLayout);
+        }
+        layoutRestored = activeLayoutId(document->database(),
+                                        restoredLayoutId) == Acad::eOk &&
+                         restoredLayoutId == originalLayout;
+      }
+      recordStep(layoutRestored, "the original layout could not be restored");
+
+      if (layoutRestored && originalViewportNumber > 1) {
+        AcDbObjectPointer<AcDbViewport> viewport(originalViewport,
+                                                 AcDb::kForRead);
+        const bool viewportRestored =
+            viewport.openStatus() == Acad::eOk && acedMspace() == Acad::eOk &&
+            acedSetCurrentVPort(viewport.object()) == Acad::eOk;
+        recordStep(viewportRestored,
+                   "the original floating viewport could not be restored");
+      } else if (layoutRestored && originalViewportNumber == 1) {
+        const bool viewportRestored = acedPspace() == Acad::eOk;
+        recordStep(viewportRestored,
+                   "the original paper-space context could not be restored");
+      }
+    }
+
+    if (acDocManager->mdiActiveDocument() == document &&
+        originalContextViewSaved) {
+      AcDbObjectId restoredLayout;
+      const AcDbObjectId restoredViewportId = acedActiveViewportId();
+      int restoredViewport = 0;
+      int status = RTERROR;
+      const bool viewportContextRestored =
+          activeLayoutId(document->database(), restoredLayout) == Acad::eOk &&
+          restoredLayout == originalLayout && !restoredViewportId.isNull() &&
+          getIntegerSystemVariable(ACRX_T("CVPORT"), restoredViewport,
+                                   status) &&
+          restoredViewport == originalViewportNumber &&
+          (originalViewportNumber == 1 ||
+           restoredViewportId == originalViewport);
+      if (recordStep(viewportContextRestored,
+                     "the original viewport context could not be verified")) {
+        EditorViewObservation currentEditorView{};
+        const bool editorViewAlreadyRestored =
+            originalEditorView && observeEditorView(currentEditorView) &&
+            sameEditorView(currentEditorView, *originalEditorView);
+        if (!editorViewAlreadyRestored) {
+          const bool editorViewRestored =
+              setCurrentEditorView(originalContextView, restoredViewportId,
+                                   originalViewportNumber) == Acad::eOk;
+          recordStep(editorViewRestored,
+                     "the original editor view could not be restored");
+        }
+      }
+      if (originalEditorView) {
+        EditorViewObservation currentEditorView{};
+        recordStep(observeEditorView(currentEditorView) &&
+                       sameEditorView(currentEditorView, *originalEditorView),
+                   "the restored editor view does not match the original");
+      }
+    }
+
+    if (documentLocked) {
+      const Acad::ErrorStatus status = acDocManager->unlockDocument(document);
+      recordStep(status == Acad::eOk,
+                 "the target drawing lock could not be released");
+      if (status == Acad::eOk) {
+        documentLocked = false;
+      }
+    }
+
+    if (activatedTarget) {
+      AcApDocument* const restorablePrevious =
+          this->document(previousActiveToken);
+      if (!matchesDatabase(restorablePrevious, previousDatabaseToken)) {
+        recordStep(false, "the previous active drawing is no longer available");
+      } else {
+        const Acad::ErrorStatus status =
+            acDocManager->activateDocument(restorablePrevious, false);
+        recordStep(status == Acad::eOk &&
+                       acDocManager->mdiActiveDocument() ==
+                           restorablePrevious &&
+                       acDocManager->curDocument() == restorablePrevious,
+                   "the previous active drawing could not be restored");
+      }
+    }
+
+    return restored;
+  };
+
+  const auto finish = [&](ViewportCaptureResult captured) {
+    if ((contextChanged || documentLocked) && !restore()) {
+      return captureResult(acadctl::NativeCaptureResultKind::RestoreFailed,
+                           restoreFailure
+                               ? restoreFailure
+                               : "the capture context could not be restored");
+    }
+    return captured;
+  };
+
+  const Acad::ErrorStatus lockStatus = acDocManager->lockDocument(
+      document, AcAp::kXWrite, nullptr, nullptr, false);
+  if (lockStatus != Acad::eOk) {
+    return captureResult(acadctl::NativeCaptureResultKind::NotQuiescent);
+  }
+  documentLocked = true;
+
+  if (activatedTarget) {
+    const Acad::ErrorStatus status =
+        acDocManager->activateDocument(document, false);
+    contextChanged = acDocManager->mdiActiveDocument() == document;
+    if (status != Acad::eOk || acDocManager->mdiActiveDocument() != document ||
+        acDocManager->curDocument() != document) {
+      return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                  "the target drawing could not be activated"));
+    }
   }
 
   int viewport = 0;
   int viewportStatus = RTERROR;
   if (!getIntegerSystemVariable(ACRX_T("CVPORT"), viewport, viewportStatus) ||
       viewport <= 0) {
-    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                         "the active viewport number is unavailable");
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                      "the target drawing's active viewport is unavailable"));
+  }
+  originalViewportNumber = viewport;
+  int originalTilemodeValue = 0;
+  int tilemodeStatus = RTERROR;
+  if (!getIntegerSystemVariable(ACRX_T("TILEMODE"), originalTilemodeValue,
+                                tilemodeStatus)) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the target drawing mode is unavailable"));
+  }
+  originalTilemode = originalTilemodeValue != 0;
+  originalViewport = acedActiveViewportId();
+  if (originalViewport.isNull()) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the target viewport identity is unavailable"));
+  }
+  if (snapshotCurrentEditorView(originalViewport, viewport,
+                                originalContextView) != Acad::eOk) {
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                      "the target editor view could not be captured"));
+  }
+  originalContextViewSaved = true;
+  EditorViewObservation observedView{};
+  if (!observeEditorView(observedView)) {
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                      "the target editor view variables are unavailable"));
+  }
+  originalEditorView = observedView;
+
+  Acad::ErrorStatus layoutStatus =
+      activeLayoutId(document->database(), originalLayout);
+  if (layoutStatus == Acad::eOk) {
+    layoutStatus = modelLayoutId(document->database(), modelLayout);
+  }
+  if (layoutStatus != Acad::eOk) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the target drawing's layout is unavailable"));
   }
 
-  AcGsView* const view = acgsGetCurrent3dAcGsView(viewport);
-  if (view) {
+  if (originalLayout != modelLayout) {
+    contextChanged = true;
+    layoutChanged = true;
+    const bool tilemodeSet = setShortSystemVariable(ACRX_T("TILEMODE"), 1);
+    int activeTilemode = 0;
+    int tilemodeStatus = RTERROR;
+    AcDbObjectId activeModelLayout;
+    if (!tilemodeSet ||
+        !getIntegerSystemVariable(ACRX_T("TILEMODE"), activeTilemode,
+                                  tilemodeStatus) ||
+        activeTilemode != 1 ||
+        activeLayoutId(document->database(), activeModelLayout) != Acad::eOk ||
+        activeModelLayout != modelLayout) {
+      return finish(captureResult(
+          acadctl::NativeCaptureResultKind::Unavailable,
+          "AutoCAD did not enter the target drawing's Model layout"));
+    }
+  }
+
+  if (!getIntegerSystemVariable(ACRX_T("CVPORT"), viewport, viewportStatus) ||
+      viewport <= 0) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                "the Model viewport is unavailable"));
+  }
+
+  modelViewport = acedActiveViewportId();
+  modelViewportNumber = viewport;
+  modelView = currentGsView(viewport);
+  if (!modelView || modelView->isInteractive()) {
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                      "the Model graphics view is unavailable or interactive"));
+  }
+  if (modelViewport.isNull()) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                "the Model viewport identity is unavailable"));
+  }
+  if (snapshotCurrentEditorView(modelViewport, viewport, modelContextView) !=
+      Acad::eOk) {
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                      "the Model editor view could not be inspected"));
+  }
+  modelContextViewSaved = true;
+  contextChanged = true;
+
+  int left = 0;
+  int bottom = 0;
+  int right = 0;
+  int top = 0;
+  if (!acgsGetViewportInfo(viewport, left, bottom, right, top)) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the Model viewport bounds are unavailable"));
+  }
+
+  const std::int64_t viewportWidthValue =
+      static_cast<std::int64_t>(right) - static_cast<std::int64_t>(left);
+  const std::int64_t viewportHeightValue =
+      static_cast<std::int64_t>(top) - static_cast<std::int64_t>(bottom);
+  if (viewportWidthValue <= 0 || viewportHeightValue <= 0 ||
+      viewportWidthValue > kMaximumCaptureDimension ||
+      viewportHeightValue > kMaximumCaptureDimension) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the Model viewport dimensions are invalid"));
+  }
+
+  const double regionWidth = maxX - minX;
+  const double regionHeight = maxY - minY;
+  const int maxLongEdgeValue = static_cast<int>(maxLongEdge);
+  const double scale =
+      std::min({static_cast<double>(maxLongEdge) / regionWidth,
+                static_cast<double>(maxLongEdge) / regionHeight,
+                static_cast<double>(viewportWidthValue) / regionWidth,
+                static_cast<double>(viewportHeightValue) / regionHeight});
+  if (!std::isfinite(scale) || scale <= 0.0) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                "the WCS region cannot be framed"));
+  }
+
+  const int captureWidth = boundedPixelDimension(
+      regionWidth, scale, maxLongEdgeValue, viewportWidthValue);
+  const int captureHeight = boundedPixelDimension(
+      regionHeight, scale, maxLongEdgeValue, viewportHeightValue);
+  const double effectiveScale =
+      std::min(static_cast<double>(captureWidth) / regionWidth,
+               static_cast<double>(captureHeight) / regionHeight);
+  const double fieldWidth =
+      static_cast<double>(viewportWidthValue) / effectiveScale;
+  const double fieldHeight =
+      static_cast<double>(viewportHeightValue) / effectiveScale;
+  const AcGePoint3d framedTarget(minX + fieldWidth * 0.5,
+                                 minY + fieldHeight * 0.5, 0.0);
+  AcDbViewTableRecord framedView;
+  if (snapshotCurrentEditorView(modelViewport, viewport, framedView) !=
+      Acad::eOk) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                "AutoCAD could not prepare the WCS view"));
+  }
+  framedView.setIsPaperspaceView(false);
+  framedView.setTarget(framedTarget);
+  framedView.setCenterPoint(AcGePoint2d(0.0, 0.0));
+  framedView.setViewDirection(AcGeVector3d(0.0, 0.0, 1.0));
+  framedView.setViewTwist(0.0);
+  framedView.setWidth(fieldWidth);
+  framedView.setHeight(fieldHeight);
+  framedView.setPerspectiveEnabled(false);
+  framedView.setFrontClipEnabled(false);
+  framedView.setBackClipEnabled(false);
+  if (setCurrentEditorView(framedView, modelViewport, viewport) != Acad::eOk ||
+      acedActiveViewportId() != modelViewport) {
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                "AutoCAD could not frame the WCS region"));
+  }
+
+  const bool shaded = acgsGetCurrent3dAcGsView(viewport) != nullptr;
+  if (shaded) {
 #ifdef ACADCTL_HAS_ATIL
-    int left = 0;
-    int bottom = 0;
-    int right = 0;
-    int top = 0;
-    if (!acgsGetViewportInfo(viewport, left, bottom, right, top)) {
-      return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                           "the active viewport bounds are unavailable");
+    const int stride = Atil::DataModel::bytesPerRow(
+        captureWidth, Atil::DataModelAttributes::k32);
+    if (stride < captureWidth * 4) {
+      return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                  "ATIL returned an invalid capture stride"));
     }
 
-    const std::int64_t widthValue =
-        static_cast<std::int64_t>(right) - static_cast<std::int64_t>(left);
-    const std::int64_t heightValue =
-        static_cast<std::int64_t>(top) - static_cast<std::int64_t>(bottom);
-    if (widthValue <= 0 || heightValue <= 0) {
-      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                           "the active viewport dimensions are invalid");
-    }
-    if (widthValue > kMaximumCaptureDimension ||
-        heightValue > kMaximumCaptureDimension) {
-      return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                           "the active viewport is too large; resize the "
-                           "AutoCAD window and retry");
-    }
-
-    const int width = static_cast<int>(widthValue);
-    const int height = static_cast<int>(heightValue);
-    const int stride =
-        Atil::DataModel::bytesPerRow(width, Atil::DataModelAttributes::k32);
-    if (stride < width * 4) {
-      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                           "ATIL returned an invalid capture stride");
-    }
-
-    const std::size_t byteCount =
-        static_cast<std::size_t>(stride) * static_cast<std::size_t>(height);
+    const std::size_t byteCount = static_cast<std::size_t>(stride) *
+                                  static_cast<std::size_t>(captureHeight);
     if (byteCount == 0 ||
         byteCount > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                           "the active viewport capture dimensions overflow");
+      return finish(
+          captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                        "the WCS region capture dimensions overflow"));
     }
     if (byteCount > kMaximumCaptureBytes) {
-      return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                           "the active viewport is too large; resize the "
-                           "AutoCAD window and retry");
+      return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                  "the WCS region capture is too large"));
     }
 
     ViewportCaptureResult captured =
@@ -1400,64 +1921,68 @@ ViewportCaptureResult ObjectArxBridge::capture(AcApDocument* document) {
       captured.pixels.resize(byteCount);
       Atil::RgbModel model(Atil::RgbModelAttributes::k4Channels,
                            Atil::DataModelAttributes::kBlueGreenRedAlpha);
-      const Atil::Size size(width, height);
+      const Atil::Size size(captureWidth, captureHeight);
       Atil::Image image(captured.pixels.data(), static_cast<int>(byteCount),
                         stride, size, &model);
-      view->getSnapShot(&image, AcGsDCPoint(0, 0));
+      modelView->getSnapShot(&image, AcGsDCPoint(0, 0));
     } catch (...) {
-      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                           "ATIL could not capture the active viewport");
+      return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                  "ATIL could not capture the WCS region"));
     }
 
-    captured.metadata.width = static_cast<std::uint32_t>(width);
-    captured.metadata.height = static_cast<std::uint32_t>(height);
+    captured.metadata.width = static_cast<std::uint32_t>(captureWidth);
+    captured.metadata.height = static_cast<std::uint32_t>(captureHeight);
     captured.metadata.stride = static_cast<std::size_t>(stride);
     captured.metadata.pixel_format = acadctl::NativePixelFormat::Bgra8;
     captured.metadata.row_order = acadctl::NativeRowOrder::BottomUp;
     captured.metadata.realistic_style = isRealisticVisualStyle();
-    return captured;
+    captured.metadata.crop_width = captured.metadata.width;
+    captured.metadata.crop_height = captured.metadata.height;
+    return finish(std::move(captured));
 #else
-    return captureResult(
+    return finish(captureResult(
         acadctl::NativeCaptureResultKind::Unavailable,
-        "3D viewport capture requires official ATIL headers at build time");
+        "3D viewport capture requires official ATIL headers at build time"));
 #endif
   }
 
   std::unique_ptr<AcGsScreenShot> screenShot(acgsGetScreenShot(viewport));
   if (!screenShot) {
-    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                         "AutoCAD did not provide a 2D viewport capture");
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                      "AutoCAD did not provide a 2D viewport capture"));
   }
 
   int width = 0;
   int height = 0;
   int depth = 0;
   if (!screenShot->getSize(width, height, depth)) {
-    return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                         "AutoCAD returned invalid 2D capture metadata");
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                      "AutoCAD returned invalid 2D capture metadata"));
   }
 
-  if (width <= 0 || height <= 0 || depth != 32) {
-    return captureResult(
-        acadctl::NativeCaptureResultKind::Invalid,
-        "the 2D capture dimensions or pixel depth are invalid");
+  if (width <= 0 || height <= 0 || depth != 32 || captureWidth > width ||
+      captureHeight > height) {
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                      "the 2D capture dimensions or pixel depth are invalid"));
   }
   if (width > kMaximumCaptureDimension || height > kMaximumCaptureDimension) {
-    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                         "the active viewport is too large; resize the AutoCAD "
-                         "window and retry");
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the 2D viewport is too large"));
   }
 
-  const std::size_t stride = static_cast<std::size_t>(width) * 4;
-  const std::size_t byteCount = stride * static_cast<std::size_t>(height);
+  const std::size_t stride = static_cast<std::size_t>(captureWidth) * 4;
+  const std::size_t byteCount =
+      stride * static_cast<std::size_t>(captureHeight);
   if (byteCount == 0) {
-    return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                         "the 2D viewport capture dimensions overflow");
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                                "the 2D WCS region dimensions overflow"));
   }
   if (byteCount > kMaximumCaptureBytes) {
-    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                         "the active viewport is too large; resize the AutoCAD "
-                         "window and retry");
+    return finish(captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                                "the 2D WCS region is too large"));
   }
 
   ViewportCaptureResult captured =
@@ -1465,27 +1990,32 @@ ViewportCaptureResult ObjectArxBridge::capture(AcApDocument* document) {
   try {
     captured.pixels.resize(byteCount);
   } catch (...) {
-    return captureResult(acadctl::NativeCaptureResultKind::Unavailable,
-                         "memory for the 2D viewport capture is unavailable");
+    return finish(
+        captureResult(acadctl::NativeCaptureResultKind::Unavailable,
+                      "memory for the 2D WCS region capture is unavailable"));
   }
 
-  for (int row = 0; row < height; ++row) {
-    const void* const scanline = screenShot->getScanline(0, row);
+  const int firstRow = height - captureHeight;
+  for (int row = 0; row < captureHeight; ++row) {
+    const void* const scanline = screenShot->getScanline(0, firstRow + row);
     if (!scanline) {
-      return captureResult(acadctl::NativeCaptureResultKind::Invalid,
-                           "AutoCAD returned an invalid 2D capture scanline");
+      return finish(
+          captureResult(acadctl::NativeCaptureResultKind::Invalid,
+                        "AutoCAD returned an invalid 2D capture scanline"));
     }
 
     std::memcpy(captured.pixels.data() + static_cast<std::size_t>(row) * stride,
                 scanline, stride);
   }
 
-  captured.metadata.width = static_cast<std::uint32_t>(width);
-  captured.metadata.height = static_cast<std::uint32_t>(height);
+  captured.metadata.width = static_cast<std::uint32_t>(captureWidth);
+  captured.metadata.height = static_cast<std::uint32_t>(captureHeight);
   captured.metadata.stride = stride;
   captured.metadata.pixel_format = acadctl::NativePixelFormat::Bgrx8;
   captured.metadata.row_order = acadctl::NativeRowOrder::TopDown;
-  return captured;
+  captured.metadata.crop_width = captured.metadata.width;
+  captured.metadata.crop_height = captured.metadata.height;
+  return finish(std::move(captured));
 }
 
 acadctl::NativeActionResult ObjectArxBridge::open(rust::Str path) {

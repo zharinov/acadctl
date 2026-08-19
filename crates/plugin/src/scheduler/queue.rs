@@ -18,7 +18,7 @@ use crate::ffi::{
 
 use super::error::Error;
 use super::native::{
-    NativeAction, ViewportCapture, classify_execution_finalization,
+    CaptureRegion, NativeAction, ViewportCapture, classify_execution_finalization,
     native_result_requires_quarantine, schedule_native_actions,
 };
 use super::operation::{
@@ -30,6 +30,7 @@ use super::timer::{
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static EXECUTION_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
+static CAPTURE_RESERVATIONS: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SCHEDULER: LazyLock<Mutex<MutationScheduler>> =
     LazyLock::new(|| Mutex::new(MutationScheduler::new()));
 
@@ -57,6 +58,7 @@ struct MutationJob {
     native_target: Option<NativeDocumentKey>,
     wait: WaitState,
     _execution_reservation: Option<ExecReservation>,
+    _capture_reservation: Option<CaptureReservation>,
     completion: oneshot::Sender<Result<OperationOutcome, Error>>,
 }
 
@@ -82,10 +84,19 @@ pub struct ExecReservation {
 
 struct ExecReservationInner;
 
+struct CaptureReservation;
+
 impl Drop for ExecReservationInner {
     fn drop(&mut self) {
         let previous = EXECUTION_RESERVATIONS.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+    }
+}
+
+impl Drop for CaptureReservation {
+    fn drop(&mut self) {
+        let previous = CAPTURE_RESERVATIONS.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_eq!(previous, 1);
     }
 }
 
@@ -390,15 +401,17 @@ impl MutationScheduler {
             native_target: None,
             wait: WaitState::queued(now),
             _execution_reservation: Some(reservation),
+            _capture_reservation: None,
             completion,
         });
 
         Ok((job_id, receiver, self.request_wake(), None))
     }
 
-    fn submit_operation(
+    fn submit_operation_with_capture_reservation(
         &mut self,
         operation: Operation,
+        capture_reservation: Option<CaptureReservation>,
         now: Instant,
     ) -> Result<SubmissionDecision, Error> {
         if self.stopping {
@@ -428,6 +441,7 @@ impl MutationScheduler {
             native_target: None,
             wait: WaitState::queued(now),
             _execution_reservation: None,
+            _capture_reservation: capture_reservation,
             completion,
         });
 
@@ -619,8 +633,26 @@ pub async fn close(id: DrawingId, discard: bool) -> Result<(), Error> {
     }
 }
 
-pub async fn capture(id: DrawingId) -> Result<ViewportCapture, Error> {
-    match submit_operation(Operation::Capture { id, capture: None }).await? {
+pub async fn capture(
+    id: DrawingId,
+    region: CaptureRegion,
+    max_long_edge: u32,
+) -> Result<ViewportCapture, Error> {
+    let reservation = CAPTURE_RESERVATIONS
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| CaptureReservation)
+        .map_err(|_| Error::CaptureCapacity)?;
+    match submit_operation_with_capture_reservation(
+        Operation::Capture {
+            id,
+            region,
+            max_long_edge,
+            capture: None,
+        },
+        reservation,
+    )
+    .await?
+    {
         OperationOutcome::Capture(capture) => Ok(capture),
         OperationOutcome::Drawing(_) | OperationOutcome::Closed | OperationOutcome::Exec(_) => Err(
             Error::CaptureInvalid("capture operation completed without a frame".into()),
@@ -762,10 +794,28 @@ pub fn stop() {
 }
 
 async fn submit_operation(operation: Operation) -> Result<OperationOutcome, Error> {
+    submit_operation_inner(operation, None).await
+}
+
+async fn submit_operation_with_capture_reservation(
+    operation: Operation,
+    reservation: CaptureReservation,
+) -> Result<OperationOutcome, Error> {
+    submit_operation_inner(operation, Some(reservation)).await
+}
+
+async fn submit_operation_inner(
+    operation: Operation,
+    capture_reservation: Option<CaptureReservation>,
+) -> Result<OperationOutcome, Error> {
     let decision = SCHEDULER
         .lock()
         .map_err(|_| Error::SchedulerStateUnavailable)?
-        .submit_operation(operation, Instant::now())?;
+        .submit_operation_with_capture_reservation(
+            operation,
+            capture_reservation,
+            Instant::now(),
+        )?;
 
     match decision {
         SubmissionDecision::Immediate(outcome) => outcome,
@@ -822,6 +872,7 @@ pub fn complete_native_capture(
             NativeCaptureResultKind::NotQuiescent => NativeActionResultKind::NotQuiescent,
             NativeCaptureResultKind::Unavailable => NativeActionResultKind::CaptureUnavailable,
             NativeCaptureResultKind::Invalid => NativeActionResultKind::CaptureInvalid,
+            NativeCaptureResultKind::RestoreFailed => NativeActionResultKind::CaptureRestoreFailed,
             kind => {
                 result.detail = format!("unknown native capture result ({})", kind.repr);
                 NativeActionResultKind::CaptureInvalid

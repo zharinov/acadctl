@@ -52,14 +52,15 @@ message CloseResponse {}
 
 message ScreenshotRequest {
   uint32 drawing_id = 1;
-  optional ScreenshotCrop crop = 2;
+  bool wide = 2;
+  ScreenshotRegion region = 3;
 }
 
-message ScreenshotCrop {
-  double left = 1;
-  double top = 2;
-  double right = 3;
-  double bottom = 4;
+message ScreenshotRegion {
+  double min_x = 1;
+  double min_y = 2;
+  double max_x = 3;
+  double max_y = 4;
 }
 
 message ScreenshotResponse {

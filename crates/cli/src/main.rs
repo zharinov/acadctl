@@ -177,13 +177,17 @@ struct ExecArgs {
 
 #[derive(Args)]
 struct ScreenshotArgs {
-    /// Hexadecimal target shown by `acadctl list`. The drawing must be active.
+    /// Hexadecimal target shown by `acadctl list`.
     #[arg(value_name = "TARGET")]
     target: Target,
 
-    /// Normalized viewport edges with a top-left origin.
-    #[arg(long, value_name = "LEFT,TOP,RIGHT,BOTTOM")]
-    crop: Option<commands::screenshot::Crop>,
+    /// Opposite corners of a model-space WCS region.
+    #[arg(long, value_name = "X1,Y1:X2,Y2", allow_hyphen_values = true)]
+    region: commands::screenshot::Region,
+
+    /// Raise the maximum output long edge from 512 to 1024 pixels.
+    #[arg(long)]
+    wide: bool,
 
     /// Exact PNG file or an existing directory. Uses managed temporary storage when omitted.
     #[arg(short, long, value_name = "PATH")]
@@ -219,7 +223,13 @@ async fn main() -> ExitCode {
         }
         Command::Close { target, discard } => commands::close::run(target, discard).await,
         Command::Screenshot(arguments) => {
-            commands::screenshot::run(arguments.target, arguments.crop, arguments.output).await
+            commands::screenshot::run(
+                arguments.target,
+                arguments.region,
+                arguments.wide,
+                arguments.output,
+            )
+            .await
         }
         Command::Eval(arguments) => {
             commands::exec::run(
@@ -420,5 +430,39 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn screenshot_requires_a_region() {
+        let error = match Cli::try_parse_from(["acadctl", "screenshot", "12345678"]) {
+            Ok(_) => panic!("screenshot without a region was accepted"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn screenshot_accepts_negative_region_coordinates_and_wide_output() {
+        let cli = Cli::try_parse_from([
+            "acadctl",
+            "screenshot",
+            "12345678",
+            "--region",
+            "-1e2,-25:10,2e1",
+            "--wide",
+        ])
+        .unwrap();
+
+        let Command::Screenshot(arguments) = cli.command else {
+            unreachable!();
+        };
+        assert_eq!(
+            arguments.region,
+            "-100,-25:10,20"
+                .parse::<commands::screenshot::Region>()
+                .unwrap()
+        );
+        assert!(arguments.wide);
     }
 }

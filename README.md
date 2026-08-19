@@ -30,12 +30,14 @@ $ acadctl eval 6A8436C8 '(square 7)'
 49
 ```
 
-Capture the active graphics viewport as a bounded PNG for visual inspection:
+Capture a model-space WCS region as a bounded PNG from a canonical top view:
 
 ```sh
-$ acadctl screenshot 6A8436C8 --crop 0.2,0.1,0.8,0.65
-{"path":"/tmp/acadctl/screenshots/acadctl-screenshot-20260818T231456.123Z.png","width":614,"height":422,"format":"png","warnings":[]}
+$ acadctl screenshot 6A8436C8 --region 0,0:100,100
+{"path":"/tmp/acadctl/screenshots/acadctl-screenshot-20260818T231456.123Z.png","width":512,"height":512,"format":"png","warnings":[]}
 ```
+
+The region is required and its corners may be given in either order. The default maximum long edge is 512 pixels; pass `--wide` to raise it to 1024. The command temporarily activates the target drawing, selects model space, positions the top view, and restores the previous document, layout, viewport, and view afterward. It may briefly steal AutoCAD focus.
 
 Omit `--output` for managed temporary storage, pass an existing directory for a generated filename there, or pass a nonexistent file path for that exact destination. Existing files are never overwritten.
 
@@ -45,7 +47,7 @@ Omit `--output` for managed temporary storage, pass an existing directory for a 
 - `acadctl open`, `acadctl save`, `acadctl close`
 - `acadctl switch`: make a drawing active.
 - `acadctl undo` and `acadctl redo`
-- `acadctl screenshot`: capture and optionally crop the active graphics viewport.
+- `acadctl screenshot`: capture a model-space WCS region from a canonical top view.
 - `acadctl exec` and `acadctl eval` for running AutoLISP.
 - Basic utilities:
   - `(actl:print value)`: print the value to the console

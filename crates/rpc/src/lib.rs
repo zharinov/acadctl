@@ -23,7 +23,7 @@ pub use protocol::{
     ExecAccepted, ExecCancelAcknowledgement, ExecCancelDisposition, ExecCancelRequest,
     ExecCancelled, ExecClientMessage, ExecFailure, ExecFinished, ExecMode, ExecOutcome, ExecOutput,
     ExecRequest, ExecServerEvent, ExecSuccess, HistoryRequest, HistoryResponse, ListRequest,
-    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse, ScreenshotCrop,
+    ListResponse, OpenRequest, OpenResponse, SaveRequest, SaveResponse, ScreenshotRegion,
     ScreenshotRequest, ScreenshotResponse, SourceLocation, SwitchRequest, SwitchResponse,
     exec_client_message, exec_outcome, exec_server_event,
 };

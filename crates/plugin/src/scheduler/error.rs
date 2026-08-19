@@ -27,6 +27,7 @@ pub enum Error {
     CloseFailed(NativeFailure),
     CaptureUnavailable(String),
     CaptureInvalid(String),
+    CaptureRestoreFailed(String),
     HistoryFailed {
         direction: HistoryDirection,
         failure: NativeFailure,
@@ -45,6 +46,7 @@ pub enum Error {
     ExecNotFinished,
     ReadinessTimedOut(Option<DrawingId>),
     MutationCapacity,
+    CaptureCapacity,
     ExecCapacity,
     NativeMutationStateUnknown,
     UnknownResult(u8),
@@ -107,6 +109,13 @@ impl fmt::Display for Error {
                     write!(formatter, "AutoCAD returned an invalid viewport capture: {detail}")
                 }
             }
+            Self::CaptureRestoreFailed(detail) => {
+                if detail.is_empty() {
+                    formatter.write_str("AutoCAD could not restore the previous view")
+                } else {
+                    write!(formatter, "AutoCAD could not restore the previous view: {detail}")
+                }
+            }
             Self::HistoryFailed { direction, failure } => failure.fmt_with_context(
                 formatter,
                 match direction {
@@ -155,6 +164,9 @@ impl fmt::Display for Error {
             Self::MutationCapacity => {
                 formatter.write_str("AutoCAD already has the maximum number of pending operations")
             }
+            Self::CaptureCapacity => {
+                formatter.write_str("AutoCAD already has a screenshot request in progress")
+            }
             Self::ExecCapacity => formatter.write_str(
                 "AutoCAD already has the maximum number or total size of execution requests",
             ),
@@ -197,7 +209,9 @@ impl Error {
             Self::UndoDisabled => Some(DrawingErrorKind::UndoDisabled),
             Self::ReadinessTimedOut(_) => Some(DrawingErrorKind::ReadinessTimedOut),
             Self::CaptureUnavailable(_) => Some(DrawingErrorKind::ViewportUnavailable),
-            Self::CaptureInvalid(_) => Some(DrawingErrorKind::CaptureFailed),
+            Self::CaptureInvalid(_) | Self::CaptureRestoreFailed(_) => {
+                Some(DrawingErrorKind::CaptureFailed)
+            }
             _ => None,
         }
     }
@@ -226,6 +240,7 @@ impl Error {
                 | Self::SavePathUnavailable
                 | Self::CloseNotPublished
                 | Self::CaptureInvalid(_)
+                | Self::CaptureRestoreFailed(_)
                 | Self::DocumentContextFailed(_)
                 | Self::DocumentContextRestoreFailed(_)
                 | Self::ExecBridgeFinalizationFailed(_)
@@ -240,6 +255,7 @@ impl Error {
         if matches!(
             self,
             Self::DocumentContextRestoreFailed(_)
+                | Self::CaptureRestoreFailed(_)
                 | Self::ExecBridgeFinalizationFailed(_)
                 | Self::ExecBridgeSymbolsClearFailed(_)
                 | Self::ExecBridgeFailed(_)

@@ -122,8 +122,11 @@ fn drawing_error_message(
         DrawingErrorKind::ViewportUnavailable => {
             format!("The active viewport for drawing {target} is unavailable: {detail}.")
         }
-        DrawingErrorKind::CaptureFailed => {
+        DrawingErrorKind::CaptureFailed if detail.is_empty() => {
             format!("The active viewport for drawing {target} could not be captured.")
+        }
+        DrawingErrorKind::CaptureFailed => {
+            format!("The active viewport for drawing {target} could not be captured: {detail}.")
         }
         DrawingErrorKind::Unspecified => {
             unreachable!("unspecified drawing errors are not rendered")

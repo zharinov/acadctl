@@ -10,7 +10,7 @@ pub(crate) use bridge::{
     take_execution_step,
 };
 pub(crate) use error::Error;
-pub(crate) use native::NativeAction;
+pub(crate) use native::{CaptureRegion, NativeAction};
 pub(crate) use queue::{
     CancelResult, ExecReservation, MutationJobId, admit_execution, cancel_execution, capture,
     close, complete_execution_native_action, complete_native_action, complete_native_capture, list,

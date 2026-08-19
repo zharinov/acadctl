@@ -109,39 +109,44 @@ impl DrawingService for DrawingRpc {
     ) -> Result<Response<ScreenshotResponse>, Status> {
         let request = request.into_inner();
         let drawing_id = parse_drawing_id(request.drawing_id)?;
-        let crop = request
-            .crop
-            .map_or(crate::screenshot::NormalizedCrop::FULL, |crop| {
-                crate::screenshot::NormalizedCrop {
-                    left: crop.left,
-                    top: crop.top,
-                    right: crop.right,
-                    bottom: crop.bottom,
-                }
-            });
-        crop.validate().map_err(|_| {
-            Status::invalid_argument("Crop edges must be finite, ordered, and between zero and one")
-        })?;
+        let region = request
+            .region
+            .ok_or_else(|| Status::invalid_argument("A model-space WCS region is required"))?;
+        let region = crate::scheduler::CaptureRegion {
+            min_x: region.min_x,
+            min_y: region.min_y,
+            max_x: region.max_x,
+            max_y: region.max_y,
+        };
+        if [region.min_x, region.min_y, region.max_x, region.max_y]
+            .iter()
+            .any(|coordinate| !coordinate.is_finite())
+            || region.min_x >= region.max_x
+            || region.min_y >= region.max_y
+        {
+            return Err(Status::invalid_argument(
+                "Region coordinates must be finite and strictly ordered",
+            ));
+        }
+        let resolution = if request.wide {
+            crate::screenshot::ResolutionPolicy::Wide
+        } else {
+            crate::screenshot::ResolutionPolicy::Default
+        };
+        let max_long_edge = if request.wide { 1024 } else { 512 };
         let screenshot = SCREENSHOT.lock().await;
-        let capture = crate::scheduler::capture(drawing_id)
+        let capture = crate::scheduler::capture(drawing_id, region, max_long_edge)
             .await
             .map_err(scheduler_error)?;
         let realistic_style = capture.realistic_style;
+        let bounds = capture.bounds;
         let encoded = tokio::task::spawn_blocking(move || {
             let _screenshot = screenshot;
-            crate::screenshot::encode_png(capture.frame(), crop)
+            crate::screenshot::encode_png(capture.frame(), bounds, resolution)
         })
         .await
         .map_err(|_| Status::internal("The viewport image processor stopped unexpectedly"))?
-        .map_err(|error| {
-            if matches!(error, crate::screenshot::ScreenshotError::InvalidCrop) {
-                Status::invalid_argument(
-                    "Crop edges must be finite, ordered, and between zero and one",
-                )
-            } else {
-                Status::internal("The viewport image could not be processed")
-            }
-        })?;
+        .map_err(|_| Status::internal("The viewport image could not be processed"))?;
 
         let warnings = if realistic_style {
             vec![

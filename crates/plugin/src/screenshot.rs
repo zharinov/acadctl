@@ -7,8 +7,8 @@ use image::{
 };
 
 const BYTES_PER_PIXEL: usize = 4;
-const MAX_WIDTH: u32 = 1024;
-const MAX_HEIGHT: u32 = 768;
+const DEFAULT_MAX_LONG_EDGE: u32 = 512;
+const WIDE_MAX_LONG_EDGE: u32 = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CapturedFrame<'a> {
@@ -32,50 +32,76 @@ pub enum RowOrder {
     BottomUp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NormalizedCrop {
-    pub left: f64,
-    pub top: f64,
-    pub right: f64,
-    pub bottom: f64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PixelBounds {
+    left: u32,
+    top: u32,
+    width: u32,
+    height: u32,
 }
 
-impl NormalizedCrop {
-    pub const FULL: Self = Self {
-        left: 0.0,
-        top: 0.0,
-        right: 1.0,
-        bottom: 1.0,
-    };
-
-    pub fn validate(self) -> Result<(), ScreenshotError> {
-        let coordinates = [self.left, self.top, self.right, self.bottom];
-        if coordinates
-            .iter()
-            .any(|coordinate| !coordinate.is_finite() || !(0.0..=1.0).contains(coordinate))
-            || self.left >= self.right
-            || self.top >= self.bottom
-        {
-            return Err(ScreenshotError::InvalidCrop);
+impl PixelBounds {
+    pub fn new(left: u32, top: u32, width: u32, height: u32) -> Result<Self, ScreenshotError> {
+        if width == 0 || height == 0 {
+            return Err(ScreenshotError::EmptyBounds);
         }
+        left.checked_add(width)
+            .and_then(|_| top.checked_add(height))
+            .ok_or(ScreenshotError::BoundsOverflow)?;
 
-        Ok(())
-    }
-
-    fn pixel_bounds(self, width: u32, height: u32) -> Result<PixelBounds, ScreenshotError> {
-        self.validate()?;
-
-        let left = scale_crop_edge(self.left, width, EdgeRounding::Down);
-        let top = scale_crop_edge(self.top, height, EdgeRounding::Down);
-        let right = scale_crop_edge(self.right, width, EdgeRounding::Up);
-        let bottom = scale_crop_edge(self.bottom, height, EdgeRounding::Up);
-
-        Ok(PixelBounds {
+        Ok(Self {
             left,
             top,
-            width: right - left,
-            height: bottom - top,
+            width,
+            height,
         })
+    }
+
+    pub const fn left(self) -> u32 {
+        self.left
+    }
+
+    pub const fn top(self) -> u32 {
+        self.top
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    fn validate_within(self, frame: CapturedFrame<'_>) -> Result<(), ScreenshotError> {
+        let right = self
+            .left
+            .checked_add(self.width)
+            .ok_or(ScreenshotError::BoundsOverflow)?;
+        let bottom = self
+            .top
+            .checked_add(self.height)
+            .ok_or(ScreenshotError::BoundsOverflow)?;
+        if right > frame.width || bottom > frame.height {
+            return Err(ScreenshotError::BoundsOutsideFrame);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResolutionPolicy {
+    #[default]
+    Default,
+    Wide,
+}
+
+impl ResolutionPolicy {
+    const fn max_long_edge(self) -> u32 {
+        match self {
+            Self::Default => DEFAULT_MAX_LONG_EDGE,
+            Self::Wide => WIDE_MAX_LONG_EDGE,
+        }
     }
 }
 
@@ -93,7 +119,9 @@ pub enum ScreenshotError {
     DimensionOverflow,
     StrideTooSmall { minimum: usize, actual: usize },
     BufferTooSmall { minimum: usize, actual: usize },
-    InvalidCrop,
+    EmptyBounds,
+    BoundsOverflow,
+    BoundsOutsideFrame,
     PngEncoding(image::ImageError),
 }
 
@@ -112,9 +140,11 @@ impl fmt::Display for ScreenshotError {
                 formatter,
                 "the captured frame buffer is {actual} bytes; at least {minimum} bytes are required"
             ),
-            Self::InvalidCrop => formatter.write_str(
-                "the normalized crop must have finite, ordered coordinates between zero and one",
-            ),
+            Self::EmptyBounds => formatter.write_str("the screenshot bounds are empty"),
+            Self::BoundsOverflow => formatter.write_str("the screenshot bounds overflow"),
+            Self::BoundsOutsideFrame => {
+                formatter.write_str("the screenshot bounds extend outside the captured frame")
+            }
             Self::PngEncoding(error) => {
                 write!(formatter, "could not encode screenshot PNG: {error}")
             }
@@ -130,7 +160,9 @@ impl error::Error for ScreenshotError {
             | Self::DimensionOverflow
             | Self::StrideTooSmall { .. }
             | Self::BufferTooSmall { .. }
-            | Self::InvalidCrop => None,
+            | Self::EmptyBounds
+            | Self::BoundsOverflow
+            | Self::BoundsOutsideFrame => None,
         }
     }
 }
@@ -144,9 +176,10 @@ pub struct EncodedScreenshot {
 
 pub fn encode_png(
     frame: CapturedFrame<'_>,
-    crop: NormalizedCrop,
+    bounds: PixelBounds,
+    resolution: ResolutionPolicy,
 ) -> Result<EncodedScreenshot, ScreenshotError> {
-    let image = process(frame, crop)?;
+    let image = process(frame, bounds, resolution)?;
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
         .write_image(
@@ -163,17 +196,22 @@ pub fn encode_png(
     })
 }
 
-fn process(frame: CapturedFrame<'_>, crop: NormalizedCrop) -> Result<RgbImage, ScreenshotError> {
+fn process(
+    frame: CapturedFrame<'_>,
+    bounds: PixelBounds,
+    resolution: ResolutionPolicy,
+) -> Result<RgbImage, ScreenshotError> {
     validate_frame(frame)?;
-    let bounds = crop.pixel_bounds(frame.width, frame.height)?;
-    let (target_width, target_height) = fitted_dimensions(bounds.width, bounds.height);
+    bounds.validate_within(frame)?;
+    let (target_width, target_height) =
+        fitted_dimensions(bounds.width(), bounds.height(), resolution.max_long_edge());
     let source = FrameView(frame);
     let cropped = crop_imm(
         &source,
-        bounds.left,
-        bounds.top,
-        bounds.width,
-        bounds.height,
+        bounds.left(),
+        bounds.top(),
+        bounds.width(),
+        bounds.height(),
     );
     let resized = thumbnail(&*cropped, target_width, target_height);
 
@@ -197,8 +235,17 @@ impl GenericImageView for FrameView<'_> {
             RowOrder::TopDown => y,
             RowOrder::BottomUp => self.0.height - y - 1,
         };
-        let pixel_start =
-            stored_y as usize * self.0.stride + x as usize * self.0.pixel_format.bytes_per_pixel();
+        let row_start = usize::try_from(stored_y)
+            .expect("a validated frame row fits usize")
+            .checked_mul(self.0.stride)
+            .expect("validated frame row offset does not overflow");
+        let pixel_offset = usize::try_from(x)
+            .expect("a validated frame column fits usize")
+            .checked_mul(self.0.pixel_format.bytes_per_pixel())
+            .expect("validated frame pixel offset does not overflow");
+        let pixel_start = row_start
+            .checked_add(pixel_offset)
+            .expect("validated frame pixel position does not overflow");
         Rgba([
             self.0.pixels[pixel_start],
             self.0.pixels[pixel_start + 1],
@@ -241,49 +288,24 @@ fn validate_frame(frame: CapturedFrame<'_>) -> Result<(), ScreenshotError> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum EdgeRounding {
-    Down,
-    Up,
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "crop coordinates are finite and bounded to [0, 1], and dimensions are u32"
-)]
-fn scale_crop_edge(coordinate: f64, dimension: u32, rounding: EdgeRounding) -> u32 {
-    let scaled = coordinate * f64::from(dimension);
-    match rounding {
-        EdgeRounding::Down => scaled.floor() as u32,
-        EdgeRounding::Up => scaled.ceil() as u32,
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PixelBounds {
-    left: u32,
-    top: u32,
-    width: u32,
-    height: u32,
-}
-
-fn fitted_dimensions(width: u32, height: u32) -> (u32, u32) {
-    if width <= MAX_WIDTH && height <= MAX_HEIGHT {
+fn fitted_dimensions(width: u32, height: u32, max_long_edge: u32) -> (u32, u32) {
+    if width <= max_long_edge && height <= max_long_edge {
         return (width, height);
     }
 
-    if u64::from(MAX_WIDTH) * u64::from(height) <= u64::from(MAX_HEIGHT) * u64::from(width) {
-        let fitted_height = u64::from(height) * u64::from(MAX_WIDTH) / u64::from(width);
+    if width >= height {
+        let fitted_height = u64::from(height) * u64::from(max_long_edge) / u64::from(width);
         (
-            MAX_WIDTH,
-            u32::try_from(fitted_height.max(1)).expect("fitted height is bounded by MAX_HEIGHT"),
+            max_long_edge,
+            u32::try_from(fitted_height.max(1))
+                .expect("fitted height is bounded by the long-edge limit"),
         )
     } else {
-        let fitted_width = u64::from(width) * u64::from(MAX_HEIGHT) / u64::from(height);
+        let fitted_width = u64::from(width) * u64::from(max_long_edge) / u64::from(height);
         (
-            u32::try_from(fitted_width.max(1)).expect("fitted width is bounded by MAX_WIDTH"),
-            MAX_HEIGHT,
+            u32::try_from(fitted_width.max(1))
+                .expect("fitted width is bounded by the long-edge limit"),
+            max_long_edge,
         )
     }
 }
@@ -293,6 +315,10 @@ mod tests {
     use image::ImageFormat;
 
     use super::*;
+
+    fn bounds(left: u32, top: u32, width: u32, height: u32) -> PixelBounds {
+        PixelBounds::new(left, top, width, height).unwrap()
+    }
 
     #[test]
     fn rejects_empty_dimensions() {
@@ -305,7 +331,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &[],
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 1, 1),
+            ResolutionPolicy::Default,
         )
         .unwrap_err();
 
@@ -323,7 +350,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &[0; 8],
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 2, 1),
+            ResolutionPolicy::Default,
         )
         .unwrap_err();
 
@@ -347,7 +375,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &[0; 11],
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 1, 2),
+            ResolutionPolicy::Default,
         )
         .unwrap_err();
 
@@ -371,7 +400,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &[],
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 1, 2),
+            ResolutionPolicy::Default,
         )
         .unwrap_err();
 
@@ -393,7 +423,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &pixels,
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 2, 2),
+            ResolutionPolicy::Default,
         )
         .unwrap();
 
@@ -414,7 +445,8 @@ mod tests {
                 row_order: RowOrder::TopDown,
                 pixels: &[0, 0, 255, 255, 255, 0, 0, 255],
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 1, 2),
+            ResolutionPolicy::Default,
         )
         .unwrap();
 
@@ -423,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn crop_rounds_outward_in_top_left_coordinates() {
+    fn crops_exact_pixel_bounds_in_top_left_coordinates() {
         let mut pixels = Vec::new();
         for source_y_from_bottom in 0_u8..4 {
             for source_x in 0_u8..4 {
@@ -439,12 +471,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &pixels,
             },
-            NormalizedCrop {
-                left: 0.26,
-                top: 0.26,
-                right: 0.74,
-                bottom: 0.74,
-            },
+            bounds(1, 1, 2, 2),
+            ResolutionPolicy::Default,
         )
         .unwrap();
 
@@ -454,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_finite_reversed_and_out_of_bounds_crops() {
+    fn rejects_empty_overflowing_and_out_of_frame_bounds() {
         let pixels = [0; 16];
         let frame = CapturedFrame {
             width: 2,
@@ -464,41 +492,73 @@ mod tests {
             row_order: RowOrder::BottomUp,
             pixels: &pixels,
         };
-        let invalid = [
-            NormalizedCrop {
-                left: f64::NAN,
-                ..NormalizedCrop::FULL
-            },
-            NormalizedCrop {
-                left: 0.8,
-                right: 0.2,
-                ..NormalizedCrop::FULL
-            },
-            NormalizedCrop {
-                right: 1.1,
-                ..NormalizedCrop::FULL
-            },
-        ];
-
-        for crop in invalid {
-            assert!(matches!(
-                process(frame, crop),
-                Err(ScreenshotError::InvalidCrop)
-            ));
-        }
+        assert!(matches!(
+            PixelBounds::new(0, 0, 0, 1),
+            Err(ScreenshotError::EmptyBounds)
+        ));
+        assert!(matches!(
+            PixelBounds::new(u32::MAX, 0, 2, 1),
+            Err(ScreenshotError::BoundsOverflow)
+        ));
+        assert!(matches!(
+            process(frame, bounds(1, 1, 2, 2), ResolutionPolicy::Default),
+            Err(ScreenshotError::BoundsOutsideFrame)
+        ));
     }
 
     #[test]
-    fn fits_wide_and_tall_images_within_the_output_bounds() {
-        assert_eq!(fitted_dimensions(2000, 1000), (1024, 512));
-        assert_eq!(fitted_dimensions(1000, 2000), (384, 768));
-        assert_eq!(fitted_dimensions(1200, 1200), (768, 768));
+    fn default_resolution_caps_square_wide_and_tall_long_edges_at_512() {
+        assert_eq!(fitted_dimensions(1200, 1200, 512), (512, 512));
+        assert_eq!(fitted_dimensions(2000, 1000, 512), (512, 256));
+        assert_eq!(fitted_dimensions(1000, 2000, 512), (256, 512));
     }
 
     #[test]
-    fn does_not_upscale_small_images() {
-        assert_eq!(fitted_dimensions(640, 480), (640, 480));
-        assert_eq!(fitted_dimensions(1024, 768), (1024, 768));
+    fn wide_resolution_caps_long_edge_at_1024() {
+        assert_eq!(fitted_dimensions(1200, 1200, 1024), (1024, 1024));
+        assert_eq!(fitted_dimensions(2000, 1000, 1024), (1024, 512));
+        assert_eq!(fitted_dimensions(1000, 2000, 1024), (512, 1024));
+    }
+
+    #[test]
+    fn neither_resolution_policy_upscales_small_images() {
+        assert_eq!(fitted_dimensions(320, 480, 512), (320, 480));
+        assert_eq!(fitted_dimensions(640, 480, 1024), (640, 480));
+    }
+
+    #[test]
+    fn processing_applies_each_long_edge_cap() {
+        let default_pixels = vec![0; 513 * 513 * BYTES_PER_PIXEL];
+        let default_image = process(
+            CapturedFrame {
+                width: 513,
+                height: 513,
+                stride: 513 * BYTES_PER_PIXEL,
+                pixel_format: PixelFormat::Bgrx8,
+                row_order: RowOrder::TopDown,
+                pixels: &default_pixels,
+            },
+            bounds(0, 0, 513, 513),
+            ResolutionPolicy::Default,
+        )
+        .unwrap();
+        assert_eq!(default_image.dimensions(), (512, 512));
+
+        let wide_pixels = vec![0; 1025 * BYTES_PER_PIXEL];
+        let wide_image = process(
+            CapturedFrame {
+                width: 1025,
+                height: 1,
+                stride: 1025 * BYTES_PER_PIXEL,
+                pixel_format: PixelFormat::Bgrx8,
+                row_order: RowOrder::TopDown,
+                pixels: &wide_pixels,
+            },
+            bounds(0, 0, 1025, 1),
+            ResolutionPolicy::Wide,
+        )
+        .unwrap();
+        assert_eq!(wide_image.dimensions(), (1024, 1));
     }
 
     #[test]
@@ -512,7 +572,8 @@ mod tests {
                 row_order: RowOrder::BottomUp,
                 pixels: &[7, 11, 13, 255],
             },
-            NormalizedCrop::FULL,
+            bounds(0, 0, 1, 1),
+            ResolutionPolicy::Default,
         )
         .unwrap();
         assert_eq!((encoded.width, encoded.height), (1, 1));

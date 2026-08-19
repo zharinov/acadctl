@@ -49,6 +49,7 @@ mod ffi {
         ExecBridgeFailed,
         CaptureUnavailable,
         CaptureInvalid,
+        CaptureRestoreFailed,
     }
 
     #[derive(Debug)]
@@ -61,6 +62,7 @@ mod ffi {
         NotQuiescent,
         Unavailable,
         Invalid,
+        RestoreFailed,
     }
 
     #[derive(Debug)]
@@ -148,6 +150,10 @@ mod ffi {
         pixel_format: NativePixelFormat,
         row_order: NativeRowOrder,
         realistic_style: bool,
+        crop_left: u32,
+        crop_top: u32,
+        crop_width: u32,
+        crop_height: u32,
         detail: String,
     }
 
@@ -222,6 +228,16 @@ mod ffi {
         fn save_path(self: &NativeAction) -> &str;
 
         fn force_document_context(self: &NativeAction) -> bool;
+
+        fn capture_min_x(self: &NativeAction) -> f64;
+
+        fn capture_min_y(self: &NativeAction) -> f64;
+
+        fn capture_max_x(self: &NativeAction) -> f64;
+
+        fn capture_max_y(self: &NativeAction) -> f64;
+
+        fn capture_max_long_edge(self: &NativeAction) -> u32;
 
         fn close_discard(self: &NativeAction) -> bool;
 

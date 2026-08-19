@@ -4,7 +4,7 @@ use tonic::{Code, Status};
 
 use crate::{
     CloseRequest, DrawingError, DrawingId, DrawingPath, ExecMode, ExecRequest, HistoryRequest,
-    OpenRequest, SavePath, SaveRequest, ScreenshotCrop, ScreenshotRequest, SourceName,
+    OpenRequest, SavePath, SaveRequest, ScreenshotRegion, ScreenshotRequest, SourceName,
     SwitchRequest,
 };
 
@@ -52,10 +52,11 @@ impl CloseRequest {
 }
 
 impl ScreenshotRequest {
-    pub fn new(drawing_id: DrawingId, crop: Option<ScreenshotCrop>) -> Self {
+    pub fn new(drawing_id: DrawingId, region: ScreenshotRegion, wide: bool) -> Self {
         Self {
             drawing_id: drawing_id.into(),
-            crop,
+            region: Some(region),
+            wide,
         }
     }
 }
@@ -110,5 +111,25 @@ mod tests {
 
         assert_eq!(DrawingError::from_status(&status), Some(error));
         assert_eq!(DrawingError::from_status(&Status::internal("failed")), None);
+    }
+
+    #[test]
+    fn screenshot_request_contains_the_required_region_and_size_policy() {
+        let drawing_id = "36C8".parse().unwrap();
+        let region = ScreenshotRegion {
+            min_x: -100.0,
+            min_y: -25.0,
+            max_x: 10.0,
+            max_y: 20.0,
+        };
+
+        assert_eq!(
+            ScreenshotRequest::new(drawing_id, region, true),
+            ScreenshotRequest {
+                drawing_id: drawing_id.into(),
+                region: Some(region),
+                wide: true,
+            }
+        );
     }
 }

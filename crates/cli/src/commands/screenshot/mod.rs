@@ -5,76 +5,75 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use acadctl_rpc::{ScreenshotCrop, ScreenshotRequest};
+use acadctl_rpc::{ScreenshotRegion, ScreenshotRequest};
 use serde::Serialize;
 use time::OffsetDateTime;
 
 use super::{RequestOperation, fail, request_error_message, target::Target};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Crop {
-    left: f64,
-    top: f64,
-    right: f64,
-    bottom: f64,
+pub(crate) struct Region {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ParseCropError;
+pub(crate) struct ParseRegionError;
 
-impl fmt::Display for ParseCropError {
+impl fmt::Display for ParseRegionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected four ordered comma-separated edges between zero and one")
+        formatter.write_str("expected two distinct finite X,Y corners separated by ':'")
     }
 }
 
-impl std::error::Error for ParseCropError {}
+impl std::error::Error for ParseRegionError {}
 
-impl FromStr for Crop {
-    type Err = ParseCropError;
+impl FromStr for Region {
+    type Err = ParseRegionError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut values = value.split(',').map(str::parse::<f64>);
-        let crop = Self {
-            left: values
-                .next()
-                .ok_or(ParseCropError)?
-                .map_err(|_| ParseCropError)?,
-            top: values
-                .next()
-                .ok_or(ParseCropError)?
-                .map_err(|_| ParseCropError)?,
-            right: values
-                .next()
-                .ok_or(ParseCropError)?
-                .map_err(|_| ParseCropError)?,
-            bottom: values
-                .next()
-                .ok_or(ParseCropError)?
-                .map_err(|_| ParseCropError)?,
-        };
-
-        if values.next().is_some()
-            || [crop.left, crop.top, crop.right, crop.bottom]
-                .iter()
-                .any(|edge| !edge.is_finite() || !(0.0..=1.0).contains(edge))
-            || crop.left >= crop.right
-            || crop.top >= crop.bottom
-        {
-            return Err(ParseCropError);
+        let mut corners = value.split(':');
+        let first = parse_corner(corners.next().ok_or(ParseRegionError)?)?;
+        let second = parse_corner(corners.next().ok_or(ParseRegionError)?)?;
+        if corners.next().is_some() || first.0 == second.0 || first.1 == second.1 {
+            return Err(ParseRegionError);
         }
 
-        Ok(crop)
+        Ok(Self {
+            min_x: first.0.min(second.0),
+            min_y: first.1.min(second.1),
+            max_x: first.0.max(second.0),
+            max_y: first.1.max(second.1),
+        })
     }
 }
 
-impl From<Crop> for ScreenshotCrop {
-    fn from(crop: Crop) -> Self {
+fn parse_corner(value: &str) -> Result<(f64, f64), ParseRegionError> {
+    let mut coordinates = value.split(',').map(str::parse::<f64>);
+    let x = coordinates
+        .next()
+        .ok_or(ParseRegionError)?
+        .map_err(|_| ParseRegionError)?;
+    let y = coordinates
+        .next()
+        .ok_or(ParseRegionError)?
+        .map_err(|_| ParseRegionError)?;
+    if coordinates.next().is_some() || !x.is_finite() || !y.is_finite() {
+        return Err(ParseRegionError);
+    }
+
+    Ok((x, y))
+}
+
+impl From<Region> for ScreenshotRegion {
+    fn from(region: Region) -> Self {
         Self {
-            left: crop.left,
-            top: crop.top,
-            right: crop.right,
-            bottom: crop.bottom,
+            min_x: region.min_x,
+            min_y: region.min_y,
+            max_x: region.max_x,
+            max_y: region.max_y,
         }
     }
 }
@@ -88,12 +87,17 @@ struct ScreenshotOutput<'a> {
     warnings: &'a [String],
 }
 
-pub async fn run(target: Target, crop: Option<Crop>, destination: Option<PathBuf>) -> ExitCode {
+pub async fn run(
+    target: Target,
+    region: Region,
+    wide: bool,
+    destination: Option<PathBuf>,
+) -> ExitCode {
     let mut client = match super::connect_drawings(target.instance_id).await {
         Ok(client) => client,
         Err(error) => return fail(error),
     };
-    let request = ScreenshotRequest::new(target.drawing_id, crop.map(Into::into));
+    let request = ScreenshotRequest::new(target.drawing_id, region.into(), wide);
     let screenshot = match client.screenshot(request).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
@@ -151,31 +155,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_normalized_crop() {
+    fn parses_and_normalizes_wcs_region() {
         assert_eq!(
-            "0.2,0.1,0.8,0.65".parse(),
-            Ok(Crop {
-                left: 0.2,
-                top: 0.1,
-                right: 0.8,
-                bottom: 0.65,
+            "1e1,20:-1e2,-2.5e1".parse(),
+            Ok(Region {
+                min_x: -100.0,
+                min_y: -25.0,
+                max_x: 10.0,
+                max_y: 20.0,
             })
         );
     }
 
     #[test]
-    fn rejects_invalid_crop() {
-        for crop in [
-            "0,0,1",
-            "0,0,1,1,1",
-            "0,0,0,1",
-            "0,0,1,0",
-            "-0.1,0,1,1",
-            "0,0,1.1,1",
-            "NaN,0,1,1",
+    fn rejects_invalid_regions() {
+        for region in [
+            "0,0",
+            "0,0:1",
+            "0,0:1,1:2,2",
+            "0,0,0:1,1",
+            "0,0:0,1",
+            "0,0:1,0",
+            "NaN,0:1,1",
+            "0,inf:1,1",
         ] {
-            assert!(crop.parse::<Crop>().is_err(), "{crop}");
+            assert!(region.parse::<Region>().is_err(), "{region}");
         }
+    }
+
+    #[test]
+    fn converts_region_to_rpc_coordinates() {
+        let region: ScreenshotRegion = "10,20:-100,-25".parse::<Region>().unwrap().into();
+
+        assert_eq!(
+            region,
+            ScreenshotRegion {
+                min_x: -100.0,
+                min_y: -25.0,
+                max_x: 10.0,
+                max_y: 20.0,
+            }
+        );
     }
 
     #[test]

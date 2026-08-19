@@ -12,13 +12,16 @@ pub(super) fn scheduler_error(error: SchedulerError) -> Status {
     let code = match &error {
         SchedulerError::DrawingNotFound(_) => Code::NotFound,
         SchedulerError::ReadinessTimedOut(_) => Code::DeadlineExceeded,
+        SchedulerError::CaptureCapacity => Code::ResourceExhausted,
         _ if error.is_internal() => Code::Internal,
         _ => Code::FailedPrecondition,
     };
 
     if let Some(kind) = error.drawing_error_kind() {
         let detail = match &error {
-            SchedulerError::CaptureUnavailable(detail) => detail.clone(),
+            SchedulerError::CaptureUnavailable(detail)
+            | SchedulerError::CaptureInvalid(detail)
+            | SchedulerError::CaptureRestoreFailed(detail) => detail.clone(),
             _ => String::new(),
         };
         DrawingError {

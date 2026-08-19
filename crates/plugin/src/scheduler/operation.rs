@@ -5,7 +5,7 @@ use crate::exec::output::OutputSink;
 use crate::exec::{Exec, ExecOutcome, ExecStepResult, NativeExecStep, ValueOutputLease};
 
 use super::error::Error;
-use super::native::{NativeCommand, ViewportCapture, interpret_capture};
+use super::native::{CaptureRegion, NativeCommand, ViewportCapture, interpret_capture};
 
 pub(super) enum Operation {
     Open {
@@ -24,6 +24,8 @@ pub(super) enum Operation {
     },
     Capture {
         id: DrawingId,
+        region: CaptureRegion,
+        max_long_edge: u32,
         capture: Option<ViewportCapture>,
     },
     History {
@@ -84,14 +86,20 @@ impl Operation {
                 Some(target) => Prepared::Native(NativeCommand::close(target.native_key, *discard)),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
-            Operation::Capture { id, capture } => match drawings.find_by_id(*id) {
+            Operation::Capture {
+                id,
+                region,
+                max_long_edge,
+                capture,
+            } => match drawings.find_by_id(*id) {
                 Some(_) if capture.is_some() => Prepared::Immediate(Err(Error::CaptureInvalid(
                     "capture operation was dispatched more than once".into(),
                 ))),
-                Some(target) if !target.drawing.active => {
-                    Prepared::Immediate(Err(Error::NotActive(*id)))
-                }
-                Some(target) => Prepared::Native(NativeCommand::capture(target.native_key)),
+                Some(target) => Prepared::Native(NativeCommand::capture(
+                    target.native_key,
+                    *region,
+                    *max_long_edge,
+                )),
                 None => Prepared::Immediate(Err(Error::DrawingNotFound(*id))),
             },
             Operation::History {
@@ -207,7 +215,7 @@ impl Operation {
 
                 Ok(OperationOutcome::Closed)
             }
-            Operation::Capture { id, capture } => {
+            Operation::Capture { id, capture, .. } => {
                 let expected = native_target.ok_or(Error::DrawingGone)?;
                 let target = drawings.find_by_id(*id).ok_or(Error::DrawingGone)?;
 
@@ -266,7 +274,7 @@ impl Operation {
         result: &crate::ffi::NativeCaptureResult,
         pixels: &[u8],
     ) -> Result<(), Error> {
-        let Self::Capture { id, capture } = self else {
+        let Self::Capture { id, capture, .. } = self else {
             return Err(Error::CaptureInvalid(
                 "native capture completed a different operation".into(),
             ));

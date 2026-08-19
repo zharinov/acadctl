@@ -6,7 +6,7 @@ use crate::ffi::{
     NativeActionKind, NativeActionResult, NativeActionResultKind, NativeCaptureResult,
     NativeCaptureResultKind, NativeExecFinalizationObservation, NativePixelFormat, NativeRowOrder,
 };
-use crate::screenshot::{CapturedFrame, PixelFormat, RowOrder};
+use crate::screenshot::{CapturedFrame, PixelBounds, PixelFormat, RowOrder};
 
 use super::error::{Error, NativeFailure};
 use super::operation::{DocumentContextPolicy, Operation, OperationOutcome};
@@ -21,12 +21,33 @@ pub(super) enum NativeCommand {
 
 pub(super) enum NativeDrawingOperation {
     Switch,
-    Save { path: Option<SavePath> },
-    Close { discard: bool },
-    Capture,
-    Undo { context: DocumentContextPolicy },
-    Redo { context: DocumentContextPolicy },
-    QueueExecDriver { context: DocumentContextPolicy },
+    Save {
+        path: Option<SavePath>,
+    },
+    Close {
+        discard: bool,
+    },
+    Capture {
+        region: CaptureRegion,
+        max_long_edge: u32,
+    },
+    Undo {
+        context: DocumentContextPolicy,
+    },
+    Redo {
+        context: DocumentContextPolicy,
+    },
+    QueueExecDriver {
+        context: DocumentContextPolicy,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CaptureRegion {
+    pub(crate) min_x: f64,
+    pub(crate) min_y: f64,
+    pub(crate) max_x: f64,
+    pub(crate) max_y: f64,
 }
 
 pub(crate) struct NativeAction {
@@ -55,8 +76,18 @@ impl NativeCommand {
         Self::drawing(target, NativeDrawingOperation::Close { discard })
     }
 
-    pub(super) fn capture(target: NativeDocumentKey) -> Self {
-        Self::drawing(target, NativeDrawingOperation::Capture)
+    pub(super) fn capture(
+        target: NativeDocumentKey,
+        region: CaptureRegion,
+        max_long_edge: u32,
+    ) -> Self {
+        Self::drawing(
+            target,
+            NativeDrawingOperation::Capture {
+                region,
+                max_long_edge,
+            },
+        )
     }
 
     pub(super) fn undo(target: NativeDocumentKey, context: DocumentContextPolicy) -> Self {
@@ -99,7 +130,7 @@ impl NativeDrawingOperation {
             Self::Switch => NativeActionKind::Switch,
             Self::Save { .. } => NativeActionKind::Save,
             Self::Close { .. } => NativeActionKind::Close,
-            Self::Capture => NativeActionKind::Capture,
+            Self::Capture { .. } => NativeActionKind::Capture,
             Self::Undo { .. } => NativeActionKind::Undo,
             Self::Redo { .. } => NativeActionKind::Redo,
             Self::QueueExecDriver { .. } => NativeActionKind::QueueExecDriver,
@@ -115,6 +146,7 @@ pub(crate) struct ViewportCapture {
     pub(crate) pixel_format: PixelFormat,
     pub(crate) row_order: RowOrder,
     pub(crate) realistic_style: bool,
+    pub(crate) bounds: PixelBounds,
     pub(crate) pixels: Vec<u8>,
 }
 
@@ -144,6 +176,13 @@ impl ViewportCapture {
             NativeRowOrder::BottomUp => RowOrder::BottomUp,
             _ => return Err(Error::CaptureInvalid("unknown native row order".into())),
         };
+        let bounds = PixelBounds::new(
+            result.crop_left,
+            result.crop_top,
+            result.crop_width,
+            result.crop_height,
+        )
+        .map_err(|error| Error::CaptureInvalid(error.to_string()))?;
 
         if result.width == 0
             || result.height == 0
@@ -180,6 +219,7 @@ impl ViewportCapture {
             pixel_format,
             row_order,
             realistic_style: result.realistic_style,
+            bounds,
             pixels: pixels.to_vec(),
         })
     }
@@ -200,6 +240,9 @@ pub(super) fn interpret_capture(
             Err(Error::CaptureUnavailable(result.detail.clone()))
         }
         NativeCaptureResultKind::Invalid => Err(Error::CaptureInvalid(result.detail.clone())),
+        NativeCaptureResultKind::RestoreFailed => {
+            Err(Error::CaptureRestoreFailed(result.detail.clone()))
+        }
         kind => Err(Error::UnknownResult(kind.repr)),
     }
 }
@@ -299,6 +342,54 @@ impl NativeAction {
             } => *context == DocumentContextPolicy::ForceTemporary,
             NativeActionState::Idle | NativeActionState::Issued { .. } => false,
         }
+    }
+
+    pub(crate) fn capture_min_x(&self) -> f64 {
+        self.capture_region().min_x
+    }
+
+    pub(crate) fn capture_min_y(&self) -> f64 {
+        self.capture_region().min_y
+    }
+
+    pub(crate) fn capture_max_x(&self) -> f64 {
+        self.capture_region().max_x
+    }
+
+    pub(crate) fn capture_max_y(&self) -> f64 {
+        self.capture_region().max_y
+    }
+
+    pub(crate) fn capture_max_long_edge(&self) -> u32 {
+        let NativeActionState::Issued {
+            command:
+                NativeCommand::Drawing {
+                    operation: NativeDrawingOperation::Capture { max_long_edge, .. },
+                    ..
+                },
+            ..
+        } = &self.state
+        else {
+            panic!("native action is not capture");
+        };
+
+        *max_long_edge
+    }
+
+    fn capture_region(&self) -> CaptureRegion {
+        let NativeActionState::Issued {
+            command:
+                NativeCommand::Drawing {
+                    operation: NativeDrawingOperation::Capture { region, .. },
+                    ..
+                },
+            ..
+        } = &self.state
+        else {
+            panic!("native action is not capture");
+        };
+
+        *region
     }
 
     fn drawing_target(&self) -> NativeDocumentKey {
@@ -443,6 +534,9 @@ pub(super) fn interpret(result: NativeActionResult, operation: &Operation) -> Re
             Err(Error::CaptureUnavailable(failure.detail))
         }
         NativeActionResultKind::CaptureInvalid => Err(Error::CaptureInvalid(failure.detail)),
+        NativeActionResultKind::CaptureRestoreFailed => {
+            Err(Error::CaptureRestoreFailed(failure.detail))
+        }
         kind => Err(Error::UnknownResult(kind.repr)),
     }
 }
@@ -451,6 +545,7 @@ pub(super) fn native_result_requires_quarantine(kind: NativeActionResultKind) ->
     matches!(
         kind,
         NativeActionResultKind::DocumentContextRestoreFailed
+            | NativeActionResultKind::CaptureRestoreFailed
             | NativeActionResultKind::ExecBridgeFinalizationFailed
             | NativeActionResultKind::ExecBridgeSymbolsClearFailed
     )
